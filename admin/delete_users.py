@@ -10,10 +10,15 @@ def delete_users_tab():
 
     # Fetch all users except self or optionally admins
     user_email = st.session_state.get("user_email")
-    users_df = db.fetch_data(
-        "SELECT id, name, email, role FROM users WHERE email != %s ORDER BY name", 
-        (user_email,)
-    )
+
+    try:
+        users_df = db.fetch_data(
+            "SELECT id, name, email, role FROM users WHERE email != %s ORDER BY name", 
+            (user_email,)
+        )
+    except Exception as e:
+        st.error("❌ Failed to load user list. Please check the logs or contact the admin.")
+        return  # gracefully exit the tab without crashing
 
     if users_df.empty:
         st.info("No other users found.")
@@ -35,6 +40,9 @@ def delete_users_tab():
             return
 
         if st.button("⚠️ Permanently delete this user"):
-            db.execute_command("DELETE FROM users WHERE email = %s", (selected_email,))
-            st.success(f"✅ User {selected_email} has been deleted.")
-            st.rerun()
+            try:
+                db.execute_command("DELETE FROM users WHERE email = %s", (selected_email,))
+                st.success(f"✅ User {selected_email} has been deleted.")
+                st.rerun()
+            except Exception as e:
+                st.error("❌ Deletion failed. Please try again or check the logs.")
