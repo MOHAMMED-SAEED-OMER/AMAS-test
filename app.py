@@ -11,11 +11,15 @@ from selling_area.main_shelf     import main_shelf_page
 from cashier.main_cashier        import main_cashier_page
 from finance.main_finance        import main_finance_page
 from returns.main_return         import main_return_page
-from issues.main_issue           import issues_page          # ✔ imported
+from issues.main_issue           import issues_page
 from shelf_map.main_map import main as shelf_map_page
+
 # helpers
 from sidebar    import sidebar
 from inv_signin import authenticate
+
+# NEW: unified user management tabs
+from admin.user_admin_tabs import show_user_admin
 
 
 def main() -> None:
@@ -50,17 +54,16 @@ def main() -> None:
         main_return_page()
 
     elif page == "Issues"         and perms.get("CanAccessIssues"):
-        issues_page()                                 # ✔ indented properly
+        issues_page()
 
-    elif page == "Shelf Map" and perms.get("CanAccessShelfMap"):
+    elif page == "Shelf Map"      and perms.get("CanAccessShelfMap"):
         shelf_map_page()
 
     elif page == "Reports"        and perms.get("CanAccessReports"):
         main_reports.reports_page()
 
     elif page == "User Management" and st.session_state.get("user_role") == "Admin":
-        from admin.user_management import user_management
-        user_management()
+        show_user_admin()  # ← unified tab with both add + manage
 
     else:
         st.error("❌ You do not have permission to access this page.")
