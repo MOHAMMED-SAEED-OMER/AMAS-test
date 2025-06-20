@@ -43,23 +43,11 @@ def authenticate():
 
     # 2) ensure user row exists --------------------------------------
     user_df = db.fetch_data("SELECT * FROM users WHERE email=%s", (user_email,))
-    if user_df.empty:                          # first-time Google user
-        db.execute_command(
-            """
-            INSERT INTO users
-                  (name, email, role,
-                   canaccesshome, canaccessitems, canaccessreceive,
-                   canaccesspo,   canaccessreports, canaccesssellingarea,
-                   canaccesscashier, canaccessfinance, canaccessreturns, canaccessshelfmap,
-                   canaccessissues)
-            VALUES (%s, %s, 'User',
-                    FALSE, FALSE, FALSE,
-                    FALSE, FALSE, FALSE,
-                    FALSE, FALSE, FALSE, FALSE,
-                    FALSE)              -- default: no Issues page access
-            """,
-            (user_name, user_email),
-        )
+    if user_df.empty:
+    st.error("🚫 Your account has not been registered by an administrator.")
+    st.info("Please contact your system admin to gain access.")
+    st.stop()
+
         user_df = db.fetch_data("SELECT * FROM users WHERE email=%s", (user_email,))
 
     info     = user_df.iloc[0]
