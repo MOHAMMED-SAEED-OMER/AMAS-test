@@ -30,18 +30,21 @@ class DatabaseManager:
 
     def _fetch_df(self, query: str, params=None) -> pd.DataFrame:
         self._ensure_live_conn()
-        try:                                  # first attempt
+        try:  # first attempt
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
-        except OperationalError:              # reconnect & retry once
+        except OperationalError:
             get_conn.clear()
             self.conn = get_conn(self.dsn)
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
+        except Exception:
+            self.conn.rollback()  # ← NEW: recover from broken transaction
+            raise
         return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
 
     def _execute(self, query: str, params=None, returning=False):
@@ -60,6 +63,9 @@ class DatabaseManager:
                 res = cur.fetchone() if returning else None
             self.conn.commit()
             return res
+        except Exception:
+            self.conn.rollback()  # ← NEW: reset failed transaction
+            raise
 
     # ────────── public API ──────────
     def fetch_data(self, query, params=None):
