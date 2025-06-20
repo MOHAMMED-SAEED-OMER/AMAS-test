@@ -44,11 +44,9 @@ def authenticate():
     # 2) ensure user row exists --------------------------------------
     user_df = db.fetch_data("SELECT * FROM users WHERE email=%s", (user_email,))
     if user_df.empty:
-    st.error("🚫 Your account has not been registered by an administrator.")
-    st.info("Please contact your system admin to gain access.")
-    st.stop()
-
-        user_df = db.fetch_data("SELECT * FROM users WHERE email=%s", (user_email,))
+        st.error("🚫 Your account has not been registered by an administrator.")
+        st.info("Please contact your system admin to gain access.")
+        st.stop()
 
     info     = user_df.iloc[0]
     pin_hash = info.get("pin_hash")            # may be NULL/None
