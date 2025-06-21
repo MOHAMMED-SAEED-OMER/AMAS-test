@@ -1,5 +1,5 @@
 """
-Cashier ▸ Check-Out   (single-file edition)
+Cashier ▸ Check-Out  (single-file edition)
 
 • Shows shift totals and item breakdown for the current cashier.
 • Lets the cashier enter bill counts, see any cash / system delta,
@@ -7,48 +7,43 @@ Cashier ▸ Check-Out   (single-file edition)
 """
 
 from __future__ import annotations
+
 import streamlit as st
 from datetime import datetime, timezone
 import pandas as pd
-# 1️⃣  Import with fallback
+
+# ───────────────────────── auth import with fallback ─────────────────────────
 try:
-    from auth_utils import get_current_user      # absolute import
-except ImportError:                              # if not found
-    from ..auth_utils import get_current_user    # relative import
+    # Works when project root is on PYTHONPATH
+    from auth_utils import get_current_user
+except ImportError:                             # when executed as a package
+    from ..auth_utils import get_current_user   # type: ignore
 
-except ImportError:                           # pragma: no cover
-    from ..auth_utils import get_current_user
-# already in your repo
-from db_handler import DatabaseManager           # your DB wrapper
+from db_handler import DatabaseManager          # shared DB wrapper
 
-# ───────────────────────────────────────────────────────────────
-# 0. setup
-# ───────────────────────────────────────────────────────────────
-_db = DatabaseManager()                           # one cached conn / session
+# ─────────────────────────── constants / setup ───────────────────────────────
+_db = DatabaseManager()                         # one cached connection per session
 DENOMS = [50_000, 25_000, 10_000, 5_000, 1_000, 500, 250]  # IQD bills
 
-
-# ───────────────────────────────────────────────────────────────
-# 1. helper functions (DB logic)
-# ───────────────────────────────────────────────────────────────
+# ───────────────────────────── helper functions ──────────────────────────────
 def get_shift_start(cashier: str):
-    """Return the timestamp that marks the start of *today’s open shift*."""
-    # A) if a closure exists today, reuse its shift_end
-    last = _db.fetch_data(
+    """Start of the *current* open shift for this cashier."""
+    # after last closure, if any
+    df = _db.fetch_data(
         "SELECT shift_end FROM cashier_shift_closure "
         "WHERE cashier = %s ORDER BY shift_end DESC LIMIT 1",
         (cashier,),
     )
-    if not last.empty:
-        return last.iat[0, 0]
+    if not df.empty:
+        return df.iat[0, 0]
 
-    # B) else first sale today
-    first_sale = _db.fetch_data(
+    # else first sale today
+    df = _db.fetch_data(
         "SELECT MIN(saletime) FROM sales "
         "WHERE cashier = %s AND saletime::date = CURRENT_DATE",
         (cashier,),
     )
-    return first_sale.iat[0, 0] if not first_sale.empty else None
+    return df.iat[0, 0] if not df.empty else None
 
 
 def get_sales_totals(cashier: str, start: datetime, end: datetime):
@@ -64,14 +59,14 @@ def get_sales_totals(cashier: str, start: datetime, end: datetime):
 
 
 def get_item_summary(cashier: str, start: datetime, end: datetime) -> pd.DataFrame:
-    """Item-level breakdown (adjust table/columns if yours differ)."""
+    """Item-level breakdown (adjust table / column names if needed)."""
     return _db.fetch_data(
         """
-        SELECT itemcode       AS "Code",
-               itemname       AS "Item",
-               SUM(quantity)  AS "Qty",
-               SUM(quantity * itemprice) AS "IQD"
-        FROM   sales_details                                   -- ← line-item table
+        SELECT itemcode AS "Code",
+               itemname AS "Item",
+               SUM(quantity)                     AS "Qty",
+               SUM(quantity * itemprice)         AS "IQD"
+        FROM   sales_details                     -- line-item table
         WHERE  cashier = %s AND saletime BETWEEN %s AND %s
         GROUP  BY itemcode, itemname
         ORDER  BY "IQD" DESC
@@ -89,7 +84,7 @@ def save_closure(
     system_total: float,
     notes: str,
 ):
-    """Insert one row into cashier_shift_closure."""
+    """Insert one row into `cashier_shift_closure`."""
     sql = """
     INSERT INTO cashier_shift_closure (
         cashier, shift_start, shift_end,
@@ -101,7 +96,7 @@ def save_closure(
               %(sys)s, %(cash)s,
               %(n50)s, %(n25)s, %(n10)s, %(n5)s,
               %(n1)s,  %(n05)s, %(n025)s,
-              %(notes)s)
+              %(notes)s);
     """
     _db.execute_command(
         sql,
@@ -114,8 +109,8 @@ def save_closure(
             "n50": denom.get(50_000, 0),
             "n25": denom.get(25_000, 0),
             "n10": denom.get(10_000, 0),
-            "n5": denom.get(5_000, 0),
-            "n1": denom.get(1_000, 0),
+            "n5":  denom.get(5_000, 0),
+            "n1":  denom.get(1_000, 0),
             "n05": denom.get(500, 0),
             "n025": denom.get(250, 0),
             "notes": notes,
@@ -131,10 +126,7 @@ def fetch_last_closure(cashier: str):
     )
     return df.iloc[0] if not df.empty else None
 
-
-# ───────────────────────────────────────────────────────────────
-# 2. Streamlit UI
-# ───────────────────────────────────────────────────────────────
+# ──────────────────────────────── UI layer ───────────────────────────────────
 def render():
     st.markdown(
         "<h2 style='color:#1ABC9C;margin-bottom:0.2em'>🧾 Shift Check-Out</h2>",
@@ -152,24 +144,24 @@ def render():
         st.info("No sales recorded for today.")
         st.stop()
 
-    shift_end = datetime.now(tz=timezone.utc)
-    system_total, tx_count = get_sales_totals(email, shift_start, shift_end)
+    now = datetime.now(tz=timezone.utc)
+    system_total, tx_count = get_sales_totals(email, shift_start, now)
 
-    # A. overview
+    # A · overview
     c1, c2, c3 = st.columns(3)
     c1.metric("Shift start", shift_start.strftime("%H:%M"))
     c2.metric("Total sales (IQD)", f"{system_total:,.0f}")
     c3.metric("# Transactions", tx_count)
 
-    # B. item breakdown
+    # B · item summary
     with st.expander("Sold-item breakdown"):
         st.dataframe(
-            get_item_summary(email, shift_start, shift_end),
+            get_item_summary(email, shift_start, now),
             height=300,
             use_container_width=True,
         )
 
-    # C. cash count
+    # C · cash count
     st.subheader("Cash count")
     denom_counts, cash_total = {}, 0
     cols = st.columns(len(DENOMS))
@@ -180,21 +172,21 @@ def render():
 
     diff = cash_total - system_total
     st.markdown(
-        f"<p style='font-size:1.1em;'>"
+        f"<p style='font-size:1.1em'>"
         f"<strong>Your total:</strong> {cash_total:,.0f} IQD "
-        f"({'+' if diff>=0 else ''}{diff:,.0f})</p>",
+        f"({'+' if diff >= 0 else ''}{diff:,.0f})</p>",
         unsafe_allow_html=True,
     )
 
     notes = st.text_area("Notes / discrepancies")
 
-    # D. submit
+    # D · submit
     if st.button("✅ Submit & Close Shift", type="primary"):
-        save_closure(email, shift_start, shift_end,
+        save_closure(email, shift_start, now,
                      denom_counts, cash_total, system_total, notes)
         st.success("Shift closed and stored!")
 
-        # Show frozen summary
+        # frozen summary
         last = fetch_last_closure(email)
         if last is not None:
             st.divider()
@@ -219,7 +211,6 @@ def render():
                 st.info(f"**Notes:** {last.notes}")
         st.stop()
 
-
-# Streamlit entry-point
+# ────────────────────────── standalone launch ────────────────────────────────
 if __name__ == "__main__":
     render()
