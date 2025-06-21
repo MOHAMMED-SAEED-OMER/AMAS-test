@@ -10,7 +10,7 @@ class POHandler(DatabaseManager):
     def get_all_purchase_orders(self):
         """
         Returns a DataFrame with columns:
-        - status, supplierid, sup_proposeddeliver, supproposedquantity, etc.
+        - status, supplierid, supproposeddeliver, supproposedquantity, etc.
         - Everything except statuses in the 'Archived' set is retrieved.
         """
         query = """
@@ -23,10 +23,9 @@ class POHandler(DatabaseManager):
             po.RespondedAt AS respondedat,
             po.ActualDelivery AS actualdelivery,
             po.CreatedBy AS createdby,
-            po.SupProposedDeliver AS sup_proposeddeliver,
+            po.supproposeddeliver AS sup_proposeddeliver,
             po.SupplierNote AS suppliernote,
             po.OriginalPOID AS originalpoid,
-            po.ProposedStatus AS proposedstatus,  
             s.SupplierName AS suppliername,
 
             poi.ItemID AS itemid,
@@ -42,7 +41,6 @@ class POHandler(DatabaseManager):
         JOIN Supplier s ON po.SupplierID = s.SupplierID
         JOIN PurchaseOrderItems poi ON po.POID = poi.POID
         JOIN Item i ON poi.ItemID = i.ItemID
-        /* Exclude statuses that belong in the Archived tab: */
         WHERE po.Status NOT IN (
             'Completed', 
             'Declined', 
@@ -54,10 +52,6 @@ class POHandler(DatabaseManager):
         return self.fetch_data(query)
 
     def get_archived_purchase_orders(self):
-        """
-        Fetches POs that have status in the 'Archived' set.
-        That includes completed or declined by either side.
-        """
         query = """
         SELECT 
             po.POID AS poid,
@@ -82,7 +76,6 @@ class POHandler(DatabaseManager):
         JOIN Supplier s ON po.SupplierID = s.SupplierID
         JOIN PurchaseOrderItems poi ON po.POID = poi.POID
         JOIN Item i ON poi.ItemID = i.ItemID
-        /* Only include 'Archived' statuses: */
         WHERE po.Status IN (
             'Completed',
             'Declined',
@@ -104,25 +97,15 @@ class POHandler(DatabaseManager):
         """
         return self.fetch_data(query)
 
-    def create_manual_po(
-        self,
-        supplier_id,
-        expected_delivery,
-        items: list,
-        created_by: str,
-        original_poid=None,
-    ):
-        """Creates a PO and all its line items in ONE transaction."""
-        # ---------- clean inputs ----------
+    def create_manual_po(self, supplier_id, expected_delivery, items: list, created_by: str, original_poid=None):
         supplier_id   = int(supplier_id) if supplier_id is not None else None
         original_poid = int(original_poid) if original_poid else None
         if pd.notnull(expected_delivery) and not isinstance(expected_delivery, datetime):
             expected_delivery = pd.to_datetime(expected_delivery).to_pydatetime()
 
         self._ensure_live_conn()
-        with self.conn:                               # ← opens BEGIN / COMMIT
+        with self.conn:
             with self.conn.cursor() as cur:
-                # 1. insert PO header, get POID
                 cur.execute(
                     """
                     INSERT INTO purchaseorders
@@ -134,14 +117,13 @@ class POHandler(DatabaseManager):
                 )
                 po_id = cur.fetchone()[0]
 
-                # 2. batch insert line items
                 rows = [
                     (
                         po_id,
                         int(it["item_id"]),
                         int(it["quantity"]),
                         it.get("estimated_price"),
-                        0,           # ReceivedQuantity default
+                        0,
                     )
                     for it in items
                 ]
@@ -156,6 +138,7 @@ class POHandler(DatabaseManager):
                     rows,
                 )
         return po_id
+
     def update_po_status_to_received(self, poid):
         poid = int(poid)
         query = """
@@ -181,22 +164,13 @@ class POHandler(DatabaseManager):
         query = "SELECT ItemID AS itemid, SupplierID AS supplierid FROM ItemSupplier"
         return self.fetch_data(query)
 
-        # ============ PROPOSED PO LOGIC ===============
-
     def accept_proposed_po(self, proposed_po_id: int):
-        """
-        Accept a supplier‑proposed PO.
-        • Creates a new PO using the supplier‑proposed quantities / prices
-          (falls back to original values if not proposed).
-        • Marks the original PO as 'Accepted by AMAS'.
-        Returns the new POID.
-        """
         proposed_po_id = int(proposed_po_id)
 
         po_info_df = self.fetch_data(
             "SELECT * FROM PurchaseOrders WHERE POID = %s",
             (proposed_po_id,)
-        ).rename(columns=str.lower)                 # ← lower‑case cols
+        ).rename(columns=str.lower)
 
         if po_info_df.empty:
             return None
@@ -206,20 +180,18 @@ class POHandler(DatabaseManager):
         items_info = self.fetch_data(
             "SELECT * FROM PurchaseOrderItems WHERE POID = %s",
             (proposed_po_id,)
-        ).rename(columns=str.lower)                 # ← lower‑case cols
+        ).rename(columns=str.lower)
 
         supplier_id = po_info.get("supplierid")
         if pd.notnull(supplier_id):
             supplier_id = int(supplier_id)
 
-        # proposed delivery date
         sup_proposed_date = None
         if pd.notnull(po_info.get("supproposeddeliver")):
             sup_proposed_date = pd.to_datetime(
                 po_info["supproposeddeliver"]
             ).to_pydatetime()
 
-        # build new items list
         new_items = []
         for _, row in items_info.iterrows():
             qty = (
@@ -250,20 +222,13 @@ class POHandler(DatabaseManager):
             original_poid=proposed_po_id,
         )
 
-        # mark original as accepted
         self.execute_command(
-            "UPDATE PurchaseOrders "
-            "SET Status = 'Accepted by AMAS' "
-            "WHERE POID = %s",
+            "UPDATE PurchaseOrders SET Status = 'Accepted by AMAS' WHERE POID = %s",
             (proposed_po_id,),
         )
         return new_poid
 
-
     def decline_proposed_po(self, proposed_po_id):
-        """
-        Decline a proposed PO by setting status to 'Declined by AMAS'.
-        """
         proposed_po_id = int(proposed_po_id)
         self.execute_command(
             "UPDATE PurchaseOrders SET Status = 'Declined by AMAS' WHERE POID = %s",
@@ -271,10 +236,6 @@ class POHandler(DatabaseManager):
         )
 
     def modify_proposed_po(self, proposed_po_id, new_delivery_date, new_items, user_email):
-        """
-        The user modifies the proposed fields, then we create a new normal PO from 
-        these final modifications, marking old one as 'Modified by AMAS'.
-        """
         proposed_po_id = int(proposed_po_id)
         po_info_df = self.fetch_data("SELECT * FROM PurchaseOrders WHERE POID = %s", (proposed_po_id,))
         if po_info_df.empty:
@@ -286,14 +247,13 @@ class POHandler(DatabaseManager):
             supplier_id = int(supplier_id)
 
         new_poid = self.create_manual_po(
-            supplier_id = supplier_id,
-            expected_delivery = new_delivery_date,
-            items = new_items,
-            created_by = user_email,
-            original_poid = proposed_po_id
+            supplier_id=supplier_id,
+            expected_delivery=new_delivery_date,
+            items=new_items,
+            created_by=user_email,
+            original_poid=proposed_po_id
         )
 
-        # Mark original
         self.execute_command(
             "UPDATE PurchaseOrders SET Status = 'Modified by AMAS' WHERE POID = %s",
             (proposed_po_id,)
