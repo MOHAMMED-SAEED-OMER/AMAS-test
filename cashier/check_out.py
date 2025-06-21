@@ -5,27 +5,21 @@ Cashier ▸ Check-Out  (single-file edition)
 • Lets the cashier enter bill counts, see any cash / system delta,
   and stores everything in `cashier_shift_closure`.
 """
-
 from __future__ import annotations
 
 import streamlit as st
 from datetime import datetime, timezone
 import pandas as pd
 
-# ───────────────────────── auth import with fallback ─────────────────────────
-try:
-    # Works when project root is on PYTHONPATH
-    from auth_utils import get_current_user
-except ImportError:                             # when executed as a package
-    from ..auth_utils import get_current_user   # type: ignore
+# absolute import – same style you use for db_handler
+from auth_utils import get_current_user
+from db_handler import DatabaseManager
 
-from db_handler import DatabaseManager          # shared DB wrapper
-
-# ─────────────────────────── constants / setup ───────────────────────────────
+# ─────────────────────────── constants / setup ──────────────────────────────
 _db = DatabaseManager()                         # one cached connection per session
 DENOMS = [50_000, 25_000, 10_000, 5_000, 1_000, 500, 250]  # IQD bills
 
-# ───────────────────────────── helper functions ──────────────────────────────
+# ───────────────────────────── helper functions ─────────────────────────────
 def get_shift_start(cashier: str):
     """Start of the *current* open shift for this cashier."""
     # after last closure, if any
@@ -47,7 +41,6 @@ def get_shift_start(cashier: str):
 
 
 def get_sales_totals(cashier: str, start: datetime, end: datetime):
-    """Return (system_total IQD, tx_count) for this shift."""
     df = _db.fetch_data(
         "SELECT SUM(finalamount) AS system_total, "
         "       COUNT(*)         AS tx_count "
@@ -59,7 +52,6 @@ def get_sales_totals(cashier: str, start: datetime, end: datetime):
 
 
 def get_item_summary(cashier: str, start: datetime, end: datetime) -> pd.DataFrame:
-    """Item-level breakdown (adjust table / column names if needed)."""
     return _db.fetch_data(
         """
         SELECT itemcode AS "Code",
@@ -84,7 +76,6 @@ def save_closure(
     system_total: float,
     notes: str,
 ):
-    """Insert one row into `cashier_shift_closure`."""
     sql = """
     INSERT INTO cashier_shift_closure (
         cashier, shift_start, shift_end,
@@ -126,7 +117,7 @@ def fetch_last_closure(cashier: str):
     )
     return df.iloc[0] if not df.empty else None
 
-# ──────────────────────────────── UI layer ───────────────────────────────────
+# ──────────────────────────────── UI layer ──────────────────────────────────
 def render():
     st.markdown(
         "<h2 style='color:#1ABC9C;margin-bottom:0.2em'>🧾 Shift Check-Out</h2>",
@@ -147,13 +138,13 @@ def render():
     now = datetime.now(tz=timezone.utc)
     system_total, tx_count = get_sales_totals(email, shift_start, now)
 
-    # A · overview
+    # A - overview
     c1, c2, c3 = st.columns(3)
     c1.metric("Shift start", shift_start.strftime("%H:%M"))
     c2.metric("Total sales (IQD)", f"{system_total:,.0f}")
     c3.metric("# Transactions", tx_count)
 
-    # B · item summary
+    # B - item summary
     with st.expander("Sold-item breakdown"):
         st.dataframe(
             get_item_summary(email, shift_start, now),
@@ -161,7 +152,7 @@ def render():
             use_container_width=True,
         )
 
-    # C · cash count
+    # C - cash count
     st.subheader("Cash count")
     denom_counts, cash_total = {}, 0
     cols = st.columns(len(DENOMS))
@@ -180,37 +171,13 @@ def render():
 
     notes = st.text_area("Notes / discrepancies")
 
-    # D · submit
+    # D - submit
     if st.button("✅ Submit & Close Shift", type="primary"):
         save_closure(email, shift_start, now,
                      denom_counts, cash_total, system_total, notes)
         st.success("Shift closed and stored!")
 
-        # frozen summary
         last = fetch_last_closure(email)
         if last is not None:
             st.divider()
-            st.markdown("### 📄 Closure summary")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("System total", f"{last.system_total:,.0f}")
-            c2.metric("Counted cash", f"{last.cash_total:,.0f}")
-            c3.metric("Δ", f"{last.discrepancy:+,.0f}",
-                      delta_color="inverse")
-
-            st.table(
-                {
-                    "Denomination": [f"{d:,}" for d in DENOMS],
-                    "Count": [
-                        last.cnt_50000, last.cnt_25000, last.cnt_10000,
-                        last.cnt_5000,  last.cnt_1000,
-                        last.cnt_500,   last.cnt_250,
-                    ],
-                }
-            )
-            if last.notes:
-                st.info(f"**Notes:** {last.notes}")
-        st.stop()
-
-# ────────────────────────── standalone launch ────────────────────────────────
-if __name__ == "__main__":
-    render()
+            st.markdown(
