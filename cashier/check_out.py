@@ -1,17 +1,16 @@
 """
-Cashier ▸ Check-Out  (single-file, lazy auth import)
+Cashier ▸ Check-Out  (no external auth import)
 """
 from __future__ import annotations
-
 import streamlit as st
 from datetime import datetime, timezone
 import pandas as pd
-from db_handler import DatabaseManager        # ← this was always safe
+from db_handler import DatabaseManager
 
 _db    = DatabaseManager()
 DENOMS = [50_000, 25_000, 10_000, 5_000, 1_000, 500, 250]
 
-# ───────────────────────── helper SQL funcs ─────────────────────────
+# ---------- helper SQL functions (unchanged) ----------
 def get_shift_start(cashier: str):
     df = _db.fetch_data(
         "SELECT shift_end FROM cashier_shift_closure "
@@ -43,8 +42,8 @@ def get_item_summary(cashier: str, start, end) -> pd.DataFrame:
         """
         SELECT itemcode AS "Code",
                itemname AS "Item",
-               SUM(quantity)                     AS "Qty",
-               SUM(quantity * itemprice)         AS "IQD"
+               SUM(quantity)              AS "Qty",
+               SUM(quantity * itemprice)  AS "IQD"
         FROM   sales_details
         WHERE  cashier=%s AND saletime BETWEEN %s AND %s
         GROUP  BY itemcode, itemname
@@ -54,11 +53,7 @@ def get_item_summary(cashier: str, start, end) -> pd.DataFrame:
     )
 
 
-def save_closure(
-    cashier, start, end,
-    denom: dict[int, int],
-    cash_total, system_total, notes: str
-):
+def save_closure(cashier, start, end, denom, cash_total, system_total, notes):
     _db.execute_command(
         """
         INSERT INTO cashier_shift_closure (
@@ -89,23 +84,20 @@ def fetch_last_closure(cashier):
     )
     return df.iloc[0] if not df.empty else None
 
-# ───────────────────────────── UI layer ───────────────────────────
+# ---------- UI ----------
 def render():
-    # 🔑 import auth helper *inside* the function
-    from auth_utils import get_current_user
-
     st.markdown(
         "<h2 style='color:#1ABC9C;margin-bottom:0.2em'>🧾 Shift Check-Out</h2>",
         unsafe_allow_html=True,
     )
 
-    user = get_current_user()
-    if not user:
+    # ✨ SAME technique used in returns.py
+    cashier_email = st.session_state.get("user_email")
+    if not cashier_email:
         st.error("Please sign in.")
         st.stop()
 
-    cashier_email = user["email"]
-    shift_start   = get_shift_start(cashier_email)
+    shift_start = get_shift_start(cashier_email)
     if not shift_start:
         st.info("No sales recorded for today.")
         st.stop()
@@ -113,20 +105,20 @@ def render():
     now = datetime.now(tz=timezone.utc)
     system_total, tx_count = get_sales_totals(cashier_email, shift_start, now)
 
-    # ── overview ──
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Shift start", shift_start.strftime("%H:%M"))
-    col2.metric("Total sales (IQD)", f"{system_total:,.0f}")
-    col3.metric("# Transactions", tx_count)
+    # Overview
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Shift start", shift_start.strftime("%H:%M"))
+    c2.metric("Total sales (IQD)", f"{system_total:,.0f}")
+    c3.metric("# Transactions", tx_count)
 
-    # ── item summary ──
+    # Item breakdown
     with st.expander("Sold-item breakdown"):
         st.dataframe(
             get_item_summary(cashier_email, shift_start, now),
             height=300, use_container_width=True,
         )
 
-    # ── cash count ──
+    # Cash count
     st.subheader("Cash count")
     denom_counts, cash_total = {}, 0
     cols = st.columns(len(DENOMS))
@@ -144,7 +136,7 @@ def render():
 
     notes = st.text_area("Notes / discrepancies")
 
-    # ── submit ──
+    # Submit
     if st.button("✅ Submit & Close Shift", type="primary"):
         save_closure(cashier_email, shift_start, now,
                      denom_counts, cash_total, system_total, notes)
@@ -154,11 +146,10 @@ def render():
         if last is not None:
             st.divider()
             st.markdown("### 📄 Closure summary")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("System total", f"{last.system_total:,.0f}")
-            c2.metric("Counted cash", f"{last.cash_total:,.0f}")
-            c3.metric("Δ", f"{last.discrepancy:+,.0f}",
-                      delta_color="inverse")
+            a, b, c = st.columns(3)
+            a.metric("System total", f"{last.system_total:,.0f}")
+            b.metric("Counted cash", f"{last.cash_total:,.0f}")
+            c.metric("Δ", f"{last.discrepancy:+,.0f}", delta_color="inverse")
 
             st.table(
                 {
@@ -174,6 +165,6 @@ def render():
                 st.info(f"**Notes:** {last.notes}")
         st.stop()
 
-# dev entry-point
+
 if __name__ == "__main__":
     render()
