@@ -10,11 +10,12 @@ from __future__ import annotations
 import streamlit as st
 from datetime import datetime, timezone
 import pandas as pd
-from auth_utils import get_current_user         
-# 1️⃣  try absolute import (works when project root is on sys.path)
+# 1️⃣  Import with fallback
 try:
-    from auth_utils import get_current_user
-# 2️⃣  fallback to relative import (works when executed as a package)
+    from auth_utils import get_current_user      # absolute import
+except ImportError:                              # if not found
+    from ..auth_utils import get_current_user    # relative import
+
 except ImportError:                           # pragma: no cover
     from ..auth_utils import get_current_user
 # already in your repo
