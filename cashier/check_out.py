@@ -40,16 +40,16 @@ def get_sales_totals(cashier: str, start, end):
 def get_item_summary(cashier: str, start, end) -> pd.DataFrame:
     return _db.fetch_data(
         """
-        SELECT i.itemcode        AS "Code",
-               i.itemnameenglish AS "Item",
-               SUM(si.quantity)                    AS "Qty",
-               SUM(si.quantity * si.unitprice)     AS "IQD"
+        SELECT i.itemid                 AS "ID",          -- real column
+               i.itemnameenglish        AS "Item",        -- or itemname
+               SUM(si.quantity)         AS "Qty",
+               SUM(si.quantity * si.unitprice) AS "IQD"
         FROM   salesitems si
-        JOIN   item i ON i.itemid = si.itemid       -- for names / codes
-        JOIN   sales s ON s.saleid = si.saleid
+        JOIN   sales s  ON s.saleid = si.saleid
+        JOIN   item  i  ON i.itemid = si.itemid
         WHERE  s.cashier = %s
           AND  s.saletime BETWEEN %s AND %s
-        GROUP  BY i.itemcode, i.itemnameenglish
+        GROUP  BY i.itemid, i.itemnameenglish
         ORDER  BY "IQD" DESC
         """,
         (cashier, start, end),
