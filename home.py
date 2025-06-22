@@ -1,4 +1,4 @@
-# home.py  – single-page dashboard with KPI cards & gauge (bug-fixed)
+# home.py – single-page dashboard with KPI cards & gauge (logo removed)
 
 import base64
 from typing import Iterable
@@ -143,7 +143,6 @@ def home() -> None:
     # ── hero ──────────────────────────────────────────────────────────────────
     st.markdown(
         "<div class='hero'>"
-        "<img src='assets/logo.png' width='170'/>"
         "<h2>Inventory Portal</h2>"
         "<p>Stay on top of stock levels across your business.</p>"
         "</div>",
@@ -156,11 +155,9 @@ def home() -> None:
     low_stock_cnt = (df["quantity"] < df["threshold"]).sum()
     classes_num   = df["classcat"].nunique()
     dept_num      = df["departmentcat"].nunique()
-
-    # **Bug fix here**: convert today to pandas Timestamp before comparing
     expired_cnt   = (
-        pd.to_datetime(df["expirationdate"], errors="coerce")
-        < pd.Timestamp.today().normalize()
+        pd.to_datetime(df["expirationdate"], errors="coerce") <
+        pd.Timestamp.today().normalize()
     ).sum()
 
     # ── KPI card row ──────────────────────────────────────────────────────────
@@ -295,7 +292,6 @@ def home() -> None:
             num_rows="dynamic",
         )
 
-        # CSV download + toast
         if st.download_button(
             "Download CSV",
             data=filtered.to_csv(index=False),
