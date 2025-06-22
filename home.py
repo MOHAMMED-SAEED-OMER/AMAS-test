@@ -1,9 +1,8 @@
-# home.py  – single-page dashboard with KPI cards & gauge
+# home.py  – single-page dashboard with KPI cards & gauge (bug-fixed)
+
 import base64
-from datetime import date
 from typing import Iterable
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -12,9 +11,8 @@ import streamlit as st
 from db_handler import DatabaseManager
 
 
-# ─────────────────────────────  UI helpers  ──────────────────────────────────
+# ───────────────────────────────  UI helpers  ────────────────────────────────
 def _inject_css() -> None:
-    """Run only once per session to load fonts + card styles."""
     if st.session_state.get("_home_css_done"):
         return
 
@@ -23,13 +21,12 @@ def _inject_css() -> None:
         <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap"
               rel="stylesheet">
         <style>
-        html,body,[class*="css"],.stApp {
+        html,body,[class*="css"],.stApp{
             font-family:'Roboto',sans-serif;
             background:linear-gradient(to bottom right,#f8f9fb,#e3e6f0);
         }
-        /* KPI card */
         .kpi-card{
-            background:#ffffff;border-radius:10px;
+            background:#fff;border-radius:10px;
             box-shadow:0 3px 8px rgba(0,0,0,0.06);
             padding:1rem;display:flex;align-items:center;gap:0.75rem;
         }
@@ -37,7 +34,6 @@ def _inject_css() -> None:
         .kpi-text{display:flex;flex-direction:column}
         .kpi-value{font-size:1.4rem;font-weight:700;margin:0}
         .kpi-label{font-size:0.85rem;color:#666;margin:0}
-        /* hero */
         .hero{
             background:linear-gradient(90deg,#5c8df6,#a66ef6);
             color:#fff;border-radius:8px;text-align:center;
@@ -55,7 +51,6 @@ def _image_uri(data: bytes | None) -> str | None:
 
 
 def _kpi_cards(kpis: list[tuple[str, int | float, str]]) -> None:
-    """Render KPI cards in a single row."""
     cols = st.columns(len(kpis))
     for col, (label, val, icon) in zip(cols, kpis):
         col.markdown(
@@ -72,7 +67,7 @@ def _kpi_cards(kpis: list[tuple[str, int | float, str]]) -> None:
         )
 
 
-# ───────────────────────────  Data functions  ────────────────────────────────
+# ──────────────────────────  Data retrieval + filters  ───────────────────────
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory() -> pd.DataFrame:
     query = """
@@ -85,6 +80,7 @@ def _load_inventory() -> pd.DataFrame:
     """
     db = DatabaseManager()
     df = db.fetch_data(query)
+
     if df.empty:
         return df
 
@@ -134,7 +130,7 @@ def _apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     return f
 
 
-# ──────────────────────────────  Main page  ──────────────────────────────────
+# ─────────────────────────────────  Main page  ───────────────────────────────
 def home() -> None:
     _inject_css()
     st.title("🏠 Home")
@@ -144,7 +140,7 @@ def home() -> None:
         st.info("No inventory data available.")
         return
 
-    # hero
+    # ── hero ──────────────────────────────────────────────────────────────────
     st.markdown(
         "<div class='hero'>"
         "<img src='assets/logo.png' width='170'/>"
@@ -154,27 +150,32 @@ def home() -> None:
         unsafe_allow_html=True,
     )
 
-    # KPI calculations
+    # ── KPI calculations ──────────────────────────────────────────────────────
     total_items   = len(df)
     total_qty     = int(df["quantity"].sum())
     low_stock_cnt = (df["quantity"] < df["threshold"]).sum()
     classes_num   = df["classcat"].nunique()
     dept_num      = df["departmentcat"].nunique()
-    expired_cnt   = (pd.to_datetime(df["expirationdate"], errors="coerce") < date.today()).sum()
 
-    # KPI card row
+    # **Bug fix here**: convert today to pandas Timestamp before comparing
+    expired_cnt   = (
+        pd.to_datetime(df["expirationdate"], errors="coerce")
+        < pd.Timestamp.today().normalize()
+    ).sum()
+
+    # ── KPI card row ──────────────────────────────────────────────────────────
     _kpi_cards(
         [
-            ("Items",         total_items,   "🗃️"),
-            ("Total Stock",   total_qty,     "📦"),
-            ("Low Stock",     low_stock_cnt, "⚠️"),
-            ("Classes",       classes_num,   "🏷️"),
-            ("Departments",   dept_num,      "🏢"),
-            ("Expired",       expired_cnt,   "⌛"),
+            ("Items",       total_items,   "🗃️"),
+            ("Total Stock", total_qty,     "📦"),
+            ("Low Stock",   low_stock_cnt, "⚠️"),
+            ("Classes",     classes_num,   "🏷️"),
+            ("Departments", dept_num,      "🏢"),
+            ("Expired",     expired_cnt,   "⌛"),
         ]
     )
 
-    # Low-stock percentage gauge
+    # ── Low-stock % gauge ─────────────────────────────────────────────────────
     low_pct = round((low_stock_cnt / total_items) * 100, 1) if total_items else 0
     gauge = go.Figure(
         go.Indicator(
@@ -195,15 +196,13 @@ def home() -> None:
     )
     st.plotly_chart(gauge, use_container_width=True)
 
-    # Quick-insight charts
+    # ── Quick-insight charts ─────────────────────────────────────────────────
     tab_bar, tab_pie = st.tabs(["Top Classes", "Departments Share"])
 
     with tab_bar:
         top_classes = (
             df.groupby("classcat", as_index=False)["quantity"]
-              .sum()
-              .sort_values("quantity", ascending=False)
-              .head(10)
+              .sum().sort_values("quantity", ascending=False).head(10)
         )
         if not top_classes.empty:
             st.plotly_chart(
@@ -214,8 +213,7 @@ def home() -> None:
     with tab_pie:
         dept_pie = (
             df.groupby("departmentcat", as_index=False)["quantity"]
-              .sum()
-              .sort_values("quantity", ascending=False)
+              .sum().sort_values("quantity", ascending=False)
         )
         if not dept_pie.empty:
             st.plotly_chart(
@@ -223,7 +221,7 @@ def home() -> None:
                 use_container_width=True,
             )
 
-    # Details/Actions
+    # ── Details & tables ─────────────────────────────────────────────────────
     with st.expander("🔧 Details & Tables", expanded=False):
         show_images = st.sidebar.checkbox("Show Images", value=True, key="show_img")
         filtered = _apply_filters(df)
@@ -297,6 +295,7 @@ def home() -> None:
             num_rows="dynamic",
         )
 
+        # CSV download + toast
         if st.download_button(
             "Download CSV",
             data=filtered.to_csv(index=False),
