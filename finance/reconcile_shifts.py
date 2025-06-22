@@ -111,7 +111,7 @@ def reconcile_shifts_tab():
                             user_email,
                         )
                         st.success("Shift approved.")
-                        st.experimental_rerun()
+                        st.rerun()
 
     # ───── recently approved
     with st.expander("✅ Recently approved (7 days)"):
