@@ -1,51 +1,32 @@
-# home.py  – streamlined single-page dashboard
+# home.py  – streamlined single-page dashboard (no global st.set_page_config)
+
 import base64
 from typing import Iterable
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 from db_handler import DatabaseManager
 
-# --------------------------------------------------------------------- setup
-st.set_page_config(
-    page_title="AMAS Inventory",
-    page_icon="📦",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-db = DatabaseManager()
-
-# ----------------------------------------------------------------- utilities
+# ──────────────────────────────────────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def _inject_css() -> None:
-    """Inject lightweight CSS; runs once per session."""
+    """Add once-per-session CSS."""
     if st.session_state.get("_home_css_done"):
         return
-
     st.markdown(
         """
         <style>
-        html, body, [class*="css"], .stApp {
-            font-family: 'Roboto', sans-serif;
-            background: linear-gradient(to bottom right,#f8f9fb,#e3e6f0);
+        html,body,[class*="css"],.stApp{
+            font-family:'Roboto',sans-serif;
+            background:linear-gradient(to bottom right,#f8f9fb,#e3e6f0);
         }
-        .hero {
+        .hero{
             background:linear-gradient(90deg,#5c8df6,#a66ef6);
-            color:white;
-            border-radius:8px;
-            padding:2rem 1rem;
-            text-align:center;
-            margin-bottom:2rem;
-        }
-        /* subtle card effect for metrics */
-        div[data-testid="stMetric"] {
-            background: #ffffff20;
-            border: 1px solid #ffffff40;
-            border-radius: 8px;
-            padding: 0.4rem;
+            color:#fff;border-radius:8px;padding:2rem 1rem;
+            text-align:center;margin-bottom:2rem;
         }
         </style>
         """,
@@ -55,17 +36,13 @@ def _inject_css() -> None:
 
 
 def _image_uri(data: bytes | None) -> str | None:
-    return (
-        f"data:image/jpeg;base64,{base64.b64encode(data).decode()}"
-        if data
-        else None
-    )
+    return f"data:image/jpeg;base64,{base64.b64encode(data).decode()}" if data else None
 
 
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory() -> pd.DataFrame:
-    """Fetch inventory and aggregate quantities."""
-    q = """
+    """Fetch and aggregate inventory records from PostgreSQL."""
+    query = """
         SELECT i.ItemID, i.ItemNameEnglish, i.ClassCat, i.DepartmentCat,
                i.SectionCat, i.FamilyCat, i.SubFamilyCat, i.ItemPicture,
                inv.Quantity, inv.ExpirationDate, inv.StorageLocation,
@@ -73,7 +50,8 @@ def _load_inventory() -> pd.DataFrame:
         FROM Inventory inv
         JOIN Item i ON inv.ItemID = i.ItemID
     """
-    df = db.fetch_data(q)
+    db = DatabaseManager()
+    df = db.fetch_data(query)
     if df.empty:
         return df
 
@@ -83,67 +61,52 @@ def _load_inventory() -> pd.DataFrame:
 
     return (
         df.groupby(["itemid", "expirationdate", "storagelocation"], as_index=False)
-        .agg(
-            {
-                "itemnameenglish": "first",
-                "classcat": "first",
-                "departmentcat": "first",
-                "sectioncat": "first",
-                "familycat": "first",
-                "subfamilycat": "first",
-                "threshold": "first",
-                "averagerequired": "first",
-                "itempicture": "first",
-                "quantity": "sum",
-            }
-        )
+        .agg({
+            "itemnameenglish": "first",
+            "classcat": "first",
+            "departmentcat": "first",
+            "sectioncat": "first",
+            "familycat": "first",
+            "subfamilycat": "first",
+            "threshold": "first",
+            "averagerequired": "first",
+            "itempicture": "first",
+            "quantity": "sum",
+        })
     )
 
 
-# ----------------------------------------------------------------- sidebar filters
-def _sidebar_filters(df: pd.DataFrame) -> dict[str, Iterable[str | None]]:
-    """Render sidebar controls and return selections."""
-    with st.sidebar:
-        st.header("🔍 Filters")
-        search = st.text_input("Item name contains …", key="inv_search")
-
-        classes = _multiselect("Class", df["classcat"].unique(), "f_class")
-        depts = _multiselect("Department", df["departmentcat"].unique(), "f_dept")
-        sections = _multiselect("Section", df["sectioncat"].unique(), "f_sec")
-
-        show_images = st.checkbox("Show images", value=True)
-
-    return {
-        "search": search,
-        "classes": classes,
-        "depts": depts,
-        "sections": sections,
-        "show_images": show_images,
-    }
-
-
-def _multiselect(label: str, options: Iterable[str], key: str) -> list[str]:
+def _filter_multiselect(label: str, options: Iterable[str], key: str) -> list[str]:
     opts = sorted({o for o in options if pd.notna(o)})
-    return st.multiselect(label, options=opts, key=key) if opts else []
+    return st.sidebar.multiselect(label, options=opts, key=key) if opts else []
 
 
-def _apply_filters(df: pd.DataFrame, flt: dict) -> pd.DataFrame:
-    f = df.copy()
-    if flt["search"]:
-        f = f[
-            f["itemnameenglish"].str.contains(flt["search"], case=False, na=False)
-        ]
-    if flt["classes"]:
-        f = f[f["classcat"].isin(flt["classes"])]
-    if flt["depts"]:
-        f = f[f["departmentcat"].isin(flt["depts"])]
-    if flt["sections"]:
-        f = f[f["sectioncat"].isin(flt["sections"])]
-    return f
+def _apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+    """Sidebar search + category filters."""
+    st.sidebar.header("🔎 Filters")
+    search = st.sidebar.text_input("Search Item Name", key="inv_search")
+    classes = _filter_multiselect("Class", df["classcat"].unique(), "f_class")
+    depts = _filter_multiselect("Department", df["departmentcat"].unique(), "f_dept")
+    sections = _filter_multiselect("Section", df["sectioncat"].unique(), "f_sec")
+
+    filt = df.copy()
+    if search:
+        filt = filt[filt["itemnameenglish"].str.contains(search, case=False, na=False)]
+    if classes:
+        filt = filt[filt["classcat"].isin(classes)]
+    if depts:
+        filt = filt[filt["departmentcat"].isin(depts)]
+    if sections:
+        filt = filt[filt["sectioncat"].isin(sections)]
+
+    return filt
 
 
-# ----------------------------------------------------------------- main page
+# ──────────────────────────────────────────────────────────────────────────────
+# main entry
+# ──────────────────────────────────────────────────────────────────────────────
 def home() -> None:
+    """Render the Inventory Home page (single tab)."""
     _inject_css()
     st.title("🏠 Home")
 
@@ -152,158 +115,143 @@ def home() -> None:
         st.info("No inventory data available.")
         return
 
-    # ------------- HERO -----------------------------------------------------
+    # ── hero ──────────────────────────────────────────────────────────────────
     st.markdown(
-        """
-        <div class='hero'>
-            <img src='assets/logo.png' width='180' />
-            <h2>Inventory Portal</h2>
-            <p>Stay on top of stock levels across your business.</p>
-        </div>
-        """,
+        "<div class='hero'>"
+        "<img src='assets/logo.png' width='180'/>"
+        "<h2>Inventory Portal</h2>"
+        "<p>Stay on top of stock levels across your business.</p>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
-    # ------------- KPI row --------------------------------------------------
-    items = len(df)
-    total_qty = int(df["quantity"].sum())
-    low_stock_cnt = int((df["quantity"] < df["threshold"]).sum())
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    items      = len(df)
+    total_qty  = int(df["quantity"].sum())
+    low_count  = (df["quantity"] < df["threshold"]).sum()
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("🗃️ Items", items)
-    k2.metric("📦 Total Stock", total_qty)
-    k3.metric("⚠️ Low Stock", low_stock_cnt)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🗃️ Items", items)
+    c2.metric("📦 Total Stock", total_qty)
+    c3.metric("⚠️ Low Stock", low_count)
 
-    if low_stock_cnt:
-        st.warning(f"⚠️ {low_stock_cnt} items below threshold")
+    if low_count > 0:
+        st.warning(f"{low_count} items are below their threshold.")
 
-    # ------------- quick insights (tabs) ------------------------------------
-    t1, t2 = st.tabs(["Top Classes", "Departments Share"])
+    # ── quick insight charts (two tabs) ───────────────────────────────────────
+    tab_bar, tab_pie = st.tabs(["Top Classes", "Departments Share"])
 
-    with t1:
-        cls_df = (
+    with tab_bar:
+        top_classes = (
             df.groupby("classcat", as_index=False)["quantity"]
             .sum()
             .sort_values("quantity", ascending=False)
             .head(10)
         )
-        if not cls_df.empty:
-            st.subheader("Top Classes by Stock")
+        if not top_classes.empty:
             st.plotly_chart(
-                px.bar(cls_df, x="classcat", y="quantity", color="classcat"),
+                px.bar(top_classes, x="classcat", y="quantity", color="classcat"),
                 use_container_width=True,
             )
 
-    with t2:
-        dept_df = (
+    with tab_pie:
+        dept_pie = (
             df.groupby("departmentcat", as_index=False)["quantity"]
             .sum()
             .sort_values("quantity", ascending=False)
         )
-        if not dept_df.empty:
-            st.subheader("Stock Share by Department")
+        if not dept_pie.empty:
             st.plotly_chart(
-                px.pie(dept_df, values="quantity", names="departmentcat"),
+                px.pie(dept_pie, names="departmentcat", values="quantity"),
                 use_container_width=True,
             )
 
-    # ------------- details expander -----------------------------------------
-    filters = _sidebar_filters(df)
-    filtered = _apply_filters(df, filters)
+    # ── details & actions ─────────────────────────────────────────────────────
+    with st.expander("🔧 Details & Tables", expanded=False):
+        show_images = st.sidebar.checkbox("Show Images", value=True, key="show_img")
 
-    with st.expander("🔧 Details & Actions", expanded=False):
-        # ------- low stock table --------------------------------------------
+        filtered = _apply_filters(df)
+
+        # low-stock table
         low_df = (
             filtered.groupby("itemid", as_index=False)
-            .agg(
-                {
-                    "itemnameenglish": "first",
-                    "quantity": "sum",
-                    "threshold": "first",
-                    "averagerequired": "first",
-                    "itempicture": "first",
-                }
-            )
+            .agg({
+                "itemnameenglish": "first",
+                "quantity": "sum",
+                "threshold": "first",
+                "averagerequired": "first",
+                "itempicture": "first",
+            })
             .query("quantity < threshold")
         )
         if not low_df.empty:
-            low_df["reorderamount"] = (
-                low_df["averagerequired"] - low_df["quantity"]
-            )
+            low_df["reorderamount"] = low_df["averagerequired"] - low_df["quantity"]
+            cols = [
+                "itempicture",
+                "itemnameenglish",
+                "quantity",
+                "threshold",
+                "reorderamount",
+            ]
+            if not show_images:
+                cols.remove("itempicture")
+
             st.subheader("⚠️ Low Stock Items")
-            _show_table(
-                low_df,
-                [
-                    "itempicture",
-                    "itemnameenglish",
-                    "quantity",
-                    "threshold",
-                    "reorderamount",
-                ],
-                filters["show_images"],
+            st.data_editor(
+                low_df[cols],
+                column_config={
+                    "itempicture": st.column_config.ImageColumn("Item Picture"),
+                    "itemnameenglish": "Item Name",
+                    "quantity": "Qty",
+                    "threshold": "Threshold",
+                    "reorderamount": "Reorder",
+                }
+                if show_images
+                else None,
+                hide_index=True,
+                use_container_width=True,
             )
         else:
             st.success("All stock levels are sufficient.")
 
-        # ------- full inventory --------------------------------------------
-        st.subheader("📦 Full Inventory")
-        _show_table(
-            filtered,
-            [
-                "itempicture",
-                "itemnameenglish",
-                "classcat",
-                "departmentcat",
-                "sectioncat",
-                "familycat",
-                "subfamilycat",
-                "quantity",
-                "threshold",
-                "averagerequired",
-                "expirationdate",
-                "storagelocation",
-            ],
-            filters["show_images"],
+        # full inventory table
+        st.subheader("📋 Full Inventory")
+        full_cols = [
+            "itempicture",
+            "itemnameenglish",
+            "classcat",
+            "departmentcat",
+            "sectioncat",
+            "familycat",
+            "subfamilycat",
+            "quantity",
+            "threshold",
+            "averagerequired",
+            "expirationdate",
+            "storagelocation",
+        ]
+        if not show_images:
+            full_cols.remove("itempicture")
+
+        st.data_editor(
+            filtered[full_cols],
+            column_config=(
+                {"itempicture": st.column_config.ImageColumn("Item Picture")}
+                if show_images
+                else None
+            ),
+            hide_index=True,
+            use_container_width=True,
+            num_rows="dynamic",
         )
 
-        # ------- CSV download ----------------------------------------------
-        clicked = st.download_button(
+        # CSV download + toast
+        if st.download_button(
             "Download CSV",
             data=filtered.to_csv(index=False),
             file_name="inventory_data.csv",
             mime="text/csv",
-        )
-        if clicked:
-            st.toast("✅ CSV downloaded")
+        ):
+            st.toast("✅ Inventory CSV downloaded")
 
-
-# ----------------------------------------------------------------- helpers
-def _show_table(df: pd.DataFrame, cols: list[str], show_images: bool) -> None:
-    """Utility to display a data_editor with optional image column."""
-    if not show_images and "itempicture" in cols:
-        cols = [c for c in cols if c != "itempicture"]
-
-    column_config = {
-        "itemnameenglish": "Item Name",
-        "classcat": "Class",
-        "departmentcat": "Department",
-        "sectioncat": "Section",
-        "familycat": "Family",
-        "subfamilycat": "Sub-Family",
-        "quantity": "Quantity",
-        "threshold": "Threshold",
-        "averagerequired": "Avg Required",
-        "expirationdate": "Expiration",
-        "storagelocation": "Storage",
-        "reorderamount": "Reorder",
-    }
-    if show_images and "itempicture" in cols:
-        column_config["itempicture"] = st.column_config.ImageColumn("Item Picture")
-
-    st.data_editor(
-        df[cols],
-        column_config=column_config,
-        hide_index=True,
-        use_container_width=True,
-        num_rows="dynamic",
-    )
+# End of file
