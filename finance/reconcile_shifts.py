@@ -1,136 +1,140 @@
 """
-Finance ▸ Reconcile Shifts
-Shows each cashier-shift closure that hasn’t been reviewed yet.
-Finance can approve or adjust the amount and leave a note.
+Finance ▸ Reconcile Shifts  –  version with EDIT + APPROVE
 """
-
 from __future__ import annotations
 import streamlit as st
-from datetime import datetime, timezone
+from datetime import datetime
 from db_handler import DatabaseManager
 
-_db = DatabaseManager()                         # shared Neon helper
+_db = DatabaseManager()
+DENOMS = [50_000, 25_000, 10_000, 5_000, 1_000, 500, 250]
 
 
-# ───────────────────────── DB helpers ──────────────────────────
+# ──────────────────── DB helper ─────────────────────
 def fetch_pending():
-    """All closures that Finance hasn’t reviewed yet."""
     return _db.fetch_data(
-        """
-        SELECT *
-        FROM   cashier_shift_closure
-        WHERE  finance_checked = FALSE
-        ORDER  BY shift_end DESC
-        """
+        "SELECT * FROM cashier_shift_closure "
+        "WHERE finance_checked = FALSE "
+        "ORDER BY shift_end DESC"
     )
 
 
-def fetch_recent_approved(days: int = 7):
-    """Last few days of already-approved closures (for quick reference)."""
+def fetch_recent(days=7):
     return _db.fetch_data(
-        """
-        SELECT *
-        FROM   cashier_shift_closure
-        WHERE  finance_checked = TRUE
-          AND  finance_checked_at >= CURRENT_DATE - %s::INT
-        ORDER  BY finance_checked_at DESC
-        """,
+        "SELECT * FROM cashier_shift_closure "
+        "WHERE finance_checked = TRUE "
+        "  AND finance_checked_at >= CURRENT_DATE - %s::INT "
+        "ORDER  BY finance_checked_at DESC",
         (days,),
     )
 
 
-def approve_shift(row, approved_amt: float, note: str, finance_email: str):
-    """Mark closure as checked (with optional adjustment)."""
+def update_with_finance(row_id: int, counts: dict[int, int],
+                        approved: float, note: str, email: str):
     _db.execute_command(
         """
         UPDATE cashier_shift_closure
-           SET finance_checked      = TRUE,
-               finance_checked_at   = NOW(),
-               finance_checked_by   = %s,
-               finance_approved_amount = %s,
-               finance_note         = %s
-         WHERE closure_id = %s
+           SET
+             finance_cnt_50000 = %(n50)s,
+             finance_cnt_25000 = %(n25)s,
+             finance_cnt_10000 = %(n10)s,
+             finance_cnt_5000  = %(n5)s,
+             finance_cnt_1000  = %(n1)s,
+             finance_cnt_500   = %(n05)s,
+             finance_cnt_250   = %(n025)s,
+             finance_approved_amount = %(approved)s,
+             finance_note      = %(note)s,
+             finance_checked   = TRUE,
+             finance_checked_by  = %(by)s,
+             finance_checked_at  = NOW()
+         WHERE closure_id = %(cid)s
         """,
-        (
-            finance_email,
-            approved_amt,
-            note,
-            int(row["closure_id"]),
-        ),
+        {
+            "cid": row_id, "approved": approved, "note": note, "by": email,
+            "n50": counts[50_000], "n25": counts[25_000], "n10": counts[10_000],
+            "n5": counts[5_000], "n1": counts[1_000],
+            "n05": counts[500], "n025": counts[250],
+        },
     )
 
 
-# ─────────────────────────── UI ───────────────────────────────
+# ──────────────────── UI ────────────────────────────
 def reconcile_shifts_tab():
     st.subheader("💳 Reconcile Cashier Shifts")
 
-    finance_email = st.session_state.get("user_email", "finance@local")
-    pending_df    = fetch_pending()
+    user_email = st.session_state.get("user_email", "finance@local")
+    pending = fetch_pending()
 
-    if pending_df.empty:
-        st.success("No pending shifts — all caught up!")
+    if pending.empty:
+        st.success("No pending shifts.")
     else:
-        st.info(f"**{len(pending_df)} shift(s)** need reconciliation.")
-        for _, row in pending_df.iterrows():
-            with st.expander(
-                f"{row.cashier} — Shift ended {row.shift_end:%d %b %H:%M}"
-            ):
+        st.info(f"{len(pending)} shift(s) awaiting approval.")
+        for _, row in pending.iterrows():
+            exp = st.expander(
+                f"{row.cashier} — ended {row.shift_end:%d-%b %H:%M}"
+            )
+
+            with exp:
                 col1, col2, col3 = st.columns(3)
-                col1.metric("System total",  f"{row.system_total:,.0f}")
-                col2.metric("Counted cash",  f"{row.cash_total:,.0f}")
-                col3.metric("Δ",             f"{row.discrepancy:+,.0f}",
+                col1.metric("System total", f"{row.system_total:,.0f}")
+                col2.metric("Cashier counted", f"{row.cash_total:,.0f}")
+                col3.metric("Δ", f"{row.discrepancy:+,.0f}",
                             delta_color="inverse")
 
-                # Bill breakdown
-                bill_cols = {
-                    50_000: row.cnt_50000, 25_000: row.cnt_25000,
-                    10_000: row.cnt_10000,  5_000: row.cnt_5000,
-                     1_000: row.cnt_1000,     500: row.cnt_500,
-                       250: row.cnt_250,
-                }
-                st.table({
-                    "Denomination": [f"{d:,}" for d in bill_cols],
-                    "Count": list(bill_cols.values()),
-                })
+                # ── EDIT FORM ──────────────────────────────────────
+                with st.form(f"edit_form_{row.closure_id}", clear_on_submit=False):
+                    st.markdown("##### Finance count (edit if needed)")
+                    c = st.columns(len(DENOMS))
+                    counts = {}
+                    for i, d in enumerate(DENOMS):
+                        default = int(row[f"cnt_{d}"])
+                        counts[d] = c[i].number_input(
+                            f"{d:,}", min_value=0, value=default, step=1,
+                            key=f"cnt_{d}_{row.closure_id}",
+                        )
 
-                st.markdown("---")
-                adj_amt = st.number_input(
-                    "Approved amount (IQD)",
-                    value=float(row.cash_total),
-                    step=1000.0,
-                    key=f"approve_amt_{row.closure_id}",
-                )
-                note = st.text_area(
-                    "Finance note (optional)",
-                    key=f"note_{row.closure_id}",
-                )
-                if st.button("✅ Approve", key=f"approve_btn_{row.closure_id}"):
-                    approve_shift(row, adj_amt, note, finance_email)
-                    st.success("Shift reconciled.")
-                    st.experimental_rerun()
+                    approved_total = sum(d * n for d, n in counts.items())
+                    st.write(f"**Calculated total:** {approved_total:,.0f} IQD")
 
-    # Recently approved
-    appr_df = fetch_recent_approved()
-    with st.expander("✅ Recently approved (last 7 days)"):
-        if appr_df.empty:
-            st.write("Nothing yet.")
+                    note = st.text_area(
+                        "Finance note (optional)",
+                        key=f"note_{row.closure_id}",
+                    )
+
+                    submitted = st.form_submit_button("✅ Save & Approve")
+                    if submitted:
+                        update_with_finance(
+                            int(row.closure_id),
+                            counts,
+                            approved_total,
+                            note,
+                            user_email,
+                        )
+                        st.success("Shift approved.")
+                        st.experimental_rerun()
+
+    # ───── recently approved
+    with st.expander("✅ Recently approved (7 days)"):
+        df = fetch_recent()
+        if df.empty:
+            st.write("None.")
         else:
-            disp = appr_df[[
-                "cashier", "shift_end", "cash_total",
-                "finance_approved_amount", "finance_checked_by",
-                "finance_checked_at",
+            show = df[[
+                "cashier", "shift_end",
+                "cash_total", "finance_approved_amount",
+                "finance_checked_by", "finance_checked_at",
             ]].rename(columns={
                 "cashier": "Cashier",
                 "shift_end": "Ended",
-                "cash_total": "Counted",
-                "finance_approved_amount": "Approved",
+                "cash_total": "Cashier",
+                "finance_approved_amount": "Finance",
                 "finance_checked_by": "By",
                 "finance_checked_at": "When",
             })
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.dataframe(show, use_container_width=True, hide_index=True)
 
 
-# for standalone debug
+# Dev entry
 if __name__ == "__main__":
-    st.set_page_config(page_title="Reconcile Shifts", layout="wide")
+    st.set_page_config("Reconcile", layout="wide")
     reconcile_shifts_tab()
