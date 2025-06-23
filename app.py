@@ -43,11 +43,13 @@ def _safe_rerun():
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
-    else:  # fallback
-        st.experimental_set_query_params(_=str(st.session_state.get("_rf", 0) + 1))
+    else:
+        cnt = st.session_state.get("_rf", 0) + 1
+        st.session_state["_rf"] = cnt
+        st.experimental_set_query_params(_=cnt)
 
-def _inject_global_css():
-    """Dark theme + teal accent & card styling (called once)."""
+def _inject_base_css():
+    """Global dark theme, teal accents, card styles, back button style."""
     if st.session_state.get("_css_done"):
         return
     st.markdown(
@@ -60,11 +62,6 @@ def _inject_global_css():
             background:linear-gradient(135deg,#0E1117 0%,#1E222A 100%);
             color:#F6F7F9;
         }
-        /* hide sidebar just on landing */
-        [data-testid="stSidebar"], [data-testid="stSidebarResizer"]{
-            display:none !important;
-        }
-
         /* card buttons */
         button[kind="secondary"]{
             width:100%; height:100%;
@@ -84,15 +81,16 @@ def _inject_global_css():
             border-color:#1FDDC1;
             cursor:pointer;
         }
-
-        /* back-to-menu button */
-        .back-btn > button{
+        /* teal back button */
+        button[id="back_to_menu"]{
             background:#1ABC9C !important;
             border:none !important;
             font-weight:600;
-            border-radius:10px !important;
+            border-radius:12px !important;
+            padding:0.5rem 1rem !important;
+            margin-bottom:1rem;
         }
-        .back-btn > button:hover{
+        button[id="back_to_menu"]:hover{
             background:#1FDDC1 !important;
         }
         </style>
@@ -101,9 +99,21 @@ def _inject_global_css():
     )
     st.session_state["_css_done"] = True
 
+def _hide_sidebar_css():
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"],
+        [data-testid="stSidebarResizer"] {display:none !important;}
+        .stApp {padding-left:1rem; padding-right:1rem;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # ───────────────────────────  LANDING GRID  ────────────────────────────────
 def landing_menu(perms: dict, role: str):
-    _inject_global_css()
+    _hide_sidebar_css()
     st.title("🗂️ **AMAS Portal**")
     st.caption("Select a module to begin")
 
@@ -131,11 +141,13 @@ def landing_menu(perms: dict, role: str):
 
 # ───────────────────────────  BACK BUTTON  ─────────────────────────────────
 def back_to_menu():
-    return st.container().button("⬅︎ Menu", key="back_to_menu", type="secondary")
+    return st.button("⬅︎ Menu", key="back_to_menu")
 
 # ───────────────────────────  MAIN FLOW  ───────────────────────────────────
 def main() -> None:
+    _inject_base_css()       # load styling once
     authenticate()
+
     perms = st.session_state.get("permissions", {})
     role  = st.session_state.get("user_role", "")
 
@@ -145,12 +157,10 @@ def main() -> None:
         landing_menu(perms, role)
         return
 
-    # back button on content pages
-    with st.container().classed("back-btn"):
-        if back_to_menu():
-            st.session_state["page"] = "LANDING"
-            _safe_rerun()
-            return
+    if back_to_menu():
+        st.session_state["page"] = "LANDING"
+        _safe_rerun()
+        return
 
     # routing
     for label, _icon, flag, func in PAGES:
