@@ -1,4 +1,4 @@
-# app.py ────────────────────────────────────────────────────────────────────
+# app.py  ───────── Vibrant card-grid navigation ────────────────────────────
 import streamlit as st
 st.set_page_config(page_title="Inventory Management System", layout="wide")
 
@@ -19,37 +19,37 @@ from shelf_map.main_map          import main as shelf_map_page
 from inv_signin  import authenticate
 from admin.user_admin_tabs import show_user_admin
 
-# ───────────────────────────  PAGE CONFIG  ────────────────────────────────
+# ─────────────────────────  NAV CONFIG  ────────────────────────────────────
 PAGES = [
-    ("Home",           "🏠", "CanAccessHome",        home.home),
-    ("Item",           "📦", "CanAccessItems",       mainitem.item_page),
-    ("Receive Items",  "📥", "CanAccessReceive",     main_receive_page),
-    ("Purchase Order", "🧾", "CanAccessPO",          mainpo.po_page),
-    ("Selling Area",   "🛒", "CanAccessSellingArea", main_shelf_page),
-    ("Cashier",        "💵", "CanAccessCashier",     main_cashier_page),
-    ("Finance",        "💰", "CanAccessFinance",     main_finance_page),
-    ("Returns",        "↩️", "CanAccessReturns",     main_return_page),
-    ("Issues",         "🐞", "CanAccessIssues",      issues_page),
-    ("Shelf Map",      "🗺️", "CanAccessShelfMap",   shelf_map_page),
-    ("Reports",        "📊", "CanAccessReports",     main_reports.reports_page),
-    ("User Management","🛠️", "ROLE_ADMIN",          show_user_admin),
-    ("Assets",         "💼", None, lambda: st.info("Assets page WIP")),
-    ("Supplier",       "🚚", None, lambda: st.info("Supplier page WIP")),
+    ("Home",            "🏠", "CanAccessHome",        home.home),
+    ("Item",            "📦", "CanAccessItems",       mainitem.item_page),
+    ("Receive Items",   "📥", "CanAccessReceive",     main_receive_page),
+    ("Purchase Order",  "🧾", "CanAccessPO",          mainpo.po_page),
+    ("Selling Area",    "🛒", "CanAccessSellingArea", main_shelf_page),
+    ("Cashier",         "💵", "CanAccessCashier",     main_cashier_page),
+    ("Finance",         "💰", "CanAccessFinance",     main_finance_page),
+    ("Returns",         "↩️", "CanAccessReturns",     main_return_page),
+    ("Issues",          "🐞", "CanAccessIssues",      issues_page),
+    ("Shelf Map",       "🗺️", "CanAccessShelfMap",   shelf_map_page),
+    ("Reports",         "📊", "CanAccessReports",     main_reports.reports_page),
+    ("User Management", "🛠️", "ROLE_ADMIN",          show_user_admin),
+    ("Assets",          "💼", None, lambda: st.info("Assets page WIP")),
+    ("Supplier",        "🚚", None, lambda: st.info("Supplier page WIP")),
 ]
 
-# ───────────────────────────  UTILS  ───────────────────────────────────────
+# ─────────────────────────  UTILS  ─────────────────────────────────────────
 def _safe_rerun():
     if hasattr(st, "rerun"):
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
     else:
-        cnt = st.session_state.get("_rf", 0) + 1
-        st.session_state["_rf"] = cnt
-        st.experimental_set_query_params(_=cnt)
+        c = st.session_state.get("_rf", 0) + 1
+        st.session_state["_rf"] = c
+        st.experimental_set_query_params(_=c)
 
+# colourful CSS injected once
 def _inject_base_css():
-    """Global dark theme, teal accents, card styles, back button style."""
     if st.session_state.get("_css_done"):
         return
     st.markdown(
@@ -57,41 +57,47 @@ def _inject_base_css():
         <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap"
               rel="stylesheet">
         <style>
-        html, body, [class*="css"], .stApp{
+        html,body,[class*="css"],.stApp{
             font-family:'Poppins',sans-serif;
-            background:linear-gradient(135deg,#0E1117 0%,#1E222A 100%);
-            color:#F6F7F9;
+            background:linear-gradient(120deg,#f6d365 0%, #fda085 100%);
+            background-attachment:fixed;
+            color:#fafbfc;
         }
-        /* card buttons */
+        /* ✨ CARD BUTTON STYLE *************************************************/
         button[kind="secondary"]{
             width:100%; height:100%;
-            background:#1A1F29;
-            border:2px solid #1ABC9C;
-            border-radius:16px;
-            padding:2.2rem 0.6rem !important;
-            font-size:1.05rem; font-weight:600;
-            color:#F6F7F9;
-            transition:transform .15s ease, box-shadow .15s ease;
-            white-space:normal; line-height:1.35;
+            padding:2.3rem 0.7rem !important;
+            font-size:1.05rem; font-weight:600; line-height:1.35;
+            border:none; border-radius:18px;
+            color:#ffffff; cursor:pointer;
+            transition: transform .15s ease, box-shadow .2s ease;
         }
+        /* rainbow gradients cycle using nth-child() (DOM order is OK) */
+        button[kind="secondary"]:nth-child(7n+1){background:linear-gradient(135deg,#ff9a9e 0%,#fecfef 100%);}
+        button[kind="secondary"]:nth-child(7n+2){background:linear-gradient(135deg,#a18cd1 0%,#fbc2eb 100%);}
+        button[kind="secondary"]:nth-child(7n+3){background:linear-gradient(135deg,#fddb92 0%,#d1fdff 100%);}
+        button[kind="secondary"]:nth-child(7n+4){background:linear-gradient(135deg,#84fab0 0%,#8fd3f4 100%);}
+        button[kind="secondary"]:nth-child(7n+5){background:linear-gradient(135deg,#cfd9df 0%,#e2ebf0 100%);}
+        button[kind="secondary"]:nth-child(7n+6){background:linear-gradient(135deg,#f6d365 0%,#fda085 100%);}
+        button[kind="secondary"]:nth-child(7n+7){background:linear-gradient(135deg,#a6c0fe 0%,#f68084 100%);}
+        /* hover interaction */
         button[kind="secondary"]:hover{
-            transform:scale(1.04);
-            box-shadow:0 0 12px rgba(26,188,156,0.6);
-            background:#23303B;
-            border-color:#1FDDC1;
-            cursor:pointer;
+            transform:translateY(-4px) scale(1.03);
+            box-shadow:0 6px 14px rgba(0,0,0,.25);
         }
-        /* teal back button */
+        /* glassy back button */
         button[id="back_to_menu"]{
-            background:#1ABC9C !important;
-            border:none !important;
-            font-weight:600;
+            backdrop-filter:blur(10px);
+            background:rgba(255,255,255,0.15) !important;
+            border:1px solid rgba(255,255,255,0.3) !important;
+            padding:0.5rem 1.3rem !important;
             border-radius:12px !important;
-            padding:0.5rem 1rem !important;
+            font-weight:600; color:#fff !important;
+            transition:background .25s ease;
             margin-bottom:1rem;
         }
         button[id="back_to_menu"]:hover{
-            background:#1FDDC1 !important;
+            background:rgba(255,255,255,0.28) !important;
         }
         </style>
         """,
@@ -99,76 +105,72 @@ def _inject_base_css():
     )
     st.session_state["_css_done"] = True
 
+# hide sidebar just on landing
 def _hide_sidebar_css():
     st.markdown(
         """
         <style>
-        [data-testid="stSidebar"],
-        [data-testid="stSidebarResizer"] {display:none !important;}
-        .stApp {padding-left:1rem; padding-right:1rem;}
+        [data-testid="stSidebar"],[data-testid="stSidebarResizer"]{
+            display:none !important;
+        }
+        .stApp{padding-left:1rem;padding-right:1rem;}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-# ───────────────────────────  LANDING GRID  ────────────────────────────────
+# ─────────────────────────  LANDING GRID  ─────────────────────────────────
 def landing_menu(perms: dict, role: str):
     _hide_sidebar_css()
-    st.title("🗂️ **AMAS Portal**")
-    st.caption("Select a module to begin")
+    st.title("✨ **AMAS Portal**")
+    st.caption("Choose a module to get started")
 
     cols_per_row = 4
-    rows = (len(PAGES) + cols_per_row - 1) // cols_per_row
+    rows = (len(PAGES)+cols_per_row-1)//cols_per_row
 
     for r in range(rows):
         cols = st.columns(cols_per_row, gap="large")
         for c in range(cols_per_row):
-            idx = r * cols_per_row + c
+            idx = r*cols_per_row + c
             if idx >= len(PAGES):
                 continue
-
             label, icon, flag, _ = PAGES[idx]
-            allowed = (
-                True if flag is None else
-                (role == "Admin" if flag == "ROLE_ADMIN" else perms.get(flag, False))
+            allowed = True if flag is None else (
+                role=="Admin" if flag=="ROLE_ADMIN" else perms.get(flag,False)
             )
             if not allowed:
                 continue
-
-            if cols[c].button(f"{icon}\n{label}", key=f"page_{label}", use_container_width=True):
+            if cols[c].button(f"{icon}\n{label}",key=f"page_{label}",use_container_width=True):
                 st.session_state["page"] = label
                 _safe_rerun()
 
-# ───────────────────────────  BACK BUTTON  ─────────────────────────────────
+# ─────────────────────────  BACK BUTTON  ──────────────────────────────────
 def back_to_menu():
     return st.button("⬅︎ Menu", key="back_to_menu")
 
-# ───────────────────────────  MAIN FLOW  ───────────────────────────────────
+# ─────────────────────────  MAIN FLOW  ────────────────────────────────────
 def main() -> None:
-    _inject_base_css()       # load styling once
+    _inject_base_css()
     authenticate()
 
-    perms = st.session_state.get("permissions", {})
-    role  = st.session_state.get("user_role", "")
+    perms = st.session_state.get("permissions",{})
+    role  = st.session_state.get("user_role","")
+    current = st.session_state.get("page","LANDING")
 
-    current = st.session_state.get("page", "LANDING")
-
-    if current == "LANDING":
+    if current=="LANDING":
         landing_menu(perms, role)
         return
 
     if back_to_menu():
-        st.session_state["page"] = "LANDING"
+        st.session_state["page"]="LANDING"
         _safe_rerun()
         return
 
     # routing
-    for label, _icon, flag, func in PAGES:
-        if current != label:
-            continue
-        allowed = (
-            True if flag is None else
-            (role == "Admin" if flag == "ROLE_ADMIN" else perms.get(flag, False))
+    for label,_icon,flag,func in PAGES:
+        if current!=label: continue
+        allowed = True if flag is None else (
+            role=="Admin" if flag=="ROLE_ADMIN" else perms.get(flag,False)
         )
         if allowed:
             func()
@@ -178,6 +180,6 @@ def main() -> None:
     else:
         st.error("Unknown page.")
 
-# ───────────────────────────  LAUNCH  ──────────────────────────────────────
-if __name__ == "__main__":
+# ─────────────────────────  RUN  ───────────────────────────────────────────
+if __name__=="__main__":
     main()
