@@ -1,7 +1,8 @@
+# app.py ────────────────────────────────────────────────────────────────────
 import streamlit as st
 st.set_page_config(page_title="Inventory Management System", layout="wide")
 
-# ── Page modules ───────────────────────────────────────────────────────────
+# ── Page modules (unchanged) ───────────────────────────────────────────────
 import home
 from item                       import mainitem
 import PO.mainpo                as mainpo
@@ -18,7 +19,8 @@ from shelf_map.main_map          import main as shelf_map_page
 from inv_signin  import authenticate
 from admin.user_admin_tabs import show_user_admin
 
-# ───────────────────────────  PAGE CONFIG  ────────────────────────────────
+# ──────────────────────────  CARD MENU CONFIG  ─────────────────────────────
+# label, icon, permission flag (or special check), callback function
 PAGES = [
     ("Home",           "🏠", "CanAccessHome",        home.home),
     ("Item",           "📦", "CanAccessItems",       mainitem.item_page),
@@ -32,62 +34,43 @@ PAGES = [
     ("Shelf Map",      "🗺️", "CanAccessShelfMap",   shelf_map_page),
     ("Reports",        "📊", "CanAccessReports",     main_reports.reports_page),
     ("User Management","🛠️", "ROLE_ADMIN",          show_user_admin),
+    # optional placeholders so you hit 14 cards
     ("Assets",         "💼", None, lambda: st.info("Assets page WIP")),
     ("Supplier",       "🚚", None, lambda: st.info("Supplier page WIP")),
 ]
 
-# ───────────────────────────  UTILITIES  ───────────────────────────────────
+# ───────────────────────────  UTILITY: safe rerun  ─────────────────────────
 def _safe_rerun():
+    """Call st.rerun() on new versions, fall back to experimental, else hack."""
     if hasattr(st, "rerun"):
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
     else:
-        st.experimental_set_query_params(_=str(st.session_state.get("_rf", 0) + 1))
+        # last-ditch: bump a query param to force reload
+        _n = st.session_state.get("_forced_refresh", 0) + 1
+        st.session_state["_forced_refresh"] = _n
+        st.experimental_set_query_params(_=_n)
 
-def _inject_global_css():
-    """Inject branding CSS on every rerun."""
+# ───────────────────────────  UI: hide sidebar on landing  ─────────────────
+def _hide_sidebar():
     st.markdown(
         """
-        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap"
-              rel="stylesheet">
         <style>
-        html,body,[class*="css"],.stApp{
-            font-family:'Poppins',sans-serif;
-            background:linear-gradient(135deg,#0E1117 0%,#1E222A 100%);
-            color:#F6F7F9;
-        }
         [data-testid="stSidebar"], [data-testid="stSidebarResizer"]{
             display:none !important;
         }
+        .stApp {padding-left:1rem; padding-right:1rem;}
+
+        /* card-style buttons */
         button[kind="secondary"]{
             width:100%; height:100%;
-            background:#1A1F29;
-            border:2px solid #1ABC9C;
-            border-radius:16px;
-            padding:2.2rem 0.6rem !important;
+            padding:2rem 0.6rem !important;
             font-size:1.05rem; font-weight:600;
-            color:#F6F7F9;
-            transition:transform .15s ease, box-shadow .15s ease;
-            white-space:normal; line-height:1.35;
+            border:2px solid #5c8df6; border-radius:12px;
+            background:#eef2ff; white-space:normal;
         }
-        button[kind="secondary"]:hover{
-            transform:scale(1.04);
-            box-shadow:0 0 12px rgba(26,188,156,0.6);
-            background:#23303B;
-            border-color:#1FDDC1;
-            cursor:pointer;
-        }
-        .back-btn > button{
-            background:#1ABC9C !important;
-            border:none !important;
-            border-radius:10px !important;
-            font-weight:600;
-            color:#0E1117 !important;
-        }
-        .back-btn > button:hover{
-            background:#1FDDC1 !important;
-        }
+        button[kind="secondary"]:hover{background:#dbe4ff;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -95,11 +78,10 @@ def _inject_global_css():
 
 # ───────────────────────────  LANDING GRID  ────────────────────────────────
 def landing_menu(perms: dict, role: str):
-    _inject_global_css()
-    st.title("🗂️ **AMAS Portal**")
-    st.caption("Select a module to begin")
+    _hide_sidebar()
+    st.title("🗂️ AMAS Portal")
 
-    cols_per_row = 4
+    cols_per_row = 4                # 4×4 grid → up to 16 slots visible
     rows = (len(PAGES) + cols_per_row - 1) // cols_per_row
 
     for r in range(rows):
@@ -110,50 +92,51 @@ def landing_menu(perms: dict, role: str):
                 continue
 
             label, icon, flag, _ = PAGES[idx]
+
+            # — permission logic —
             allowed = (
-                True if flag is None else
-                (role == "Admin" if flag == "ROLE_ADMIN" else perms.get(flag, False))
+                True if flag is None
+                else (role == "Admin" if flag == "ROLE_ADMIN" else perms.get(flag, False))
             )
             if not allowed:
-                continue
+                continue  # hide card entirely
 
             if cols[c].button(f"{icon}\n{label}", key=f"page_{label}", use_container_width=True):
                 st.session_state["page"] = label
                 _safe_rerun()
 
-# ───────────────────────────  BACK BUTTON  ─────────────────────────────────
-def back_to_menu() -> bool:
-    st.markdown('<div class="back-btn">', unsafe_allow_html=True)
-    clicked = st.button("⬅︎ Menu", key="back_to_menu")
-    st.markdown('</div>', unsafe_allow_html=True)
-    return clicked
+# ───────────────────────────  BACK-BUTTON  ─────────────────────────────────
+def back_to_menu():
+    """Render a small back button; return True if user clicked it."""
+    return st.button("⬅️ Menu", key="back_to_menu")
 
-# ───────────────────────────  MAIN FLOW  ───────────────────────────────────
+# ───────────────────────────  MAIN  ────────────────────────────────────────
 def main() -> None:
-    authenticate()
+    authenticate()                                # ← your login / SSO flow
     perms = st.session_state.get("permissions", {})
     role  = st.session_state.get("user_role", "")
 
     current = st.session_state.get("page", "LANDING")
 
-    # inject CSS on every run
-    _inject_global_css()
-
+    # — landing screen —
     if current == "LANDING":
         landing_menu(perms, role)
         return
 
+    # — display back button on every content page —
     if back_to_menu():
         st.session_state["page"] = "LANDING"
         _safe_rerun()
         return
 
+    # — route to selected page —
     for label, _icon, flag, func in PAGES:
         if current != label:
             continue
+
         allowed = (
-            True if flag is None else
-            (role == "Admin" if flag == "ROLE_ADMIN" else perms.get(flag, False))
+            True if flag is None
+            else (role == "Admin" if flag == "ROLE_ADMIN" else perms.get(flag, False))
         )
         if allowed:
             func()
@@ -163,6 +146,6 @@ def main() -> None:
     else:
         st.error("Unknown page.")
 
-# ───────────────────────────  LAUNCH  ──────────────────────────────────────
+# ───────────────────────────  RUN  ─────────────────────────────────────────
 if __name__ == "__main__":
     main()
