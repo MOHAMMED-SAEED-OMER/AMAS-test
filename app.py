@@ -1,4 +1,3 @@
-# app.py ────────────────────────────────────────────────────────────────────
 import streamlit as st
 st.set_page_config(page_title="Inventory Management System", layout="wide")
 
@@ -39,20 +38,15 @@ PAGES = [
 
 # ───────────────────────────  UTILITIES  ───────────────────────────────────
 def _safe_rerun():
-    """Works on all Streamlit versions."""
     if hasattr(st, "rerun"):
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
-    else:  # fallback
-        _n = st.session_state.get("_rf", 0) + 1
-        st.session_state["_rf"] = _n
-        st.experimental_set_query_params(_=_n)
+    else:
+        st.experimental_set_query_params(_=str(st.session_state.get("_rf", 0) + 1))
 
 def _inject_global_css():
-    """Dark theme, teal accents, card & back-button styling."""
-    if st.session_state.get("_css_done"):
-        return
+    """Inject branding CSS on every rerun."""
     st.markdown(
         """
         <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap"
@@ -63,11 +57,9 @@ def _inject_global_css():
             background:linear-gradient(135deg,#0E1117 0%,#1E222A 100%);
             color:#F6F7F9;
         }
-        /* hide sidebar only on landing (handled via JS later) */
         [data-testid="stSidebar"], [data-testid="stSidebarResizer"]{
             display:none !important;
         }
-        /* card buttons */
         button[kind="secondary"]{
             width:100%; height:100%;
             background:#1A1F29;
@@ -86,7 +78,6 @@ def _inject_global_css():
             border-color:#1FDDC1;
             cursor:pointer;
         }
-        /* styled back button */
         .back-btn > button{
             background:#1ABC9C !important;
             border:none !important;
@@ -101,7 +92,6 @@ def _inject_global_css():
         """,
         unsafe_allow_html=True,
     )
-    st.session_state["_css_done"] = True
 
 # ───────────────────────────  LANDING GRID  ────────────────────────────────
 def landing_menu(perms: dict, role: str):
@@ -133,7 +123,6 @@ def landing_menu(perms: dict, role: str):
 
 # ───────────────────────────  BACK BUTTON  ─────────────────────────────────
 def back_to_menu() -> bool:
-    """Render styled back button; return True when clicked."""
     st.markdown('<div class="back-btn">', unsafe_allow_html=True)
     clicked = st.button("⬅︎ Menu", key="back_to_menu")
     st.markdown('</div>', unsafe_allow_html=True)
@@ -141,25 +130,24 @@ def back_to_menu() -> bool:
 
 # ───────────────────────────  MAIN FLOW  ───────────────────────────────────
 def main() -> None:
-    authenticate()                       # your existing login/SSO flow
+    authenticate()
     perms = st.session_state.get("permissions", {})
     role  = st.session_state.get("user_role", "")
 
-    _inject_global_css()                 # ensure CSS for non-landing pages
     current = st.session_state.get("page", "LANDING")
 
-    # landing screen
+    # inject CSS on every run
+    _inject_global_css()
+
     if current == "LANDING":
         landing_menu(perms, role)
         return
 
-    # back button on every content page
     if back_to_menu():
         st.session_state["page"] = "LANDING"
         _safe_rerun()
         return
 
-    # routing
     for label, _icon, flag, func in PAGES:
         if current != label:
             continue
