@@ -10,6 +10,7 @@ class CashierHandler(DatabaseManager):
     DB helpers for POS:
       • create sale header & line items
       • keep shelf stock in sync
+      • log shortages when shelf stock is insufficient
     """
 
     # ───────────────────── sale header ─────────────────────
@@ -69,150 +70,168 @@ class CashierHandler(DatabaseManager):
             execute_values(cur, sql, rows)
         self.conn.commit()
 
-    # ───────────────────── shelf stock update ─────────────────────
+    # ───────────────────── shelf stock helpers ─────────────────────
+    def _deduct_from_shelf(self, itemid: int, qty_needed: int) -> int:
+        """
+        Remove qty from oldest shelf layers.
+        If a layer is emptied, DELETE the row.
+        Returns the remaining (shortage) qty.
+        """
+        remaining = qty_needed
+        layers = self.fetch_data(
+            """
+            SELECT shelfid, quantity
+            FROM   shelf
+            WHERE  itemid = %s AND quantity > 0
+            ORDER  BY expirationdate
+            """,
+            (itemid,),
+        )
+    
+        for lyr in layers.itertuples():
+            if remaining == 0:
+                break
+    
+            if remaining >= lyr.quantity:
+                # consume the whole layer → delete row
+                self.execute_command(
+                    "DELETE FROM shelf WHERE shelfid = %s",
+                    (lyr.shelfid,),
+                )
+                remaining -= lyr.quantity
+            else:
+                # partial take → update residual qty
+                self.execute_command(
+                    "UPDATE shelf SET quantity = quantity - %s "
+                    "WHERE shelfid = %s",
+                    (remaining, lyr.shelfid),
+                )
+                remaining = 0
+    
+        return remaining  # >0 means shortage
+    
+    # legacy method (still used by Return flow)
     def reduce_shelf_stock(self, itemid, quantity_sold):
         """
-        Subtract qty from oldest shelf layer. If the item is
-        not on shelf yet, create a negative row so stock never "hides".
+        Subtract qty from oldest shelf layer.
+        If a layer reaches 0, delete it.
+        Negative rows are no longer created.
         """
-        itemid_py   = int(itemid)
-        qty_py      = int(quantity_sold)
-
-        batch = self.fetch_data(
+        itemid_py = int(itemid)
+        qty_py    = int(quantity_sold)
+    
+        layer = self.fetch_data(
             """
             SELECT shelfid, quantity
             FROM   shelf
             WHERE  itemid = %s
             ORDER  BY expirationdate
-            LIMIT 1;
+            LIMIT 1
             """,
             (itemid_py,),
         )
-
-        if not batch.empty:
-            shelfid = int(batch.iloc[0]["shelfid"])
-            new_qty = int(batch.iloc[0]["quantity"]) - qty_py
-            self.execute_command(
-                """
-                UPDATE shelf
-                   SET quantity    = %s,
-                       lastupdated = CURRENT_TIMESTAMP
-                 WHERE shelfid     = %s;
-                """,
-                (new_qty, shelfid),
-            )
+    
+        if layer.empty:
+            return  # nothing on shelf – caller should now rely on shortage table
+    
+        shelfid = int(layer.iloc[0].shelfid)
+        qty_left = int(layer.iloc[0].quantity) - qty_py
+    
+        if qty_left <= 0:
+            self.execute_command("DELETE FROM shelf WHERE shelfid = %s", (shelfid,))
         else:
-            # pull earliest expiry from inventory, else today
-            exp_row = self.fetch_data(
-                """
-                SELECT expirationdate
-                  FROM inventory
-                 WHERE itemid = %s
-                 ORDER  BY expirationdate
-                 LIMIT 1;
-                """,
-                (itemid_py,),
-            )
-            expiry = exp_row.iloc[0]["expirationdate"] if not exp_row.empty else date.today()
-
             self.execute_command(
-                """
-                INSERT INTO shelf
-                      (itemid, expirationdate, quantity, lastupdated, notes)
-                VALUES (%s, %s, %s, CURRENT_TIMESTAMP,
-                        'Auto-created negative stock by cashier sale');
-                """,
-                (itemid_py, expiry, -qty_py),
+                "UPDATE shelf SET quantity = %s, lastupdated = CURRENT_TIMESTAMP "
+                "WHERE shelfid = %s",
+                (qty_left, shelfid),
             )
-            # ⚠️ no ShelfEntries write — selling does not log movements
+    
 
-    # ───────────────────── finalize POS / return ─────────────────────
-    def finalize_sale(
+    # ───────────────────── SHORTAGE-AWARE POS commit ─────────────────
+    def process_sale_with_shortage(
         self,
+        *,
         cart_items,
         discount_rate,
         payment_method,
         cashier,
         notes="",
-        original_saleid=None,
     ):
-        # 1) totals
-        subtotal = sum(float(ci["quantity"]) * float(ci["sellingprice"]) for ci in cart_items)
-        total_disc = round(subtotal * float(discount_rate) / 100, 2)
-        final_amt  = round(subtotal - total_disc, 2)
-
-        # 2) (optional) validate return quantities …
-        if payment_method == "Return" and original_saleid:
-            self._validate_return_quantities(cart_items, original_saleid)
-
-        # 3) header
+        """
+        Create sale, deduct shelf quantities, log shortages.
+        Returns (saleid, shortages_list) where shortages_list contains
+        dicts: {"itemname": str, "qty": int}
+        """
+        # --- header placeholder (totals filled later) ----------------
         saleid = self.create_sale_record(
-            subtotal,
-            discount_rate,
-            total_disc,
-            final_amt,
-            payment_method,
-            cashier,
-            notes,
-            original_saleid,
+            total_amount   = 0,
+            discount_rate  = discount_rate,
+            total_discount = 0,
+            final_amount   = 0,
+            payment_method = payment_method,
+            cashier        = cashier,
+            notes          = notes,
         )
         if saleid is None:
             return None
 
-        # 4) line items
-        lines = []
-        for ci in cart_items:
-            qty  = int(ci["quantity"])
-            unit = float(ci["sellingprice"])
-            lines.append(
+        shortages: list[dict] = []
+        sale_lines  = []
+        running_total = 0
+
+        for item in cart_items:
+            iid = int(item["itemid"])
+            qty = int(item["quantity"])
+            price = float(item["sellingprice"])
+            running_total += qty * price
+
+            # 1. try to pull from shelf
+            short = self._deduct_from_shelf(iid, qty)
+
+            if short > 0:
+                # shortage table entry
+                self.execute_command(
+                    """
+                    INSERT INTO shelf_shortage (saleid, itemid, shortage_qty)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (saleid, iid, short),
+                )
+                # fetch name for toast
+                name = self.fetch_data(
+                    "SELECT itemnameenglish FROM item WHERE itemid = %s",
+                    (iid,),
+                ).iloc[0, 0]
+                shortages.append({"itemname": name, "qty": short})
+
+            # 2. salesitems row (record full sold qty)
+            sale_lines.append(
                 {
-                    "itemid": ci["itemid"],
+                    "itemid": iid,
                     "quantity": qty,
-                    "unitprice": unit,
-                    "totalprice": round(qty * unit, 2),
+                    "unitprice": price,
+                    "totalprice": round(qty * price, 2),
                 }
             )
-        self.add_sale_items(saleid, lines)
 
-        # 5) shelf deduction
-        for ci in cart_items:
-            self.reduce_shelf_stock(ci["itemid"], abs(int(ci["quantity"])))
+        # batch insert lines
+        self.add_sale_items(saleid, sale_lines)
 
-        return saleid
-
-    # ---------------- internal helper --------------------------------
-    def _validate_return_quantities(self, cart_items, original_saleid):
-        """
-        Ensure cumulative returns never exceed original sold qty.
-        """
-        orig = self.fetch_data(
-            "SELECT itemid, quantity FROM salesitems WHERE saleid = %s",
-            (original_saleid,),
-        )
-        if orig.empty:
-            raise Exception("Original sale items not found.")
-
-        sold = {r.itemid: float(r.quantity) for r in orig.itertuples()}
-
-        already = self.fetch_data(
+        # update totals in header
+        total_disc = round(running_total * discount_rate / 100, 2)
+        final_amt  = running_total - total_disc
+        self.execute_command(
             """
-            SELECT itemid, SUM(ABS(quantity)) AS returned
-            FROM salesitems
-            WHERE saleid IN (
-                SELECT saleid FROM sales WHERE original_saleid = %s
-            )
-            GROUP BY itemid;
+            UPDATE sales
+            SET totalamount   = %s,
+                totaldiscount = %s,
+                finalamount   = %s
+            WHERE saleid = %s
             """,
-            (original_saleid,),
+            (running_total, total_disc, final_amt, saleid),
         )
-        returned = {r.itemid: float(r.returned) for r in already.itertuples()}
 
-        for ci in cart_items:
-            iid = int(ci["itemid"])
-            req = abs(float(ci["quantity"]))
-            allowed = sold.get(iid, 0) - returned.get(iid, 0)
-            if req > allowed:
-                raise Exception(f"Return qty for item {iid} exceeds allowed ({allowed}).")
+        return saleid, shortages
 
     # ───────────────────── reporting helper ─────────────────────
     def get_sale_details(self, saleid):
