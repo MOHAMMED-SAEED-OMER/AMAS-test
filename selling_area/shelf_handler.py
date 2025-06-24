@@ -209,3 +209,48 @@ class ShelfHandler(DatabaseManager):
             df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
             df["totalquantity"]  = df["totalquantity"].astype(int)
         return df
+
+# ───────── shortage resolver (transfer side) ─────────
+    def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
+        """
+        Consume open shortages for this itemid (oldest first).
+        Returns the qty still left to put on shelf.
+        """
+        rows = self.fetch_data(
+            """
+            SELECT shortageid, shortage_qty
+            FROM   shelf_shortage
+            WHERE  itemid = %s AND resolved = FALSE
+            ORDER  BY logged_at
+            """,
+            (itemid,),
+        )
+
+        remaining = qty_need
+        for r in rows.itertuples():
+            if remaining == 0:
+                break
+            take = min(remaining, int(r.shortage_qty))
+
+            # shrink or resolve the shortage row
+            self.execute_command(
+                """
+                UPDATE shelf_shortage
+                SET    shortage_qty = shortage_qty - %s,
+                       resolved      = (shortage_qty - %s = 0),
+                       resolved_qty  = COALESCE(resolved_qty,0) + %s,
+                       resolved_at   = CASE
+                                         WHEN shortage_qty - %s = 0
+                                         THEN CURRENT_TIMESTAMP
+                                       END,
+                       resolved_by   = %s
+                WHERE  shortageid = %s
+                """,
+                (take, take, take, take, user, r.shortageid),
+            )
+            remaining -= take
+
+        # optional tidy-up of zero rows
+        self.execute_command("DELETE FROM shelf_shortage WHERE shortage_qty = 0;")
+
+        return remaining
