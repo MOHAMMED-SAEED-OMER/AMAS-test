@@ -1,4 +1,5 @@
 # cashier/cashier_handler.py
+import json
 import pandas as pd
 from datetime import date
 from psycopg2.extras import execute_values
@@ -246,3 +247,51 @@ class CashierHandler(DatabaseManager):
             (saleid,),
         )
         return sale_df, items_df
+
+    # ---- Held bill helpers ---------------------------------------------
+    def save_hold(self, *, cashier_id: str, label: str,
+                  df_items: pd.DataFrame) -> int:
+        """Store current bill in pos_holds (items as JSONB array)."""
+        # only the columns we need to rebuild a bill
+        payload = df_items[["itemid", "itemname",
+                            "quantity", "price"]].to_dict(orient="records")
+        hold_id = self.execute_command_returning(
+            """
+            INSERT INTO pos_holds (hold_label, cashier_id, items)
+            VALUES (%s, %s, %s::jsonb)         -- cast text → jsonb
+            RETURNING holdid
+            """,
+            (label, cashier_id, json.dumps(payload)),
+        )[0]
+        return int(hold_id)
+
+    def load_hold(self, hold_id: int) -> pd.DataFrame:
+        """
+        Return the held bill as a DataFrame shaped like sales_table.
+        Fills itemname if missing.
+        """
+        js = self.fetch_data("SELECT items FROM pos_holds WHERE holdid=%s",
+                             (hold_id,))
+        if js.empty:
+            raise ValueError("Hold not found")
+
+        data = js.iloc[0, 0]
+        rows = json.loads(data) if isinstance(data, str) else data
+        df   = pd.DataFrame(rows)
+
+        # 🔹 back-fill itemname when absent
+        if "itemname" not in df.columns:
+            ids = df["itemid"].tolist()
+            if len(ids) == 1:
+                q   = "SELECT itemid, itemnameenglish AS name FROM item WHERE itemid = %s"
+                par = (ids[0],)
+            else:
+                q   = "SELECT itemid, itemnameenglish AS name FROM item WHERE itemid IN %s"
+                par = (tuple(ids),)
+            names = self.fetch_data(q, par).set_index("itemid")["name"].to_dict()
+            df["itemname"] = df["itemid"].map(names).fillna("Unknown")
+
+        df["total"] = df["quantity"] * df["price"]
+        return df[["itemid", "itemname", "quantity", "price", "total"]]
+    def delete_hold(self, hold_id: int):
+        self.execute_command("DELETE FROM pos_holds WHERE holdid=%s", (hold_id,))

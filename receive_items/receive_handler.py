@@ -168,3 +168,8 @@ class ReceiveHandler(DatabaseManager):
         WHERE  itemid = %s AND expirationdate = %s
         """
         self.execute_command(sql, (new_loc, item_id, exp_date))
+
+    # add inside ReceiveHandler (anywhere convenient)
+    def get_suppliers(self):
+        return self.fetch_data("SELECT supplierid, suppliername FROM supplier "
+                               "ORDER BY suppliername")
