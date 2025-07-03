@@ -111,3 +111,7 @@ celerybeat-schedule
 
 # macOS
 .DS_Store
+
+# Streamlit secrets
+.streamlit/secrets.toml
+

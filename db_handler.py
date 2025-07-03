@@ -2,14 +2,27 @@ import streamlit as st
 import psycopg2
 from psycopg2 import OperationalError          # reconnect check
 import pandas as pd
+import uuid
 
 # ───────────────────────────────────────────────────────────────
 # 1. One cached connection per user session
 # ───────────────────────────────────────────────────────────────
+def _session_key() -> str:
+    """Return a unique key for the current user session."""
+    if "_session_key" not in st.session_state:
+        st.session_state["_session_key"] = uuid.uuid4().hex
+    return st.session_state["_session_key"]
+
+
 @st.cache_resource(show_spinner=False)
-def get_conn(dsn: str):
-    """Create (once) and return a live PostgreSQL connection."""
-    return psycopg2.connect(dsn)
+def get_conn(dsn: str, key: str):
+    """Create (once per session) and return a PostgreSQL connection."""
+    conn = psycopg2.connect(dsn)
+    try:
+        st.on_session_end(conn.close)
+    except Exception:
+        pass
+    return conn
 
 # ───────────────────────────────────────────────────────────────
 # 2. Database manager with auto-reconnect logic
@@ -18,15 +31,16 @@ class DatabaseManager:
     """General DB interactions using a cached connection."""
 
     def __init__(self):
-        self.dsn  = st.secrets["neon"]["dsn"]
-        self.conn = get_conn(self.dsn)        # reuse across reruns
+        self.dsn   = st.secrets["neon"]["dsn"]
+        self._key  = _session_key()
+        self.conn  = get_conn(self.dsn, self._key)  # reuse within this session
 
     # ────────── internal helpers ──────────
     def _ensure_live_conn(self):
         """Reconnect if the cached connection was closed by Neon."""
         if self.conn.closed:                  # 0 = open, >0 = closed
             get_conn.clear()
-            self.conn = get_conn(self.dsn)
+            self.conn = get_conn(self.dsn, self._key)
 
     def _fetch_df(self, query: str, params=None) -> pd.DataFrame:
         self._ensure_live_conn()
@@ -37,7 +51,7 @@ class DatabaseManager:
                 cols = [c[0] for c in cur.description]
         except OperationalError:
             get_conn.clear()
-            self.conn = get_conn(self.dsn)
+            self.conn = get_conn(self.dsn, self._key)
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
@@ -57,7 +71,7 @@ class DatabaseManager:
             return res
         except OperationalError:
             get_conn.clear()
-            self.conn = get_conn(self.dsn)
+            self.conn = get_conn(self.dsn, self._key)
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 res = cur.fetchone() if returning else None
