@@ -1,16 +1,24 @@
+# inv_signin.py  – Google SSO  ➜ PIN  ➜ permissions   (MySQL backend)
+
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-import streamlit.components.v1 as components        # ← iframe for JS timer
+import streamlit.components.v1 as components    # iframe for JS timer
+
+from datetime import datetime, timedelta, timezone
+from zoneinfo  import ZoneInfo
+
 from db_handler import DatabaseManager
 from auth_utils import hash_pin, verify_pin
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
-db = DatabaseManager()
-BAGHDAD_TZ = ZoneInfo("Asia/Baghdad")
+# ------------------------------------------------------------------
+db          = DatabaseManager()
+BAGHDAD_TZ  = ZoneInfo("Asia/Baghdad")
+# ------------------------------------------------------------------
+
 
 # ───────────────────────── helpers ────────────────────────────────
 def _row_to_permissions(row):
+    """Map DB columns → boolean permission flags stored in session."""
     return {
         "CanAccessHome":        row["canaccesshome"],
         "CanAccessItems":       row["canaccessitems"],
@@ -25,14 +33,20 @@ def _row_to_permissions(row):
         "CanAccessShelfMap":    row["canaccessshelfmap"],
     }
 
+
 # ───────────────────────── auth flow ──────────────────────────────
 def authenticate():
-    """Google SSO ➜ mandatory PIN ➜ permissions (Baghdad)."""
+    """
+    Google Single-Sign-On  ➜ mandatory PIN check  ➜ permissions
+    All timestamps handled in Asia/Baghdad TZ.
+    """
     # 1) Google sign-in ------------------------------------------------
     if not st.user.is_logged_in:
         logo = "https://img.icons8.com/color/48/000000/google-logo.png"
-        st.markdown("<h2 style='text-align:center'>Inventory Management System</h2>",
-                    unsafe_allow_html=True)
+        st.markdown(
+            "<h2 style='text-align:center'>Inventory Management System</h2>",
+            unsafe_allow_html=True,
+        )
         _, c, _ = st.columns([1, 3, 1])
         with c:
             st.image(logo, width=32)
@@ -45,7 +59,7 @@ def authenticate():
     st.session_state["user_name"]  = st.user.name
 
     # 2) ensure user row exists ---------------------------------------
-    user_df = db.fetch_data("SELECT * FROM users WHERE email=%s", (user_email,))
+    user_df = db.fetch_data("SELECT * FROM `users` WHERE email = %s", (user_email,))
     if user_df.empty:
         st.error("🚫 Your account has not been registered by an administrator.")
         st.stop()
@@ -60,7 +74,11 @@ def authenticate():
     # parse lock_ts → aware(Baghdad)
     if lock_ts:
         try:
-            lock_dt = lock_ts if isinstance(lock_ts, datetime) else datetime.fromisoformat(str(lock_ts))
+            lock_dt = (
+                lock_ts
+                if isinstance(lock_ts, datetime)
+                else datetime.fromisoformat(str(lock_ts))
+            )
             if lock_dt.tzinfo is None:
                 lock_dt = lock_dt.replace(tzinfo=timezone.utc)
             lock_dt = lock_dt.astimezone(BAGHDAD_TZ)
@@ -98,7 +116,9 @@ def authenticate():
         st.stop()
     elif lock_dt and lock_dt <= now:
         db.execute_command(
-            "UPDATE users SET pin_fail_count = 0, pin_locked_until = NULL WHERE email = %s",
+            "UPDATE `users` "
+            "SET pin_fail_count = 0, pin_locked_until = NULL "
+            "WHERE email = %s",
             (user_email,),
         )
         fail_cnt = 0
@@ -110,15 +130,21 @@ def authenticate():
         pin2 = st.text_input("Confirm your PIN", type="password", key="set_pin2")
         if st.button("Save PIN"):
             if not (pin1 and pin2):
-                st.warning("Enter the PIN twice."); st.stop()
+                st.warning("Enter the PIN twice.")
+                st.stop()
             if pin1 != pin2:
-                st.error("PINs don’t match."); st.stop()
+                st.error("PINs don’t match.")
+                st.stop()
             if not (pin1.isdigit() and 4 <= len(pin1) <= 8):
-                st.error("PIN must be 4–8 digits."); st.stop()
-            db.execute_command("UPDATE users SET pin_hash = %s WHERE email = %s",
-                               (hash_pin(pin1), user_email))
+                st.error("PIN must be 4–8 digits.")
+                st.stop()
+            db.execute_command(
+                "UPDATE `users` SET pin_hash = %s WHERE email = %s",
+                (hash_pin(pin1), user_email),
+            )
             st.success("✔ PIN saved. Sign in again.")
-            st.session_state.clear(); st.rerun()
+            st.session_state.clear()
+            st.rerun()
         st.stop()
 
     # 3) mandatory PIN every session ---------------------------------
@@ -130,19 +156,30 @@ def authenticate():
         if pin_try:
             if verify_pin(pin_try, pin_hash):
                 st.session_state["pin_ok"] = True
-                db.execute_command("UPDATE users SET pin_fail_count = 0, pin_locked_until = NULL WHERE email=%s",
-                                   (user_email,))
+                db.execute_command(
+                    "UPDATE `users` "
+                    "SET pin_fail_count = 0, pin_locked_until = NULL "
+                    "WHERE email = %s",
+                    (user_email,),
+                )
                 st.rerun()
             else:
                 fail_cnt += 1
                 if fail_cnt >= MAX_FAILS:
                     lock_until = now + timedelta(minutes=LOCK_MINUTE)
-                    db.execute_command("UPDATE users SET pin_fail_count=%s, pin_locked_until=%s WHERE email=%s",
-                                       (fail_cnt, lock_until, user_email))
+                    db.execute_command(
+                        "UPDATE `users` "
+                        "SET pin_fail_count = %s, pin_locked_until = %s "
+                        "WHERE email = %s",
+                        (fail_cnt, lock_until, user_email),
+                    )
                     st.error("Too many incorrect PIN attempts – account locked.")
                 else:
-                    db.execute_command("UPDATE users SET pin_fail_count=%s WHERE email=%s",
-                                       (fail_cnt, user_email))
+                    db.execute_command(
+                        "UPDATE `users` "
+                        "SET pin_fail_count = %s WHERE email = %s",
+                        (fail_cnt, user_email),
+                    )
                     st.error("❌ Incorrect PIN")
         st.stop()
 
@@ -150,6 +187,8 @@ def authenticate():
     st.session_state["permissions"] = _row_to_permissions(info)
     st.session_state["user_role"]   = info["role"]
 
+
 # ───────────────────────── misc helper ────────────────────────────
 def logout():
+    """Helper to trigger Streamlit’s built-in logout."""
     st.logout()
