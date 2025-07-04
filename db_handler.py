@@ -1,6 +1,7 @@
+# db_handler.py  – MySQL edition
 import streamlit as st
-import psycopg2
-from psycopg2 import OperationalError          # reconnect check
+import mysql.connector
+from mysql.connector import OperationalError, InterfaceError   # reconnect check
 import pandas as pd
 import uuid
 
@@ -15,9 +16,13 @@ def _session_key() -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def get_conn(dsn: str, key: str):
-    """Create (once per session) and return a PostgreSQL connection."""
-    conn = psycopg2.connect(dsn)
+def get_conn(params: dict, key: str):
+    """
+    Create (once per session) and return a MySQL connection.
+    `params` is the kwargs-dict you would normally pass to
+    `mysql.connector.connect(**params)`.
+    """
+    conn = mysql.connector.connect(**params)
     try:
         st.on_session_end(conn.close)
     except Exception:
@@ -31,16 +36,32 @@ class DatabaseManager:
     """General DB interactions using a cached connection."""
 
     def __init__(self):
-        self.dsn   = st.secrets["neon"]["dsn"]
+        # Credentials live in .streamlit/secrets.toml
+        # Either top-level keys (DB_HOST …) *or* a [mysql] section work.
+        secrets = st.secrets
+        if "mysql" in secrets:
+            secrets = secrets["mysql"]
+
+        self.params = dict(
+            host      = secrets["DB_HOST"],
+            port      = int(secrets["DB_PORT"]),
+            user      = secrets["DB_USER"],
+            password  = secrets["DB_PASS"],
+            database  = secrets["DB_NAME"],
+            autocommit=True,
+            charset   ="utf8mb4",
+            collation ="utf8mb4_unicode_ci",
+            raise_on_warnings=True,
+        )
         self._key  = _session_key()
-        self.conn  = get_conn(self.dsn, self._key)  # reuse within this session
+        self.conn  = get_conn(self.params, self._key)  # reuse within this session
 
     # ────────── internal helpers ──────────
     def _ensure_live_conn(self):
-        """Reconnect if the cached connection was closed by Neon."""
-        if self.conn.closed:                  # 0 = open, >0 = closed
+        """Reconnect if the cached connection was closed by MySQL."""
+        if not self.conn.is_connected():       # False means closed
             get_conn.clear()
-            self.conn = get_conn(self.dsn, self._key)
+            self.conn = get_conn(self.params, self._key)
 
     def _fetch_df(self, query: str, params=None) -> pd.DataFrame:
         self._ensure_live_conn()
@@ -49,19 +70,24 @@ class DatabaseManager:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
-        except OperationalError:
+        except (OperationalError, InterfaceError):
             get_conn.clear()
-            self.conn = get_conn(self.dsn, self._key)
+            self.conn = get_conn(self.params, self._key)
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
         except Exception:
-            self.conn.rollback()  # ← NEW: recover from broken transaction
+            self.conn.rollback()               # recover from broken tx
             raise
         return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
 
     def _execute(self, query: str, params=None, returning=False):
+        """
+        Run INSERT/UPDATE/DELETE.
+        If `returning` is True **you must include your own SELECT** in `query`
+        because MySQL’s `RETURNING` is limited.
+        """
         self._ensure_live_conn()
         try:
             with self.conn.cursor() as cur:
@@ -69,16 +95,16 @@ class DatabaseManager:
                 res = cur.fetchone() if returning else None
             self.conn.commit()
             return res
-        except OperationalError:
+        except (OperationalError, InterfaceError):
             get_conn.clear()
-            self.conn = get_conn(self.dsn, self._key)
+            self.conn = get_conn(self.params, self._key)
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 res = cur.fetchone() if returning else None
             self.conn.commit()
             return res
         except Exception:
-            self.conn.rollback()  # ← NEW: reset failed transaction
+            self.conn.rollback()
             raise
 
     # ────────── public API ──────────
@@ -116,60 +142,45 @@ class DatabaseManager:
 
     # ─────────── foreign_key Management ───────────
     def check_foreign_key_references(
-            self,
-            referenced_table: str,
-            referenced_column: str,
-            value
-        ) -> list[str]:
+        self,
+        referenced_table: str,
+        referenced_column: str,
+        value
+    ) -> list[str]:
+        """
+        Return tables that still reference `value` via FOREIGN KEY.
+        Empty list ⇒ safe to delete.
+        """
+        # 1️⃣  find all foreign-key constraints that target the PK
+        fk_sql = """
+            SELECT tc.table_schema,
+                   tc.table_name
+            FROM   information_schema.table_constraints AS tc
+            JOIN   information_schema.key_column_usage AS kcu
+                   ON tc.constraint_name = kcu.constraint_name
+            JOIN   information_schema.constraint_column_usage AS ccu
+                   ON ccu.constraint_name = tc.constraint_name
+            WHERE  tc.constraint_type = 'FOREIGN KEY'
+              AND  ccu.table_name      = %s
+              AND  ccu.column_name     = %s;
+        """
+        fks = self.fetch_data(fk_sql, (referenced_table, referenced_column))
+
+        conflicts: list[str] = []
+        for _, row in fks.iterrows():
+            schema = row["table_schema"]
+            table  = row["table_name"]
+
+            # 2️⃣  check if at least one record references the value
+            exists_sql = f"""
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM   `{schema}`.`{table}`
+                    WHERE  {referenced_column} = %s
+                );
             """
-            Return a list of tables that still reference the given value
-            through a FOREIGN KEY constraint.
-    
-            Parameters
-            ----------
-            referenced_table : str
-                The table that owns the primary-key (e.g. 'item').
-            referenced_column : str
-                The PK column name (e.g. 'itemid').
-            value : Any
-                The concrete value you want to check (e.g. 77).
-    
-            Returns
-            -------
-            list[str]
-                Table names that contain at least one referencing row.
-                Empty list → safe to delete.
-            """
-            # 1️⃣  find all foreign-key constraints that target the PK
-            fk_sql = """
-                SELECT tc.table_schema,
-                       tc.table_name
-                FROM   information_schema.table_constraints AS tc
-                JOIN   information_schema.key_column_usage AS kcu
-                       ON tc.constraint_name = kcu.constraint_name
-                JOIN   information_schema.constraint_column_usage AS ccu
-                       ON ccu.constraint_name = tc.constraint_name
-                WHERE  tc.constraint_type = 'FOREIGN KEY'
-                  AND  ccu.table_name      = %s
-                  AND  ccu.column_name     = %s;
-            """
-            fks = self.fetch_data(fk_sql, (referenced_table, referenced_column))
-    
-            conflicts: list[str] = []
-            for _, row in fks.iterrows():
-                schema = row["table_schema"]
-                table  = row["table_name"]
-    
-                # 2️⃣  check if at least one record references the value
-                exists_sql = f"""
-                    SELECT EXISTS(
-                        SELECT 1
-                        FROM   {schema}.{table}
-                        WHERE  {referenced_column} = %s
-                    );
-                """
-                exists = self.fetch_data(exists_sql, (value,)).iat[0, 0]
-                if exists:
-                    conflicts.append(f"{schema}.{table}")
-    
-            return sorted(set(conflicts))
+            exists = self.fetch_data(exists_sql, (value,)).iat[0, 0]
+            if exists:
+                conflicts.append(f"{schema}.{table}")
+
+        return sorted(set(conflicts))
