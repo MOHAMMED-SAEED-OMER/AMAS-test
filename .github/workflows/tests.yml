@@ -8,14 +8,68 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # ─────────────────────────────────────────────────────────────
+    # Start a throw-away MySQL service (v8.4)
+    # ─────────────────────────────────────────────────────────────
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: amas
+          MYSQL_USER: Hawkar
+          MYSQL_PASSWORD: Noway2025
+        ports:
+          - 3306:3306
+        # Wait until the server responds to healthcheck
+        options: >-
+          --health-cmd="mysqladmin ping -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    # ─────────────────────────────────────────────────────────────
+    # Environment vars that your Streamlit tests will read
+    # (mirrors .streamlit/secrets.toml)
+    # ─────────────────────────────────────────────────────────────
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_USER: Hawkar
+      DB_PASS: Noway2025
+      DB_NAME: amas
+
     steps:
       - uses: actions/checkout@v3
+
       - uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+
+      # optional: pip cache for faster re-runs
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # ───────────────────────────────────────────────────────────
+      # (Optional) Apply schema / seed data
+      # If you keep a `schema.sql` or fixtures under tests/, load here.
+      # uncomment and adapt if you have such a file.
+      #
+      # - name: Prepare database schema
+      #   run: |
+      #     mysql -h 127.0.0.1 -P 3306 -u Hawkar -pNoway2025 amas < tests/schema.sql
+      # ───────────────────────────────────────────────────────────
+
       - name: Run tests
         run: pytest -q
