@@ -1,7 +1,8 @@
-# cashier/pos.py  ────────────────────────────────────────────────────
+# cashier/pos.py  – Point-of-Sale tab (MySQL backend)
 import streamlit as st
 import pandas as pd
-import streamlit.components.v1 as components   # for the F9 hot-key snippet
+import streamlit.components.v1 as components
+
 from cashier.cashier_handler import CashierHandler
 
 cashier_handler = CashierHandler()
@@ -11,12 +12,15 @@ cashier_handler = CashierHandler()
 def get_item_catalogue() -> pd.DataFrame:
     return cashier_handler.fetch_data(
         """
-        SELECT itemid, itemnameenglish AS itemname, sellingprice,
-               COALESCE(barcode,'') AS barcode,
-               COALESCE(packetbarcode,'') AS packetbarcode,
-               COALESCE(cartonbarcode,'') AS cartonbarcode,
-               packetsize, cartonsize
-        FROM item
+        SELECT  itemid,
+                itemnameenglish AS itemname,
+                sellingprice,
+                COALESCE(barcode,'')        AS barcode,
+                COALESCE(packetbarcode,'')  AS packetbarcode,
+                COALESCE(cartonbarcode,'')  AS cartonbarcode,
+                packetsize,
+                cartonsize
+        FROM    `item`
         """
     )
 
@@ -51,12 +55,12 @@ def fetch_item(cat_df, idx, names, key: str, qty_in: int):
     qty = qty_in * mult
     price = float(row.sellingprice or 0.0)
     return {
-        "barcode":  key,
-        "itemid":   int(row.itemid),
+        "barcode": key,
+        "itemid": int(row.itemid),
         "itemname": f"{row.itemname} {lab}",
         "quantity": qty,
-        "price":    price,
-        "total":    price * qty,
+        "price": price,
+        "total": price * qty,
     }
 
 
@@ -72,9 +76,14 @@ def display_pos_tab():
 
     # ── Held bills list (Resume / Delete) ──────────────────────────
     held = cashier_handler.fetch_data(
-        """SELECT holdid, hold_label, created_at,
-                  jsonb_array_length(items) AS lines
-           FROM pos_holds ORDER BY created_at"""
+        """
+        SELECT  holdid,
+                hold_label,
+                created_at,
+                JSON_LENGTH(items) AS lines      -- 🔑 MySQL JSON helper
+        FROM    `pos_holds`
+        ORDER BY created_at
+        """
     )
     if not held.empty:
         st.markdown("### ⏸ Held Bills")
@@ -96,7 +105,7 @@ def display_pos_tab():
     if "sales_table" not in st.session_state:
         clear_bill()
 
-    cat_df   = get_item_catalogue()
+    cat_df = get_item_catalogue()
     bc_idx, name_series = build_lookup(cat_df)
 
     col_l, col_r = st.columns([0.7, 0.3])
@@ -111,10 +120,11 @@ def display_pos_tab():
             if st.form_submit_button("➕ Add"):
                 itm = fetch_item(cat_df, bc_idx, name_series, txt, int(qty))
                 if itm is None:
-                    st.warning("No matching item."); return
+                    st.warning("No matching item.")
+                    return
                 st.session_state.sales_table = pd.concat(
                     [st.session_state.sales_table, pd.DataFrame([itm])],
-                    ignore_index=True
+                    ignore_index=True,
                 )
                 st.success(f"Added {itm['itemname']} ×{itm['quantity']}")
 
@@ -124,41 +134,47 @@ def display_pos_tab():
         def bill_fragment():
             df = st.session_state.sales_table
             if df.empty:
-                st.info("Bill is empty."); return
+                st.info("Bill is empty.")
+                return
             df["total"] = df["quantity"] * df["price"]
-            st.dataframe(df[["itemname", "quantity", "price", "total"]],
-                         hide_index=True, use_container_width=True)
+            st.dataframe(
+                df[["itemname", "quantity", "price", "total"]],
+                hide_index=True,
+                use_container_width=True,
+            )
             for idx, row in df.iterrows():
                 cols = st.columns([7, 2, 1])
                 cols[0].markdown(f"**{row.itemname}**")
-                new_q = cols[1].number_input("",
-                                             min_value=1,
-                                             value=int(row.quantity),
-                                             key=f"qty_{idx}",
-                                             label_visibility="collapsed")
+                new_q = cols[1].number_input(
+                    "",
+                    min_value=1,
+                    value=int(row.quantity),
+                    key=f"qty_{idx}",
+                    label_visibility="collapsed",
+                )
                 if new_q != row.quantity:
                     df.at[idx, "quantity"] = new_q
                     st.session_state.sales_table = df
                     st.rerun()
                 if cols[2].button("🗑️", key=f"rm_{idx}"):
-                    st.session_state.sales_table = (
-                        df.drop(idx).reset_index(drop=True)
-                    )
+                    st.session_state.sales_table = df.drop(idx).reset_index(drop=True)
                     st.rerun()
+
         bill_fragment()
 
     # ───────── RIGHT: totals & actions ────────────────────────────
     with col_r:
         df = st.session_state.sales_table
-        subtotal  = float(df["total"].sum()) if not df.empty else 0.0
+        subtotal = float(df["total"].sum()) if not df.empty else 0.0
         disc_rate = st.number_input(
             "Discount (%)",
-            min_value=0.0, max_value=100.0,
+            min_value=0.0,
+            max_value=100.0,
             step=0.5,
             value=st.session_state.get("discount_rate", 0.0),
             key="discount_rate",
         )
-        disc_amt  = round(subtotal * disc_rate / 100, 2)
+        disc_amt = round(subtotal * disc_rate / 100, 2)
         final_amt = round(subtotal - disc_amt, 2)
 
         st.markdown(f"**Subtotal:** {subtotal:.2f}")
@@ -173,18 +189,13 @@ def display_pos_tab():
         if btns[2].button("❌ Cancel"):
             clear_bill()
 
-        # ── Inject F9 hot-key that clicks the Hold button -----------
+        # F9 hot-key → click Hold
         components.html(
             """
             <script>
               (function () {
-                const P = window.parent.document;           // Streamlit page
-
-                // remove previous listener to avoid stacking duplicates
-                if (P._f9HoldListener) {
-                  P.removeEventListener('keydown', P._f9HoldListener);
-                }
-
+                const P = window.parent.document;
+                if (P._f9HoldListener) P.removeEventListener('keydown', P._f9HoldListener);
                 P._f9HoldListener = function (e) {
                   if (e.code === 'F9') {
                     e.preventDefault();
@@ -198,9 +209,9 @@ def display_pos_tab():
             </script>
             """,
             height=0,
-            width=0
+            width=0,
         )
-        # ── Hold button & inline form -------------------------------
+
         if btns[3].button("🕐 Hold (F9)"):
             if df.empty:
                 st.warning("Bill is empty.")
@@ -215,9 +226,9 @@ def display_pos_tab():
             col_save, col_cancel = st.columns(2)
             if col_save.button("Save & Clear"):
                 hid = cashier_handler.save_hold(
-                    cashier_id = st.session_state.get("user_email", "Unknown"),
-                    label      = label or "Unnamed",
-                    df_items   = df
+                    cashier_id=st.session_state.get("user_email", "Unknown"),
+                    label=label or "Unnamed",
+                    df_items=df,
                 )
                 st.success(f"Held as “{label or 'Unnamed'}” (H{hid})")
                 st.session_state.pop("hold_form")
@@ -232,25 +243,29 @@ def display_pos_tab():
 def finalize_sale(method, disc_rate, subtotal, disc_amt, final_amt):
     df = st.session_state.sales_table
     if df.empty:
-        st.error("Bill is empty."); return
+        st.error("Bill is empty.")
+        return
     cart_items = [
-        {"itemid": int(r.itemid),
-         "quantity": int(r.quantity),
-         "sellingprice": float(r.price)}
+        {
+            "itemid": int(r.itemid),
+            "quantity": int(r.quantity),
+            "sellingprice": float(r.price),
+        }
         for _, r in df.iterrows()
     ]
     res = cashier_handler.process_sale_with_shortage(
-        cart_items       = cart_items,
-        discount_rate    = disc_rate,
-        payment_method   = method,
-        cashier          = st.session_state.get("user_email", "Unknown"),
-        notes            = (
+        cart_items=cart_items,
+        discount_rate=disc_rate,
+        payment_method=method,
+        cashier=st.session_state.get("user_email", "Unknown"),
+        notes=(
             f"POS | Sub {subtotal:.2f} | Disc {disc_amt:.2f} "
             f"| Final {final_amt:.2f}"
-        )
+        ),
     )
     if not res:
-        st.error("Sale failed."); return
+        st.error("Sale failed.")
+        return
     sale_id, shortages = res
     st.success(f"✅ Sale completed! ID {sale_id}")
     for s in shortages:
