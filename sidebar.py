@@ -1,7 +1,7 @@
 # sidebar.py
 import streamlit as st
-from db_handler import DatabaseManager
-from auth_utils import verify_pin, hash_pin
+from db_handler  import DatabaseManager
+from auth_utils  import verify_pin, hash_pin
 
 db = DatabaseManager()
 
@@ -42,28 +42,35 @@ def _inject_sidebar_css() -> None:
 # ────────────────────────────────────────────────
 def _change_pin_ui() -> None:
     with st.sidebar.expander("🔑 Change PIN"):
-        old  = st.text_input("Current", type="password", key="old_pin")
+        old  = st.text_input("Current",        type="password", key="old_pin")
         new1 = st.text_input("New (4–8 digits)", type="password", key="new_pin1")
-        new2 = st.text_input("Confirm new", type="password", key="new_pin2")
+        new2 = st.text_input("Confirm new",    type="password", key="new_pin2")
 
         if st.button("Update PIN", key="btn_update_pin"):
             if not (old and new1 and new2):
-                st.warning("Fill all three boxes."); return
+                st.warning("Fill all three boxes.")
+                return
 
-            row = db.fetch_data("SELECT pin_hash FROM users WHERE email=%s",
-                                (st.session_state["user_email"],))
+            # MySQL-safe quoted table
+            row = db.fetch_data(
+                "SELECT pin_hash FROM `users` WHERE email = %s",
+                (st.session_state["user_email"],),
+            )
             stored = row.pin_hash.iloc[0] if not row.empty else None
             if not verify_pin(old, stored):
-                st.error("Current PIN is incorrect."); return
+                st.error("Current PIN is incorrect.")
+                return
 
             if new1 != new2:
-                st.error("New PIN entries don’t match."); return
+                st.error("New PIN entries don’t match.")
+                return
 
             if not (new1.isdigit() and 4 <= len(new1) <= 8):
-                st.error("PIN must be 4–8 digits."); return
+                st.error("PIN must be 4–8 digits.")
+                return
 
             db.execute_command(
-                "UPDATE users SET pin_hash=%s WHERE email=%s",
+                "UPDATE `users` SET pin_hash = %s WHERE email = %s",
                 (hash_pin(new1), st.session_state["user_email"]),
             )
             st.success("✔ PIN updated.")
