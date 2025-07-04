@@ -1,7 +1,10 @@
 {
   "name": "Python 3",
-  // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
   "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bullseye",
+
+  // ─────────────────────────────────────────────────────────────
+  // VS Code & Codespaces customisations
+  // ─────────────────────────────────────────────────────────────
   "customizations": {
     "codespaces": {
       "openFiles": [
@@ -17,17 +20,27 @@
       ]
     }
   },
-  "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; [ -f requirements.txt ] && pip3 install --user -r requirements.txt; pip3 install --user streamlit; echo '✅ Packages installed and Requirements met'",
+
+  // ─────────────────────────────────────────────────────────────
+  // Install apt + pip requirements on build / rebuild
+  // ─────────────────────────────────────────────────────────────
+  "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; \\\n  sudo apt-get install -y default-mysql-client; \\\n  [ -f requirements.txt ] && pip3 install --user -r requirements.txt; \\\n  pip3 install --user streamlit; \\\n  echo '✅ Packages installed and requirements met'",
+
+  // ─────────────────────────────────────────────────────────────
+  // Start Streamlit automatically when the container attaches
+  // ─────────────────────────────────────────────────────────────
   "postAttachCommand": {
     "server": "streamlit run app.py"
   },
+
+  // ─────────────────────────────────────────────────────────────
+  // Port forwarding so VS Code preview opens the app
+  // ─────────────────────────────────────────────────────────────
   "portsAttributes": {
     "8501": {
       "label": "Application",
       "onAutoForward": "openPreview"
     }
   },
-  "forwardPorts": [
-    8501
-  ]
+  "forwardPorts": [8501]
 }
