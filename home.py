@@ -70,13 +70,14 @@ def _kpi_cards(kpis: list[tuple[str, int | float, str]]) -> None:
 # ──────────────────────────  Data retrieval + filters  ───────────────────────
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory() -> pd.DataFrame:
+    # MySQL-safe quoting + lower-case table names
     query = """
-        SELECT i.ItemID, i.ItemNameEnglish, i.ClassCat, i.DepartmentCat,
-               i.SectionCat, i.FamilyCat, i.SubFamilyCat, i.ItemPicture,
-               inv.Quantity, inv.ExpirationDate, inv.StorageLocation,
-               i.Threshold, i.AverageRequired
-        FROM Inventory inv
-        JOIN Item i ON inv.ItemID = i.ItemID
+        SELECT  i.ItemID, i.ItemNameEnglish, i.ClassCat, i.DepartmentCat,
+                i.SectionCat, i.FamilyCat, i.SubFamilyCat, i.ItemPicture,
+                inv.Quantity, inv.ExpirationDate, inv.StorageLocation,
+                i.Threshold, i.AverageRequired
+        FROM    `inventory` AS inv
+        JOIN    `item`       AS i  ON inv.ItemID = i.ItemID
     """
     db = DatabaseManager()
     df = db.fetch_data(query)
@@ -299,6 +300,3 @@ def home() -> None:
             mime="text/csv",
         ):
             st.toast("✅ Inventory CSV downloaded")
-
-
-# End of file
