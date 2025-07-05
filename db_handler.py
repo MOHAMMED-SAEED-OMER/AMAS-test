@@ -39,10 +39,17 @@ class DatabaseManager:
 
         # 💡 Accept BOTH upper-case and lower-case keys
         def pick(*names, default=None):
+            """
+            Return the first secrets entry that exists, ignoring KeyError.
+            Falls back to `default` if none are found.
+            """
             for n in names:
-                if n in secrets:
-                    return secrets[n]
+                try:
+                    return secrets[n]          # st.secrets[...] may raise
+                except KeyError:
+                    continue
             return default
+
 
         self.params = dict(
             host      = pick("DB_HOST", "host"),
