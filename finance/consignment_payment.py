@@ -1,14 +1,14 @@
 # finance/consignment_payment.py
 """
-Consignment dashboard (supplier chosen inside the tab).
+Consignment dashboard (MySQL backend)
 
 • Outstanding debt  =  Σ(received per PO) – Σ(payments per PO)
 • Unsold consignment stock still with us (inventory + shelf) and its value
 • Record consignment payments (FIFO — oldest partially/unpaid POs first)
 """
-
-import streamlit as st
 import pandas as pd
+import streamlit as st
+
 from finance.finance_handler import FinanceHandler
 
 
@@ -18,7 +18,7 @@ def consignment_tab(fh: FinanceHandler) -> None:
 
     # 1️⃣  Supplier selector
     sup_df = fh.fetch_data(
-        "SELECT supplierid, suppliername FROM supplier ORDER BY suppliername"
+        "SELECT supplierid, suppliername FROM `supplier` ORDER BY suppliername"
     )
     if sup_df.empty:
         st.info("No suppliers found.")
@@ -26,9 +26,7 @@ def consignment_tab(fh: FinanceHandler) -> None:
 
     lookup = dict(zip(sup_df["supplierid"], sup_df["suppliername"]))
     supplier_id = st.selectbox(
-        "Supplier",
-        sup_df["supplierid"],
-        format_func=lambda sid: lookup[sid],
+        "Supplier", sup_df["supplierid"], format_func=lambda sid: lookup[sid]
     )
     if supplier_id is None:
         st.stop()
@@ -42,24 +40,23 @@ def _render_supplier_dashboard(
 ):
     st.subheader(f"Supplier: {supplier_name}")
 
-    # 2️⃣  Item‑level receipt rows (from poitemcost)
+    # 2️⃣  Item-level receipt rows (from poitemcost)
     po_items_sql = """
         WITH received AS (
-            SELECT pc.poid,
-                   pc.itemid,
-                   it.itemnameenglish                 AS itemname,
-                   SUM(pc.quantity)                   AS received_qty,
-                   AVG(pc.cost_per_unit)              AS cost_per_unit,
-                   SUM(pc.quantity * pc.cost_per_unit) AS received_value,
-                   MIN(po.actualdelivery)             AS order_date
-            FROM   poitemcost pc
-            JOIN   purchaseorders po ON pc.poid = po.poid
-            JOIN   item            it ON pc.itemid = it.itemid
-            WHERE  po.supplierid = %s
-            GROUP  BY pc.poid, pc.itemid, it.itemnameenglish
+            SELECT  pc.poid,
+                    pc.itemid,
+                    it.itemnameenglish                    AS itemname,
+                    SUM(pc.quantity)                      AS received_qty,
+                    AVG(pc.cost_per_unit)                 AS cost_per_unit,
+                    SUM(pc.quantity * pc.cost_per_unit)   AS received_value,
+                    MIN(po.actualdelivery)                AS order_date
+            FROM    `poitemcost`        pc
+            JOIN    `purchaseorders`    po ON pc.poid  = po.poid
+            JOIN    `item`              it ON pc.itemid = it.itemid
+            WHERE   po.supplierid = %s
+            GROUP BY pc.poid, pc.itemid, it.itemnameenglish
         )
-        SELECT *
-        FROM   received
+        SELECT * FROM received
     """
     po_items_df = fh.fetch_data(po_items_sql, (supplier_id,))
     if po_items_df.empty:
@@ -70,7 +67,7 @@ def _render_supplier_dashboard(
         ["cost_per_unit", "received_value"]
     ].astype(float)
 
-    # 3️⃣  PO‑level totals (sum of all items in the PO)
+    # 3️⃣  PO-level totals
     po_totals = (
         po_items_df.groupby("poid", as_index=False)
         .agg(
@@ -82,8 +79,12 @@ def _render_supplier_dashboard(
     # payments per PO
     paid_map = (
         fh.fetch_data(
-            "SELECT poid, SUM(allocatedamount)::float AS paid_amount "
-            "FROM popayments GROUP BY poid"
+            """
+            SELECT poid,
+                   SUM(allocatedamount) AS paid_amount
+            FROM   `popayments`
+            GROUP  BY poid
+            """
         )
         .set_index("poid")["paid_amount"]
         .to_dict()
@@ -97,44 +98,41 @@ def _render_supplier_dashboard(
 
     with st.expander("🔍 PO breakdown"):
         st.dataframe(
-            po_totals[
-                ["poid", "received_value", "paid_amount", "outstanding"]
-            ],
+            po_totals[["poid", "received_value", "paid_amount", "outstanding"]],
             use_container_width=True,
             hide_index=True,
         )
 
     # 4️⃣  Stock on hand — exact valuation
     stock_sql = """
-        -- Inventory part
-        SELECT i.itemid,
-               SUM(i.quantity)                         AS inv_qty,
-               0                                       AS shelf_qty,
-               SUM(i.quantity * i.cost_per_unit)::float AS inv_value,
-               0                                       AS shelf_value
-        FROM   inventory i
-        JOIN   itemsupplier s ON i.itemid = s.itemid
-        WHERE  s.supplierid = %s
-        GROUP  BY i.itemid
+        /* Inventory part */
+        SELECT  i.itemid,
+                SUM(i.quantity)                        AS inv_qty,
+                0                                      AS shelf_qty,
+                SUM(i.quantity * i.cost_per_unit)      AS inv_value,
+                0                                      AS shelf_value
+        FROM    `inventory`      i
+        JOIN    `itemsupplier`   s ON i.itemid = s.itemid
+        WHERE   s.supplierid = %s
+        GROUP BY i.itemid
 
         UNION ALL
 
-        -- Shelf part
-        SELECT sh.itemid,
-               0                                       AS inv_qty,
-               SUM(sh.quantity)                        AS shelf_qty,
-               0                                       AS inv_value,
-               SUM(sh.quantity * sh.cost_per_unit)::float AS shelf_value
-        FROM   shelf sh
-        JOIN   itemsupplier s ON sh.itemid = s.itemid
-        WHERE  s.supplierid = %s
-        GROUP  BY sh.itemid
+        /* Shelf part */
+        SELECT  sh.itemid,
+                0                                      AS inv_qty,
+                SUM(sh.quantity)                       AS shelf_qty,
+                0                                      AS inv_value,
+                SUM(sh.quantity * sh.cost_per_unit)    AS shelf_value
+        FROM    `shelf`         sh
+        JOIN    `itemsupplier`  s ON sh.itemid = s.itemid
+        WHERE   s.supplierid = %s
+        GROUP BY sh.itemid
     """
     stock_raw = fh.fetch_data(stock_sql, (supplier_id, supplier_id))
 
     if stock_raw.empty:
-        total_qty = 0
-        total_value = 0.0
+        total_qty, total_value = 0, 0.0
         stock_df = pd.DataFrame()
     else:
         stock_df = (
@@ -149,9 +147,8 @@ def _render_supplier_dashboard(
         stock_df["total_qty"] = stock_df["inv_qty"] + stock_df["shelf_qty"]
         stock_df["total_value"] = stock_df["inv_value"] + stock_df["shelf_value"]
 
-        # item names
         names_df = fh.fetch_data(
-            "SELECT itemid, itemnameenglish AS itemname FROM item"
+            "SELECT itemid, itemnameenglish AS itemname FROM `item`"
         )
         stock_df = stock_df.merge(names_df, on="itemid", how="left")
 
@@ -185,20 +182,14 @@ def _render_supplier_dashboard(
     pay_cols = st.columns([2, 1, 1, 3])
     pay_date = pay_cols[0].date_input("Payment date", value=pd.Timestamp.today())
     pay_method = pay_cols[1].selectbox(
-        "Method",
-        ["Cash", "Credit Card", "Bank Transfer", "Other"],
-        key="consign_pay_method",
+        "Method", ["Cash", "Credit Card", "Bank Transfer", "Other"], key="consign_pay_method"
     )
     amount = pay_cols[2].number_input(
-        "Amount",
-        min_value=0.01,
-        step=0.01,
-        format="%.2f",
-        key="consign_pay_amount",
+        "Amount", min_value=0.01, step=0.01, format="%.2f", key="consign_pay_amount"
     )
     notes = pay_cols[3].text_input("Notes (optional)")
 
-    if st.button("💾 Pay & auto‑allocate (oldest first)"):
+    if st.button("💾 Pay & auto-allocate (oldest first)"):
         if amount <= 0:
             st.error("Enter a positive amount.")
             st.stop()
@@ -215,7 +206,7 @@ def _render_supplier_dashboard(
             st.error("DB error creating payment.")
             st.stop()
 
-        # FIFO allocation over PO totals
+        # FIFO allocation
         po_fifo = (
             po_totals.query("outstanding > 0")
             .sort_values(["order_date", "poid"])
@@ -239,7 +230,7 @@ def _render_supplier_dashboard(
         )
         st.rerun()
 
-    # 6️⃣  Amount‑payable summary
+    # 6️⃣  Amount-payable summary
     payable = max(0.0, outstanding_total - total_value)
     st.markdown("---")
     st.markdown(f"### Amount payable now (consignment): **{payable:,.2f} IQD**")
