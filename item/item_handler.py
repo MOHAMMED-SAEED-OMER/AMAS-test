@@ -1,157 +1,186 @@
-import streamlit as st
+# item/item_handler.py  – MySQL backend
+import math
 import pandas as pd
+import streamlit as st
+
 from db_handler import DatabaseManager
 
+
 class ItemHandler(DatabaseManager):
-    """Handles all item-related database interactions separately."""
+    """
+    All item-related DB helpers
+    (rewritten for MySQL, no RETURNING / ON CONFLICT).
+    """
 
-    # ✅ Item methods
-    def get_items(self):
-        """
-        Fetch item data and ensure a valid DataFrame is returned even if no items exist.
-        """
-        query = "SELECT * FROM item"
-        df = self.fetch_data(query)
-
+    # ───────────────────────────── Items ─────────────────────────────
+    def get_items(self) -> pd.DataFrame:
+        """Return every row from `item` (empty DF with columns if none)."""
+        df = self.fetch_data("SELECT * FROM `item`")
         if df.empty:
-            # ✅ Return an empty DataFrame with correct columns to prevent errors
-            return pd.DataFrame(columns=[
-                "itemid", "itemnameenglish", "itemnamekurdish", "classcat", "departmentcat",
-                "sectioncat", "familycat", "subfamilycat", "shelflife", "threshold",
-                "averagerequired", "origincountry", "manufacturer", "brand",
-                "barcode", "packetbarcode", "cartonbarcode", "unittype", "packaging", "itempicture", "createdat", "updatedat"
-            ])
-        
+            return pd.DataFrame(
+                columns=[
+                    "itemid",
+                    "itemnameenglish",
+                    "itemnamekurdish",
+                    "classcat",
+                    "departmentcat",
+                    "sectioncat",
+                    "familycat",
+                    "subfamilycat",
+                    "shelflife",
+                    "threshold",
+                    "averagerequired",
+                    "origincountry",
+                    "manufacturer",
+                    "brand",
+                    "barcode",
+                    "packetbarcode",
+                    "cartonbarcode",
+                    "unittype",
+                    "packaging",
+                    "itempicture",
+                    "createdat",
+                    "updatedat",
+                ]
+            )
         return df
 
-    def get_suppliers(self):
-        """Fetches the list of suppliers."""
-        query = "SELECT SupplierID, SupplierName FROM Supplier"
-        return self.fetch_data(query)
+    # ───────────────────────── Suppliers ─────────────────────────────
+    def get_suppliers(self) -> pd.DataFrame:
+        return self.fetch_data(
+            "SELECT supplierid, suppliername FROM `supplier` ORDER BY suppliername"
+        )
 
-    def get_item_suppliers(self, item_id):
-        """Fetches suppliers linked to a specific item."""
-        query = """
-        SELECT s.SupplierName FROM ItemSupplier isup
-        JOIN Supplier s ON isup.SupplierID = s.SupplierID
-        WHERE isup.ItemID = %s
+    def get_item_suppliers(self, item_id: int) -> list[int]:
         """
-        df = self.fetch_data(query, (item_id,))
-        return df["suppliername"].tolist() if not df.empty else []
+        IDs of suppliers linked to a given item.
+        (Fixed: now returns IDs, not names.)
+        """
+        q = "SELECT supplierid FROM `itemsupplier` WHERE itemid = %s"
+        df = self.fetch_data(q, (item_id,))
+        return df["supplierid"].astype(int).tolist() if not df.empty else []
 
-    def add_item(self, item_data, supplier_ids):
-        """Adds a new item and links it to suppliers."""
-        columns = ", ".join(item_data.keys())
-        placeholders = ", ".join(["%s"] * len(item_data))
-        query = f"""
-        INSERT INTO item ({columns}, createdat, updatedat)
-        VALUES ({placeholders}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        RETURNING itemid
+    # ────────────────────────── INSERT ──────────────────────────────
+    def add_item(self, item_data: dict, supplier_ids: list[int]) -> int | None:
         """
-        item_id = self.execute_command_returning(query, list(item_data.values()))
+        Create a new item and link it to supplier IDs.
+        Returns the new itemid.
+        """
+        cols  = ", ".join(item_data.keys())
+        ph    = ", ".join(["%s"] * len(item_data))
+        sql   = (
+            f"INSERT INTO `item` ({cols}, createdat, updatedat) "
+            f"VALUES ({ph}, NOW(), NOW())"
+        )
+
+        # Insert, fetch AUTO_INCREMENT via lastrowid
+        self._ensure_live_conn()
+        with self.conn.cursor() as cur:
+            cur.execute(sql, list(item_data.values()))
+            item_id = cur.lastrowid
+        self.conn.commit()
 
         if item_id:
-            self.link_item_suppliers(item_id[0], supplier_ids)
-            return item_id[0]
+            self.link_item_suppliers(item_id, supplier_ids)
+            return int(item_id)
         return None
 
-    def link_item_suppliers(self, item_id, supplier_ids):
-        """Links an item with selected suppliers."""
+    # ──────────────────── supplier-link helpers ─────────────────────
+    def link_item_suppliers(self, item_id: int, supplier_ids: list[int]) -> None:
+        """
+        Insert into itemsupplier, ignore duplicates.
+        """
         if not supplier_ids:
             return
+
         values = ", ".join(["(%s, %s)"] * len(supplier_ids))
         params = []
-        for supplier_id in supplier_ids:
-            params.extend([item_id, supplier_id])
-        query = f"""
-        INSERT INTO itemsupplier (itemid, supplierid) 
-        VALUES {values}
-        ON CONFLICT DO NOTHING
-        """
-        self.execute_command(query, params)
+        for sid in supplier_ids:
+            params.extend([item_id, sid])
 
-    def update_item(self, item_id, updated_data):
-        """Updates item details."""
+        # INSERT IGNORE skips rows that would violate the PK
+        sql = f"INSERT IGNORE INTO `itemsupplier` (itemid, supplierid) VALUES {values}"
+        self.execute_command(sql, tuple(params))
+
+    def update_item_suppliers(self, item_id: int, supplier_ids: list[int]) -> None:
+        """
+        Replace supplier links for an item.
+        """
+        self.execute_command("DELETE FROM `itemsupplier` WHERE itemid = %s", (item_id,))
+        self.link_item_suppliers(item_id, supplier_ids)
+
+    # ────────────────────────── UPDATE ─────────────────────────────
+    def update_item(self, item_id: int, updated_data: dict) -> None:
+        """
+        Patch columns on an item row.
+        """
         if not updated_data:
             st.warning("⚠️ No changes made.")
             return
-        set_clause = ", ".join(f"{col} = %s" for col in updated_data.keys())
-        query = f"""
-        UPDATE item
-        SET {set_clause}, updatedat = CURRENT_TIMESTAMP
-        WHERE itemid = %s
-        """
+
+        set_clause = ", ".join(f"{k} = %s" for k in updated_data)
+        sql = (
+            f"UPDATE `item` SET {set_clause}, updatedat = NOW() WHERE itemid = %s"
+        )
         params = list(updated_data.values()) + [item_id]
-        self.execute_command(query, params)
+        self.execute_command(sql, tuple(params))
 
-    def update_item_suppliers(self, item_id, supplier_ids):
-        """Updates suppliers linked to an item."""
-        delete_query = "DELETE FROM ItemSupplier WHERE ItemID = %s"
-        self.execute_command(delete_query, (item_id,))
-        for supplier_id in supplier_ids:
-            insert_query = "INSERT INTO ItemSupplier (ItemID, SupplierID) VALUES (%s, %s)"
-            self.execute_command(insert_query, (item_id, supplier_id))
-
-    # ✅ Dropdown methods
-    def get_dropdown_values(self, section):
-        """Fetches values from dropdown categories."""
-        query = "SELECT value FROM Dropdowns WHERE section = %s"
-        df = self.fetch_data(query, (section,))
-        return df["value"].tolist() if not df.empty else []
-
-    def add_dropdown_value(self, section, value):
-        """Adds a new value to dropdown categories."""
-        query = """
-        INSERT INTO Dropdowns (section, value)
-        VALUES (%s, %s)
-        ON CONFLICT (section, value) DO NOTHING
+    # ────────────────────────── DELETE ─────────────────────────────
+    def delete_item(self, itemid: int) -> None:
         """
-        self.execute_command(query, (section, value))
-
-    def delete_dropdown_value(self, section, value):
-        """Deletes a value from dropdown categories."""
-        query = "DELETE FROM Dropdowns WHERE section = %s AND value = %s"
-        self.execute_command(query, (section, value))
-
-    # ✅ Methods for "Add Pictures" Tab
-    def get_items_without_pictures(self):
-        """Fetch items without pictures."""
-        query = """
-        SELECT ItemID, ItemNameEnglish
-        FROM Item
-        WHERE ItemPicture IS NULL OR length(ItemPicture) = 0
-        """
-        return self.fetch_data(query)
-
-    def update_item_picture(self, item_id, picture_data):
-        """Update item picture in database."""
-        query = """
-        UPDATE Item
-        SET ItemPicture = %s, UpdatedAt = CURRENT_TIMESTAMP
-        WHERE ItemID = %s
-        """
-        self.execute_command(query, (picture_data, item_id))
-
-    def delete_item(self, itemid: int):
-        """
-        Delete an item only if it is not referenced anywhere else.
-        Raises ValueError listing blocking tables if references exist.
+        Delete an item after verifying no FK references.
         """
         conflicts = self.check_foreign_key_references(
-            referenced_table="item",
-            referenced_column="itemid",
-            value=itemid,
+            referenced_table="item", referenced_column="itemid", value=itemid
         )
-
         if conflicts:
-            tables = ", ".join(conflicts)
             raise ValueError(
-                f"Cannot delete item {itemid}: the item is still referenced by "
-                f"the following table(s): {tables}"
+                f"Cannot delete item {itemid}: still referenced by {', '.join(conflicts)}"
             )
 
-        # remove supplier links first (optional but tidy)
-        self.execute_command("DELETE FROM itemsupplier WHERE itemid = %s", (itemid,))
+        self.execute_command("DELETE FROM `itemsupplier` WHERE itemid = %s", (itemid,))
+        self.execute_command("DELETE FROM `item` WHERE itemid = %s", (itemid,))
 
-        # finally remove the item record itself
-        self.execute_command("DELETE FROM item WHERE itemid = %s", (itemid,))
+    # ───────────────────── Dropdown utilities ──────────────────────
+    def get_dropdown_values(self, section: str) -> list[str]:
+        df = self.fetch_data(
+            "SELECT value FROM `dropdowns` WHERE section = %s ORDER BY value", (section,)
+        )
+        return df["value"].tolist() if not df.empty else []
+
+    def add_dropdown_value(self, section: str, value: str) -> None:
+        # INSERT IGNORE avoids duplicate key errors when (section,value) is UNIQUE
+        self.execute_command(
+            "INSERT IGNORE INTO `dropdowns` (section, value) VALUES (%s, %s)",
+            (section, value),
+        )
+
+    def delete_dropdown_value(self, section: str, value: str) -> None:
+        self.execute_command(
+            "DELETE FROM `dropdowns` WHERE section = %s AND value = %s",
+            (section, value),
+        )
+
+    # ───────────── picture helpers (Add Pictures tab) ──────────────
+    def get_items_without_pictures(self) -> pd.DataFrame:
+        """
+        Items whose ItemPicture is NULL or empty (MySQL LENGTH)
+        """
+        q = """
+            SELECT itemid, itemnameenglish
+            FROM   `item`
+            WHERE  itempicture IS NULL OR LENGTH(itempicture) = 0
+            ORDER  BY itemnameenglish
+        """
+        return self.fetch_data(q)
+
+    def update_item_picture(self, item_id: int, picture_data: bytes) -> None:
+        self.execute_command(
+            """
+            UPDATE `item`
+               SET itempicture = %s,
+                   updatedat   = NOW()
+             WHERE itemid      = %s
+            """,
+            (picture_data, item_id),
+        )
