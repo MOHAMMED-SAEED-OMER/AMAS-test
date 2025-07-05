@@ -1,4 +1,4 @@
-# db_handler.py  – MySQL edition
+# db_handler.py  – MySQL edition (secrets-key tolerant)
 import streamlit as st
 import mysql.connector
 from mysql.connector import OperationalError, InterfaceError   # reconnect check
@@ -17,11 +17,7 @@ def _session_key() -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_conn(params: dict, key: str):
-    """
-    Create (once per session) and return a MySQL connection.
-    `params` is the kwargs-dict you would normally pass to
-    `mysql.connector.connect(**params)`.
-    """
+    """Create (once per session) and return a MySQL connection."""
     conn = mysql.connector.connect(**params)
     try:
         st.on_session_end(conn.close)
@@ -36,36 +32,43 @@ class DatabaseManager:
     """General DB interactions using a cached connection."""
 
     def __init__(self):
-        # Credentials live in .streamlit/secrets.toml
-        # Either top-level keys (DB_HOST …) *or* a [mysql] section work.
+        # Credentials live in .streamlit/secrets.toml (Cloud UI)
         secrets = st.secrets
-        if "mysql" in secrets:
+        if "mysql" in secrets:                         # sectioned secrets
             secrets = secrets["mysql"]
 
+        # 💡 Accept BOTH upper-case and lower-case keys
+        def pick(*names, default=None):
+            for n in names:
+                if n in secrets:
+                    return secrets[n]
+            return default
+
         self.params = dict(
-            host      = secrets["DB_HOST"],
-            port      = int(secrets["DB_PORT"]),
-            user      = secrets["DB_USER"],
-            password  = secrets["DB_PASS"],
-            database  = secrets["DB_NAME"],
+            host      = pick("DB_HOST", "host"),
+            port      = int(pick("DB_PORT", "port", default=3306)),
+            user      = pick("DB_USER", "user"),
+            password  = pick("DB_PASS", "password"),
+            database  = pick("DB_NAME", "database"),
             autocommit=True,
             charset   ="utf8mb4",
             collation ="utf8mb4_unicode_ci",
             raise_on_warnings=True,
         )
+
         self._key  = _session_key()
         self.conn  = get_conn(self.params, self._key)  # reuse within this session
 
     # ────────── internal helpers ──────────
     def _ensure_live_conn(self):
         """Reconnect if the cached connection was closed by MySQL."""
-        if not self.conn.is_connected():       # False means closed
+        if not self.conn.is_connected():
             get_conn.clear()
             self.conn = get_conn(self.params, self._key)
 
     def _fetch_df(self, query: str, params=None) -> pd.DataFrame:
         self._ensure_live_conn()
-        try:  # first attempt
+        try:
             with self.conn.cursor() as cur:
                 cur.execute(query, params or ())
                 rows = cur.fetchall()
@@ -78,7 +81,7 @@ class DatabaseManager:
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
         except Exception:
-            self.conn.rollback()               # recover from broken tx
+            self.conn.rollback()
             raise
         return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
 
@@ -86,7 +89,7 @@ class DatabaseManager:
         """
         Run INSERT/UPDATE/DELETE.
         If `returning` is True **you must include your own SELECT** in `query`
-        because MySQL’s `RETURNING` is limited.
+        because MySQL’s RETURNING is limited.
         """
         self._ensure_live_conn()
         try:
@@ -151,7 +154,6 @@ class DatabaseManager:
         Return tables that still reference `value` via FOREIGN KEY.
         Empty list ⇒ safe to delete.
         """
-        # 1️⃣  find all foreign-key constraints that target the PK
         fk_sql = """
             SELECT tc.table_schema,
                    tc.table_name
@@ -171,7 +173,6 @@ class DatabaseManager:
             schema = row["table_schema"]
             table  = row["table_name"]
 
-            # 2️⃣  check if at least one record references the value
             exists_sql = f"""
                 SELECT EXISTS(
                     SELECT 1
