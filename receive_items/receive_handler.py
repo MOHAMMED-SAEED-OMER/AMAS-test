@@ -1,41 +1,50 @@
+# receive_items/receive_handler.py  – MySQL backend
 from db_handler import DatabaseManager
-from psycopg2.extras import execute_values
 
 
 class ReceiveHandler(DatabaseManager):
-    """Handles database operations for receiving items, costs, and locations."""
+    """
+    DB helpers for the receiving workflow
+    (rewritten to avoid Postgres-only RETURNING / execute_values).
+    """
 
-    # ───────────────────────── POs to receive ─────────────────────────
+    # ───────────────────── POs eligible to receive ─────────────────────
     def get_received_pos(self):
-        query = """
-        SELECT po.poid,
-               po.expecteddelivery,
-               s.suppliername
-        FROM   purchaseorders po
-        JOIN   supplier s ON po.supplierid = s.supplierid
-        WHERE  po.status = 'Received'
-        """
-        return self.fetch_data(query)
+        return self.fetch_data(
+            """
+            SELECT  po.poid,
+                    po.expecteddelivery,
+                    s.suppliername
+            FROM    purchaseorders po
+            JOIN    supplier       s ON s.supplierid = po.supplierid
+            WHERE   po.status = 'Received'
+            """
+        )
 
-    def get_po_items(self, poid):
-        query = """
-        SELECT poi.itemid,
-               i.itemnameenglish,
-               poi.orderedquantity,
-               poi.receivedquantity,
-               poi.estimatedprice,
-               poi.supexpirationdate
-        FROM   purchaseorderitems poi
-        JOIN   item i ON poi.itemid = i.itemid
-        WHERE  poi.poid = %s
-        """
-        return self.fetch_data(query, (poid,))
+    def get_po_items(self, poid: int):
+        return self.fetch_data(
+            """
+            SELECT  poi.itemid,
+                    i.itemnameenglish,
+                    poi.orderedquantity,
+                    poi.receivedquantity,
+                    poi.estimatedprice,
+                    poi.supexpirationdate
+            FROM    purchaseorderitems poi
+            JOIN    item               i ON i.itemid = poi.itemid
+            WHERE   poi.poid = %s
+            """,
+            (poid,),
+        )
 
-    # ─────────────────────── inventory & quantities ───────────────────
-    def add_items_to_inventory(self, items: list):
+    # ─────────────────── inventory & qty updates ──────────────────────
+    def add_items_to_inventory(self, items: list[dict]) -> None:
         """
-        Batch-insert many inventory rows in ONE round-trip and ONE commit.
+        Batch-insert inventory rows with a single executemany().
         """
+        if not items:
+            return
+
         rows = [
             (
                 int(itm["item_id"]),
@@ -52,124 +61,166 @@ class ReceiveHandler(DatabaseManager):
         sql = """
             INSERT INTO inventory
                   (itemid, quantity, expirationdate,
-                   storagelocation,
-                   cost_per_unit, poid, costid)   -- datereceived omitted (defaults)
-            VALUES %s
+                   storagelocation, cost_per_unit,
+                   poid, costid)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
 
         self._ensure_live_conn()
-        with self.conn:                        # BEGIN … COMMIT once
-            with self.conn.cursor() as cur:
-                execute_values(cur, sql, rows)
-    def update_received_quantity(self, poid, item_id, qty):
-        sql = """
-        UPDATE purchaseorderitems
-        SET    receivedquantity = %s
-        WHERE  poid = %s AND itemid = %s
-        """
-        self.execute_command(sql, (qty, poid, item_id))
+        with self.conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        self.conn.commit()
 
-    # ────────────────────────── cost tracking ─────────────────────────
-    def insert_poitem_cost(self, poid, item_id, cost_per_unit, qty, note=""):
-        sql = """
-        INSERT INTO poitemcost (poid, itemid, cost_per_unit,
-                                quantity, cost_date, note)
-        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, %s)
-        RETURNING costid
-        """
-        res = self.execute_command_returning(sql, (poid, item_id, cost_per_unit, qty, note))
-        return int(res[0])          # ← caller now receives costid
-        
-    def refresh_po_total_cost(self, poid: int):
-        sql = """
-        UPDATE purchaseorders
-        SET    totalcost = COALESCE((
-                 SELECT SUM(quantity * cost_per_unit)
-                 FROM   poitemcost
-                 WHERE  poid = %s
-               ),0)
-        WHERE  poid = %s
-        """
-        self.execute_command(sql, (poid, poid))
-
-    # ───────────────────── synthetic‑PO helpers ───────────────────────
-    def create_manual_po(self, supplier_id: int, note: str = "") -> int:
-        """
-        Create a synthetic PO header (status='Completed') and commit.
-        Returns the new POID.
-        """
-        sql = """
-        INSERT INTO purchaseorders
-              (supplierid, status, orderdate, expecteddelivery,
-               actualdelivery, createdby, suppliernote, totalcost)
-        VALUES (%s, 'Completed', CURRENT_DATE, CURRENT_DATE,
-                CURRENT_DATE, 'ManualReceive', %s, 0.0)
-        RETURNING poid
-        """
-        res = self.execute_command_returning(sql, (supplier_id, note))
-        return int(res[0])
-
-    def add_po_item(self, poid: int, item_id: int, qty: int, cost: float):
-        sql = """
-        INSERT INTO purchaseorderitems
-              (poid, itemid, orderedquantity, receivedquantity, estimatedprice)
-        VALUES (%s, %s, %s, %s, %s)
-        """
-        self.execute_command(sql, (poid, item_id, qty, qty, cost))
-
-    # ─────────────────────── PO status helpers ───────────────────────
-    def mark_po_completed(self, poid):
+    def update_received_quantity(self, poid: int, item_id: int, qty: int) -> None:
         self.execute_command(
-            "UPDATE purchaseorders SET status = 'Completed' WHERE poid = %s",
-            (poid,)
+            """
+            UPDATE purchaseorderitems
+               SET receivedquantity = %s
+             WHERE poid  = %s
+               AND itemid = %s
+            """,
+            (qty, poid, item_id),
         )
 
-    # ───────────────────── location helper queries ───────────────────
-    def get_items_with_locations_and_expirations(self):
-        query = """
-        SELECT i.itemid,
-               i.itemnameenglish,
-               i.barcode,
-               inv.storagelocation,
-               inv.expirationdate,
-               SUM(inv.quantity) AS currentquantity
-        FROM   item i
-        JOIN   inventory inv ON i.itemid = inv.itemid
-        GROUP  BY i.itemid, i.itemnameenglish, i.barcode,
-                 inv.storagelocation, inv.expirationdate
-        HAVING SUM(inv.quantity) > 0
+    # ──────────────────────── cost tracking ───────────────────────────
+    def insert_poitem_cost(
+        self,
+        poid: int,
+        item_id: int,
+        cost_per_unit: float,
+        qty: int,
+        note: str = "",
+    ) -> int:
         """
-        return self.fetch_data(query)
+        Insert cost row and return the new costid (AUTO_INCREMENT).
+        """
+        sql = """
+            INSERT INTO poitemcost
+                (poid, itemid, cost_per_unit, quantity, cost_date, note)
+            VALUES (%s, %s, %s, %s, NOW(), %s)
+        """
+        self._ensure_live_conn()
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (poid, item_id, cost_per_unit, qty, note))
+            cost_id = cur.lastrowid
+        self.conn.commit()
+        return int(cost_id)
+
+    def refresh_po_total_cost(self, poid: int) -> None:
+        """
+        Re-calculate totalcost on a PO from its poitemcost rows.
+        """
+        self.execute_command(
+            """
+            UPDATE purchaseorders
+               SET totalcost = (
+                   SELECT IFNULL(SUM(quantity * cost_per_unit), 0)
+                   FROM   poitemcost
+                   WHERE  poid = %s
+               )
+             WHERE poid = %s
+            """,
+            (poid, poid),
+        )
+
+    # ─────────────── synthetic / manual PO helpers ────────────────────
+    def create_manual_po(self, supplier_id: int, note: str = "") -> int:
+        """
+        Create a synthetic PO header (status='Completed') and return POID.
+        """
+        sql = """
+            INSERT INTO purchaseorders
+                  (supplierid, status, orderdate, expecteddelivery,
+                   actualdelivery, createdby, suppliernote, totalcost)
+            VALUES (%s, 'Completed', CURDATE(), CURDATE(),
+                    CURDATE(), 'ManualReceive', %s, 0.0)
+        """
+        self._ensure_live_conn()
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (supplier_id, note))
+            poid = cur.lastrowid
+        self.conn.commit()
+        return int(poid)
+
+    def add_po_item(self, poid: int, item_id: int, qty: int, cost: float) -> None:
+        self.execute_command(
+            """
+            INSERT INTO purchaseorderitems
+                  (poid, itemid, orderedquantity,
+                   receivedquantity, estimatedprice)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (poid, item_id, qty, qty, cost),
+        )
+
+    # ─────────────────────── PO status helpers ───────────────────────
+    def mark_po_completed(self, poid: int) -> None:
+        self.execute_command(
+            "UPDATE purchaseorders SET status = 'Completed' WHERE poid = %s",
+            (poid,),
+        )
+
+    # ───────────── location queries & updates ────────────────────────
+    def get_items_with_locations_and_expirations(self):
+        return self.fetch_data(
+            """
+            SELECT  i.itemid,
+                    i.itemnameenglish,
+                    i.barcode,
+                    inv.storagelocation,
+                    inv.expirationdate,
+                    SUM(inv.quantity) AS currentquantity
+            FROM    item i
+            JOIN    inventory inv ON inv.itemid = i.itemid
+            GROUP   BY i.itemid,
+                     i.itemnameenglish,
+                     i.barcode,
+                     inv.storagelocation,
+                     inv.expirationdate
+            HAVING  SUM(inv.quantity) > 0
+            """
+        )
 
     def get_items_without_location(self):
-        query = """
-        SELECT i.itemid,
-               i.itemnameenglish,
-               i.barcode,
-               COALESCE(inv.quantity,0) AS currentquantity
-        FROM   item i
-        JOIN   inventory inv ON i.itemid = inv.itemid
-        WHERE  inv.storagelocation IS NULL OR inv.storagelocation = ''
-        """
-        return self.fetch_data(query)
+        return self.fetch_data(
+            """
+            SELECT  i.itemid,
+                    i.itemnameenglish,
+                    i.barcode,
+                    IFNULL(SUM(inv.quantity),0) AS currentquantity
+            FROM    item i
+            JOIN    inventory inv ON inv.itemid = i.itemid
+            WHERE   (inv.storagelocation IS NULL OR inv.storagelocation = '')
+            GROUP   BY i.itemid, i.itemnameenglish, i.barcode
+            """
+        )
 
-    def update_item_location(self, item_id, new_loc):
-        sql = """
-        UPDATE inventory
-        SET    storagelocation = %s
-        WHERE  itemid = %s AND (storagelocation IS NULL OR storagelocation = '')
-        """
-        self.execute_command(sql, (new_loc, int(item_id)))
+    def update_item_location(self, item_id: int, new_loc: str) -> None:
+        self.execute_command(
+            """
+            UPDATE inventory
+               SET storagelocation = %s
+             WHERE itemid = %s
+               AND (storagelocation IS NULL OR storagelocation = '')
+            """,
+            (new_loc, int(item_id)),
+        )
 
-    def update_item_location_specific(self, item_id, exp_date, new_loc):
-        sql = """
-        UPDATE inventory
-        SET    storagelocation = %s
-        WHERE  itemid = %s AND expirationdate = %s
-        """
-        self.execute_command(sql, (new_loc, item_id, exp_date))
+    def update_item_location_specific(
+        self, item_id: int, exp_date, new_loc: str
+    ) -> None:
+        self.execute_command(
+            """
+            UPDATE inventory
+               SET storagelocation = %s
+             WHERE itemid        = %s
+               AND expirationdate = %s
+            """,
+            (new_loc, item_id, exp_date),
+        )
 
-    # add inside ReceiveHandler (anywhere convenient)
+    # ─────────────── simple helper used by UI tabs ───────────────────
     def get_suppliers(self):
-        return self.fetch_data("SELECT supplierid, suppliername FROM supplier "
-                               "ORDER BY suppliername")
+        return self.fetch_data(
+            "SELECT supplierid, suppliername FROM supplier ORDER BY suppliername"
+        )
