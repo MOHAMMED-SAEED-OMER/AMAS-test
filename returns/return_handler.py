@@ -1,19 +1,19 @@
-# returns/return_handler.py
+# returns/return_handler.py  ▶︎  MySQL / MariaDB version
 import pandas as pd
 from db_handler import DatabaseManager
-from psycopg2.extras import execute_values      # <-- NEW
+
 
 class ReturnHandler(DatabaseManager):
     """
-    Handles all DB work for supplier returns:
-      • create return header / items
+    DB helper for supplier returns (MySQL edition).
+
+      • create return header / lines
       • approve return
-      • fetch summaries & detail
-      • helper look-ups (POs + PO items)
+      • fetch summaries / detail
     """
 
     # ───────────────────────────────────────────────────────────────
-    # Create & Edit
+    # Creation helpers
     # ───────────────────────────────────────────────────────────────
     def create_return(
         self,
@@ -23,9 +23,10 @@ class ReturnHandler(DatabaseManager):
         total_return_cost: float,
         creditnote: str = "",
         notes: str = "",
-    ) -> int:
+    ) -> int | None:
         """
-        Insert a new row in supplierreturns.  Returns the new returnid.
+        Insert a row into `supplierreturns` and return the new PK.
+        (Uses cursor.lastrowid instead of the Postgres RETURNING clause.)
         """
         sql = """
         INSERT INTO supplierreturns (
@@ -37,21 +38,23 @@ class ReturnHandler(DatabaseManager):
             totalreturncost
         )
         VALUES (%s, %s, %s, 'Pending Approval', %s, %s)
-        RETURNING returnid;
         """
-        res = self.execute_command_returning(
-            sql, (supplier_id, creditnote, notes, createdby, total_return_cost)
-        )
-        return int(res[0]) if res else None
 
-    # ----------- NEW: batch insert for many return lines ------------
+        self._ensure_live_conn()
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (supplier_id, creditnote, notes, createdby, total_return_cost))
+            self.conn.commit()
+            return int(cur.lastrowid)        # MySQL way to get the PK
+
+
+    # ---------- BULK insert of return items ------------------------
     def add_return_items_bulk(self, items: list[dict]) -> None:
         """
-        Batch-insert many rows into supplierreturnitems in ONE transaction.
-        Each dict needs keys:
-            returnid, itemid, quantity, itemprice
-        Optional keys:
-            reason, poid, expiredate
+        One round-trip INSERT for many lines – MySQL build-values version.
+        Required keys in each dict:
+          returnid • itemid • quantity • itemprice
+        Optional:
+          reason • poid • expiredate
         """
         if not items:
             return
@@ -71,20 +74,20 @@ class ReturnHandler(DatabaseManager):
         ]
 
         sql = """
-            INSERT INTO supplierreturnitems (
-                returnid, itemid, quantity,
-                itemprice, totalcost, reason,
-                poid, expirationdate
-            )
-            VALUES %s
+        INSERT INTO supplierreturnitems (
+              returnid, itemid, quantity,
+              itemprice, totalcost, reason,
+              poid, expirationdate
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         self._ensure_live_conn()
-        with self.conn:                        # BEGIN … COMMIT once
-            with self.conn.cursor() as cur:
-                execute_values(cur, sql, rows)
+        with self.conn.cursor() as cur:
+            cur.executemany(sql, rows)
+            self.conn.commit()
 
-    # ---- backward-compatible single-row helper (calls bulk) --------
+
+    # ---- single-row helper (wraps the bulk method) ---------------
     def add_return_item(
         self,
         *,
@@ -93,25 +96,19 @@ class ReturnHandler(DatabaseManager):
         quantity: float,
         itemprice: float,
         reason: str = "",
-        poid: int = None,
-        expiredate: str = None,
+        poid: int | None = None,
+        expiredate: str | None = None,
     ) -> None:
-        """
-        Add ONE line into supplierreturnitems.
-        (Now implemented via bulk helper for efficiency.)
-        """
         self.add_return_items_bulk(
-            [
-                dict(
-                    returnid=returnid,
-                    itemid=itemid,
-                    quantity=quantity,
-                    itemprice=itemprice,
-                    reason=reason,
-                    poid=poid,
-                    expiredate=expiredate,
-                )
-            ]
+            [{
+                "returnid":   returnid,
+                "itemid":     itemid,
+                "quantity":   quantity,
+                "itemprice":  itemprice,
+                "reason":     reason,
+                "poid":       poid,
+                "expiredate": expiredate,
+            }]
         )
 
     # ───────────────────────────────────────────────────────────────
@@ -128,12 +125,12 @@ class ReturnHandler(DatabaseManager):
         self.execute_command(sql, (creditnote, returnid))
 
     # ───────────────────────────────────────────────────────────────
-    # Look-ups for UI
+    # Look-ups for the UI
     # ───────────────────────────────────────────────────────────────
     def get_purchase_orders_by_supplier(self, supplier_id: int) -> pd.DataFrame:
         sql = """
         SELECT poid,
-               orderdate::date   AS orderdate,
+               DATE(orderdate)         AS orderdate,     -- DATE() ≈  ::date
                totalcost,
                status
           FROM purchaseorders
@@ -156,7 +153,7 @@ class ReturnHandler(DatabaseManager):
         return self.fetch_data(sql, (poid,))
 
     # ───────────────────────────────────────────────────────────────
-    # Reporting
+    # Reporting helpers
     # ───────────────────────────────────────────────────────────────
     def get_returns_summary(self) -> pd.DataFrame:
         sql = """
@@ -197,10 +194,8 @@ class ReturnHandler(DatabaseManager):
             (returnid,),
         )
 
-    # ───────────────────────── inventory update ─────────────────────
-    def reduce_inventory(
-        self, *, itemid: int, expiredate: str, qty: int
-    ) -> None:
+    # ───────────────────────── inventory adjustment ─────────────────
+    def reduce_inventory(self, *, itemid: int, expiredate: str, qty: int) -> None:
         sql = """
         UPDATE inventory
            SET quantity = quantity - %s
