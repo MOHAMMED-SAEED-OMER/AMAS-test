@@ -1,8 +1,9 @@
-# inventory/returns/add_return.py
+# returns/add_return.py
 import streamlit as st
 from returns.return_handler import ReturnHandler
 
 rh = ReturnHandler()
+
 
 # ───────────────────────────────────────────────────────────────
 def return_tab() -> None:
@@ -10,7 +11,9 @@ def return_tab() -> None:
 
     # 1) Supplier selector ───────────────────────────────────────
     sup_df = rh.fetch_data(
-        "SELECT supplierid, suppliername FROM supplier ORDER BY suppliername"
+        "SELECT supplierid, suppliername "
+        "FROM   supplier "
+        "ORDER  BY suppliername"
     )
     if sup_df.empty:
         st.info("No suppliers in database.")
@@ -41,10 +44,10 @@ def return_tab() -> None:
     items_df = rh.fetch_data(
         """
         SELECT i.itemid, i.itemnameenglish
-          FROM item i
-          JOIN itemsupplier isup ON i.itemid = isup.itemid
-         WHERE isup.supplierid = %s
-         ORDER BY i.itemnameenglish
+        FROM   item i
+        JOIN   itemsupplier isup ON i.itemid = isup.itemid
+        WHERE  isup.supplierid = %s
+        ORDER  BY i.itemnameenglish
         """,
         (supplier_id,),
     )
@@ -53,7 +56,12 @@ def return_tab() -> None:
         return
 
     po_df = rh.fetch_data(
-        "SELECT poid FROM purchaseorders WHERE supplierid = %s ORDER BY poid DESC",
+        """
+        SELECT poid
+        FROM   purchaseorders
+        WHERE  supplierid = %s
+        ORDER  BY poid DESC
+        """,
         (supplier_id,),
     )
     po_choices = ["—"] + po_df["poid"].astype(str).tolist()
@@ -78,7 +86,7 @@ def return_tab() -> None:
     hdr_reason.markdown("**Reason**")
     hdr_poid.markdown("**Linked&nbsp;PO**")
     hdr_max.markdown("**Max**")
-    hdr_avg.markdown("**cost**")
+    hdr_avg.markdown("**Cost**")
 
     # ────────────────────────────────────────────────────────────
     #  Data rows
@@ -104,17 +112,22 @@ def return_tab() -> None:
         exp_df = rh.fetch_data(
             """
             SELECT expirationdate,
-                   SUM(q)::int AS quantity
+                   SUM(q) AS quantity
             FROM (
                 SELECT expirationdate, quantity AS q
-                  FROM inventory WHERE itemid = %s
+                FROM   inventory
+                WHERE  itemid = %s
+
                 UNION ALL
+
                 SELECT expirationdate, quantity AS q
-                  FROM shelf      WHERE itemid = %s
-            ) z
-            GROUP BY expirationdate HAVING SUM(q) > 0
+                FROM   shelf
+                WHERE  itemid = %s
+            ) AS z
+            GROUP  BY expirationdate
+            HAVING SUM(q) > 0
             ORDER  BY expirationdate;
-            """,
+            """,                                    # ➊ removed “::int” cast
             (item_id, item_id),
         )
 
@@ -135,7 +148,7 @@ def return_tab() -> None:
             exp_selected = str(
                 exp_df.iloc[opts.index(exp_opt)].expirationdate
             )
-            avail_qty = exp_df.iloc[opts.index(exp_opt)].quantity
+            avail_qty = int(exp_df.iloc[opts.index(exp_opt)].quantity)
 
         # Qty input
         qty = col_qty.number_input(
@@ -152,16 +165,20 @@ def return_tab() -> None:
         avg_cost_df = rh.fetch_data(
             """
             WITH layers AS (
-              SELECT quantity, cost_per_unit
-                FROM inventory WHERE itemid = %s AND quantity > 0
-              UNION ALL
-              SELECT quantity, cost_per_unit
-                FROM shelf      WHERE itemid = %s AND quantity > 0
+                SELECT quantity, cost_per_unit
+                FROM   inventory
+                WHERE  itemid = %s AND quantity > 0
+
+                UNION ALL
+
+                SELECT quantity, cost_per_unit
+                FROM   shelf
+                WHERE  itemid = %s AND quantity > 0
             )
             SELECT SUM(quantity * cost_per_unit) /
-                   NULLIF(SUM(quantity),0) AS avg_cost
-              FROM layers;
-            """,
+                   NULLIF(SUM(quantity), 0) AS avg_cost
+            FROM   layers;
+            """,                                  # ➋ unchanged – valid in MySQL
             (item_id, item_id),
         )
         avg_cost = round(
@@ -253,3 +270,8 @@ def return_tab() -> None:
 
             st.success(f"✅ Return #{ret_id} saved with {len(payload)} item(s).")
             st.rerun()
+
+
+# Debug / standalone run
+if __name__ == "__main__":
+    return_tab()
