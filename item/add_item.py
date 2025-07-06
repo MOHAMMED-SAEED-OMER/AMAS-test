@@ -1,5 +1,6 @@
-# item/add_item.py
+# item/add_item.py  – fixed for binary images
 import streamlit as st
+import mysql.connector                      # ⬅ for Binary()
 from item.item_handler import ItemHandler
 
 item_handler = ItemHandler()
@@ -9,7 +10,6 @@ item_handler = ItemHandler()
 # ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def load_dropdowns():
-    # Mapping dropdown label → DB section name
     dropdown_fields = {
         "Class Category":      "ClassCat",
         "Department Category": "DepartmentCat",
@@ -36,68 +36,51 @@ def add_item_tab():
     required = ["Item Name (English)", "Class Category",
                 "Shelf Life", "Threshold", "Average Required"]
 
-    # HTML bullet for required fields
     def req(label):
         return f"{label} *" if label in required else label
 
     # ─────────── FORM ───────────
     with st.form("add_item_form", clear_on_submit=True):
-        # Text inputs
         item_name_en = st.text_input(req("Item Name (English)"))
         item_name_ku = st.text_input("Item Name (Kurdish)")
 
-        class_cat = st.selectbox(
-            req("Class Category"), [""] + dropdown_values["Class Category"]
-        )
-
-        department_cat = st.selectbox(
-            "Department Category", [""] + dropdown_values["Department Category"]
-        )
-        section_cat = st.selectbox(
-            "Section Category", [""] + dropdown_values["Section Category"]
-        )
-        family_cat = st.selectbox(
-            "Family Category", [""] + dropdown_values["Family Category"]
-        )
-        subfamily_cat = st.selectbox(
-            "Sub-Family Category", [""] + dropdown_values["Sub-Family Category"]
-        )
+        class_cat = st.selectbox(req("Class Category"),
+                                 [""] + dropdown_values["Class Category"])
+        department_cat = st.selectbox("Department Category",
+                                      [""] + dropdown_values["Department Category"])
+        section_cat = st.selectbox("Section Category",
+                                   [""] + dropdown_values["Section Category"])
+        family_cat = st.selectbox("Family Category",
+                                  [""] + dropdown_values["Family Category"])
+        subfamily_cat = st.selectbox("Sub-Family Category",
+                                     [""] + dropdown_values["Sub-Family Category"])
 
         shelf_life       = st.number_input(req("Shelf Life"), min_value=0)
         threshold        = st.number_input(req("Threshold"), min_value=0)
         average_required = st.number_input(req("Average Required"), min_value=0)
 
-        origin_country = st.selectbox(
-            "Origin Country", [""] + dropdown_values["Origin Country"]
-        )
-        manufacturer = st.selectbox(
-            "Manufacturer", [""] + dropdown_values["Manufacturer"]
-        )
-        brand = st.selectbox(
-            "Brand", [""] + dropdown_values["Brand"]
-        )
+        origin_country = st.selectbox("Origin Country",
+                                      [""] + dropdown_values["Origin Country"])
+        manufacturer   = st.selectbox("Manufacturer",
+                                      [""] + dropdown_values["Manufacturer"])
+        brand          = st.selectbox("Brand", [""] + dropdown_values["Brand"])
 
-        barcode    = st.text_input("Barcode")
-        packet_barcode = st.text_input("Packet Barcode")
-        carton_barcode = st.text_input("Carton Barcode")
-        unit_type  = st.selectbox(
-            "Unit Type", [""] + dropdown_values["Unit Type"]
-        )
-        packaging  = st.selectbox(
-            "Packaging", [""] + dropdown_values["Packaging"]
-        )
+        barcode         = st.text_input("Barcode")
+        packet_barcode  = st.text_input("Packet Barcode")
+        carton_barcode  = st.text_input("Carton Barcode")
+        unit_type       = st.selectbox("Unit Type", [""] + dropdown_values["Unit Type"])
+        packaging       = st.selectbox("Packaging", [""] + dropdown_values["Packaging"])
 
         item_picture = st.file_uploader("Item Picture", type=["jpg", "jpeg", "png"])
 
         # Supplier multiselect
-        suppliers_df      = item_handler.get_suppliers()
-        supplier_names    = suppliers_df["suppliername"].tolist()
-        selected_sup_names = st.multiselect("Select Supplier(s)", supplier_names)
-        selected_sup_ids   = suppliers_df[
+        suppliers_df        = item_handler.get_suppliers()
+        supplier_names      = suppliers_df["suppliername"].tolist()
+        selected_sup_names  = st.multiselect("Select Supplier(s)", supplier_names)
+        selected_sup_ids    = suppliers_df[
             suppliers_df["suppliername"].isin(selected_sup_names)
         ]["supplierid"].tolist()
 
-        # ── Submit button ──
         submitted = st.form_submit_button("Add Item")
 
     # ─────────── After submit ───────────
@@ -117,13 +100,16 @@ def add_item_tab():
         st.error("❌ An item with this English name already exists!")
         return
 
-    # Prepare picture bytes
-    pic_bytes = item_picture.getvalue() if item_picture else None
+    # Prepare picture bytes (wrap in Binary so MySQL treats it as BLOB)
+    if item_picture:
+        pic_bytes = mysql.connector.Binary(item_picture.getvalue())
+    else:
+        pic_bytes = None
 
     # Build item dict
     item_data = {
         "itemnameenglish": item_name_en.strip(),
-        "itemnamekurdish": item_name_ku.strip(),
+        "itemnamekurdish": item_name_ku.strip() or None,
         "classcat":        class_cat,
         "departmentcat":   department_cat or None,
         "sectioncat":      section_cat or None,
@@ -135,9 +121,9 @@ def add_item_tab():
         "origincountry":   origin_country or None,
         "manufacturer":    manufacturer or None,
         "brand":           brand or None,
-        "barcode":        barcode.strip() or None,
-        "packetbarcode":  packet_barcode.strip() or None,
-        "cartonbarcode":  carton_barcode.strip() or None,
+        "barcode":         barcode.strip() or None,
+        "packetbarcode":   packet_barcode.strip() or None,
+        "cartonbarcode":   carton_barcode.strip() or None,
         "unittype":        unit_type or None,
         "packaging":       packaging or None,
         "itempicture":     pic_bytes,
