@@ -1,10 +1,10 @@
-# home.py – one big inventory table, inline filters, no charts
+# home.py – consolidated inventory table, 2 inline filters, no charts, no supplier join
 import base64
 import pandas as pd
 import streamlit as st
 from db_handler import DatabaseManager
 
-# ───────────────────────── CSS helper ──────────────────────────
+# ───────────────────────── CSS helper ─────────────────────────
 def _inject_css() -> None:
     if st.session_state.get("_home_css_done"):
         return
@@ -33,12 +33,12 @@ def _img_uri(blob: bytes | None) -> str | None:
     return f"data:image/jpeg;base64,{base64.b64encode(blob).decode()}" if blob else None
 
 
-# ───────────────────── data loader (cached) ────────────────────
+# ─────────────────── data loader (cached) ────────────────────
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory() -> pd.DataFrame:
     """
-    Pull inventory and item data.
-    Uses inv.DateReceived (rename here if your column differs).
+    Pull inventory joined to item only.
+    Adjust `inv.datereceived` below if your column name differs.
     """
     query = """
         SELECT  i.ItemID,
@@ -55,18 +55,17 @@ def _load_inventory() -> pd.DataFrame:
         FROM  `inventory` AS inv
         JOIN  `item`      AS i  ON inv.ItemID = i.ItemID
     """
-    db = DatabaseManager()
-    df = db.fetch_data(query)
+    df = DatabaseManager().fetch_data(query)
     if df.empty:
         return df
 
     df.columns = df.columns.str.lower()
     df["itempicture"] = df["itempicture"].apply(_img_uri)
-    df["quantity"]    = pd.to_numeric(df["quantity"], errors="coerce").astype("Int64")
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").astype("Int64")
     return df
 
 
-# ─────────────────────────── main page ─────────────────────────
+# ────────────────────────── main page ─────────────────────────
 def home() -> None:
     _inject_css()
     st.title("🏠 Inventory Home")
@@ -95,7 +94,7 @@ def home() -> None:
     if f_nm:
         fdf = fdf[fdf["itemnameenglish"].str.contains(f_nm, case=False, na=False)]
 
-    # ordered table (Supplier column removed for now)
+    # column order
     col_order = [
         "itemid", "itempicture", "barcode", "itemnameenglish",
         "quantity", "receivedate"
