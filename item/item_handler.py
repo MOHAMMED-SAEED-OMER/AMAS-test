@@ -1,14 +1,11 @@
-# item/item_handler.py  – MySQL backend (prepared-cursor edition)
+# item/item_handler.py  – prepared cursors + reliable last-insert id
 import pandas as pd
 import streamlit as st
 from db_handler import DatabaseManager
 
 
 class ItemHandler(DatabaseManager):
-    """
-    All item-related DB helpers.
-    Uses prepared statements whenever binary data (itempicture) might be sent.
-    """
+    """All item-related DB helpers (MySQL)."""
 
     # ───────────────────────────── Items ─────────────────────────────
     def get_items(self) -> pd.DataFrame:
@@ -27,7 +24,7 @@ class ItemHandler(DatabaseManager):
             )
         return df
 
-    # ───────────────────────── Suppliers ─────────────────────────────
+    # ───────────────────── Suppliers (simple selects) ─────────────────────
     def get_suppliers(self) -> pd.DataFrame:
         return self.fetch_data(
             "SELECT supplierid, suppliername FROM `supplier` ORDER BY suppliername"
@@ -42,8 +39,8 @@ class ItemHandler(DatabaseManager):
     # ────────────────────────── INSERT ──────────────────────────────
     def add_item(self, item_data: dict, supplier_ids: list[int]) -> int | None:
         """
-        Create a new item and link it to supplier IDs. Returns the new itemid.
-        Uses a prepared cursor so BLOB data bypasses UTF-8 validation.
+        Insert a new item (prepared statement for safe BLOB handling),
+        then link suppliers. Returns new itemid or None.
         """
         cols = ", ".join(item_data.keys())
         ph   = ", ".join(["%s"] * len(item_data))
@@ -53,9 +50,16 @@ class ItemHandler(DatabaseManager):
         )
 
         self._ensure_live_conn()
+
+        # 1️⃣  prepared INSERT so binary data isn't checked for UTF-8
         with self.conn.cursor(prepared=True) as cur:
             cur.execute(sql, list(item_data.values()))
-            item_id = cur.lastrowid
+
+        # 2️⃣  fetch the new AUTO_INCREMENT id reliably
+        with self.conn.cursor() as cur2:               # regular cursor ok here
+            cur2.execute("SELECT LAST_INSERT_ID()")
+            item_id = cur2.fetchone()[0]
+
         self.conn.commit()
 
         if item_id:
@@ -67,7 +71,6 @@ class ItemHandler(DatabaseManager):
     def link_item_suppliers(self, item_id: int, supplier_ids: list[int]) -> None:
         if not supplier_ids:
             return
-
         values = ", ".join(["(%s, %s)"] * len(supplier_ids))
         params = []
         for sid in supplier_ids:
@@ -87,14 +90,12 @@ class ItemHandler(DatabaseManager):
         if not updated_data:
             st.warning("⚠️ No changes made.")
             return
-
         set_clause = ", ".join(f"{k} = %s" for k in updated_data)
         sql = (
             f"UPDATE `item` SET {set_clause}, updatedat = NOW() WHERE itemid = %s"
         )
         params = list(updated_data.values()) + [item_id]
 
-        # prepared cursor (not strictly needed here but consistent)
         self._ensure_live_conn()
         with self.conn.cursor(prepared=True) as cur:
             cur.execute(sql, params)
@@ -109,7 +110,6 @@ class ItemHandler(DatabaseManager):
             raise ValueError(
                 f"Cannot delete item {itemid}: still referenced by {', '.join(conflicts)}"
             )
-
         self.execute_command(
             "DELETE FROM `itemsupplier` WHERE itemid = %s", (itemid,)
         )
