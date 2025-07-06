@@ -5,7 +5,7 @@ import streamlit as st
 from db_handler import DatabaseManager
 
 
-# ───────────────────────── CSS & UI helpers ─────────────────────────
+# ───────────────────── CSS & UI helpers ─────────────────────
 def _inject_css() -> None:
     if st.session_state.get("_home_css_done"):
         return
@@ -18,7 +18,6 @@ def _inject_css() -> None:
             font-family:'Roboto',sans-serif;
             background:#f8f9fb;
         }
-        /* KPI cards */
         .kpi-card{
             background:#fff;border-radius:10px;
             box-shadow:0 3px 8px rgba(0,0,0,0.06);
@@ -35,7 +34,10 @@ def _inject_css() -> None:
 
 
 def _img_uri(blob: bytes | None) -> str | None:
-    return f"data:image/jpeg;base64,{base64.b64encode(blob).decode()}" if blob else None
+    return (
+        f"data:image/jpeg;base64,{base64.b64encode(blob).decode()}"
+        if blob else None
+    )
 
 
 def _kpi_cards(kpis: list[tuple[str, int | float, str]]) -> None:
@@ -55,7 +57,7 @@ def _kpi_cards(kpis: list[tuple[str, int | float, str]]) -> None:
         )
 
 
-# ─────────────────────────── data loader ───────────────────────────
+# ───────────────────── data loader (cached) ─────────────────────
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory() -> pd.DataFrame:
     query = """
@@ -79,11 +81,11 @@ def _load_inventory() -> pd.DataFrame:
 
     df.columns = df.columns.str.lower()
     df["itempicture"] = df["itempicture"].apply(_img_uri)
-    df["quantity"]    = pd.to_numeric(df["quantity"], errors="coerce").astype("Int64")
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").astype("Int64")
     return df
 
 
-# ──────────────────────────── main page ────────────────────────────
+# ─────────────────────────── main page ───────────────────────────
 def home() -> None:
     _inject_css()
     st.title("🏠 Inventory Home")
@@ -93,7 +95,7 @@ def home() -> None:
         st.info("No inventory data available.")
         return
 
-    # ── KPI totals ──────────────────────────────────────────────────
+    # ── KPI totals ────────────────────────────────────────────────
     total_items   = df["itemid"].nunique()
     total_qty     = int(df["quantity"].sum())
     today         = pd.Timestamp.today().normalize()
@@ -131,28 +133,32 @@ def home() -> None:
     col_order = [
         "itemid", "itempicture", "barcode", "itemnameenglish",
         "quantity", "receivedate"
-    ] + [c for c in fdf.columns if c not in (
-        "itemid","itempicture","barcode","itemnameenglish",
-        "quantity","receivedate")]
+    ] + [
+        c for c in fdf.columns
+        if c not in ("itemid","itempicture","barcode","itemnameenglish",
+                     "quantity","receivedate")
+    ]
 
     st.data_editor(
         fdf[col_order],
         hide_index=True,
         use_container_width=True,
         column_config={
-            "itempicture":    st.column_config.ImageColumn("Pic", width="small"),
-            "itemid":         st.column_config.NumberColumn("ID", width="small"),
-            "barcode":        st.column_config.TextColumn("Barcode"),
-            "itemnameenglish":st.column_config.TextColumn("English Name", width="medium"),
-            "quantity":       st.column_config.NumberColumn("Qty", width="small"),
-            "receivedate":    st.column_config.DatetimeColumn("Receive Date"),
+            "itempicture":     st.column_config.ImageColumn("Pic", width="small"),
+            "itemid":          st.column_config.NumberColumn("ID", width="small"),
+            "barcode":         st.column_config.TextColumn("Barcode"),
+            "itemnameenglish": st.column_config.TextColumn("English Name", width="medium"),
+            "quantity":        st.column_config.NumberColumn("Qty", width="small"),
+            "receivedate":     st.column_config.DatetimeColumn("Receive Date"),
         },
         num_rows="dynamic",
     )
 
+    # ── CSV download (without the image column) ───────────────────
+    export_df = fdf.drop(columns=["itempicture"])
     st.download_button(
         "Download CSV",
-        fdf[col_order].to_csv(index=False).encode(),
+        export_df.to_csv(index=False).encode(),
         "inventory_full.csv",
         "text/csv",
     )
