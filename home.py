@@ -1,10 +1,10 @@
-# home.py  – one big inventory table, inline filters, no charts
+# home.py – one big inventory table, inline filters, no charts
 import base64
 import pandas as pd
 import streamlit as st
 from db_handler import DatabaseManager
 
-# ──────────────────────────── CSS helper ────────────────────────────
+# ───────────────────────── CSS helper ──────────────────────────
 def _inject_css() -> None:
     if st.session_state.get("_home_css_done"):
         return
@@ -33,12 +33,12 @@ def _img_uri(blob: bytes | None) -> str | None:
     return f"data:image/jpeg;base64,{base64.b64encode(blob).decode()}" if blob else None
 
 
-# ─────────────────────── data loader (cached) ───────────────────────
+# ───────────────────── data loader (cached) ────────────────────
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory() -> pd.DataFrame:
     """
-    Pull inventory joined directly to item and supplier.
-    Adjust column names to match your schema: inventory.DateReceived, inventory.SupplierID.
+    Pull inventory and item data.
+    Uses inv.DateReceived (rename here if your column differs).
     """
     query = """
         SELECT  i.ItemID,
@@ -46,16 +46,14 @@ def _load_inventory() -> pd.DataFrame:
                 i.ItemPicture,
                 i.ItemNameEnglish,
                 inv.Quantity,
-                inv.DateReceived         AS ReceiveDate,   -- make sure this exists
-                s.SupplierName,
+                inv.DateReceived  AS ReceiveDate,
                 inv.ExpirationDate,
                 inv.StorageLocation,
                 i.ClassCat, i.DepartmentCat, i.SectionCat,
                 i.FamilyCat, i.SubFamilyCat,
                 i.Threshold, i.AverageRequired
-        FROM      `inventory` AS inv
-        JOIN      `item`      AS i  ON inv.ItemID     = i.ItemID
-        LEFT JOIN `supplier`  AS s  ON inv.SupplierID = s.SupplierID
+        FROM  `inventory` AS inv
+        JOIN  `item`      AS i  ON inv.ItemID = i.ItemID
     """
     db = DatabaseManager()
     df = db.fetch_data(query)
@@ -68,7 +66,7 @@ def _load_inventory() -> pd.DataFrame:
     return df
 
 
-# ─────────────────────────── main page ──────────────────────────────
+# ─────────────────────────── main page ─────────────────────────
 def home() -> None:
     _inject_css()
     st.title("🏠 Inventory Home")
@@ -84,11 +82,11 @@ def home() -> None:
         unsafe_allow_html=True,
     )
 
-    # ── inline filters ───────────────────────────────────────────────
-    col_bc, col_name = st.columns(2)
+    # inline filters
+    col_bc, col_nm = st.columns(2)
     with col_bc:
         f_bc = st.text_input("Filter by Barcode").strip()
-    with col_name:
+    with col_nm:
         f_nm = st.text_input("Filter by Item Name").strip()
 
     fdf = df.copy()
@@ -97,13 +95,13 @@ def home() -> None:
     if f_nm:
         fdf = fdf[fdf["itemnameenglish"].str.contains(f_nm, case=False, na=False)]
 
-    # ── ordered table ────────────────────────────────────────────────
+    # ordered table (Supplier column removed for now)
     col_order = [
         "itemid", "itempicture", "barcode", "itemnameenglish",
-        "quantity", "receivedate", "suppliername"
+        "quantity", "receivedate"
     ] + [c for c in fdf.columns if c not in (
         "itemid","itempicture","barcode","itemnameenglish",
-        "quantity","receivedate","suppliername")]
+        "quantity","receivedate")]
 
     st.data_editor(
         fdf[col_order],
@@ -116,7 +114,6 @@ def home() -> None:
             "itemnameenglish":st.column_config.TextColumn("English Name", width="medium"),
             "quantity":       st.column_config.NumberColumn("Qty", width="small"),
             "receivedate":    st.column_config.DatetimeColumn("Receive Date"),
-            "suppliername":   st.column_config.TextColumn("Supplier"),
         },
         num_rows="dynamic",
     )
