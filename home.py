@@ -1,14 +1,10 @@
-# home.py  – clean dashboard, one big inventory table, no charts
+# home.py  – one big inventory table, inline filters, no charts
 import base64
-from typing import Iterable
-
 import pandas as pd
 import streamlit as st
-
 from db_handler import DatabaseManager
 
-
-# ──────────────────────────── CSS / UI helpers ─────────────────────────────
+# ───────────────────────────  CSS / helper funcs ────────────────────────────
 def _inject_css() -> None:
     if st.session_state.get("_home_css_done"):
         return
@@ -33,15 +29,18 @@ def _inject_css() -> None:
     st.session_state["_home_css_done"] = True
 
 
-def _image_uri(data: bytes | None) -> str | None:
-    return f"data:image/jpeg;base64,{base64.b64encode(data).decode()}" if data else None
+def _image_uri(blob: bytes | None) -> str | None:
+    return f"data:image/jpeg;base64,{base64.b64encode(blob).decode()}" if blob else None
 
 
-# ──────────────────────── Data retrieval & caching ─────────────────────────
+# ─────────────────────────────  Data loader  ────────────────────────────────
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory() -> pd.DataFrame:
     """
-    Pull inventory joined to item & supplier. Adjust column names if yours differ.
+    Pull inventory, item, PO, and supplier data.
+    • Uses inv.datereceived  (your DESCRIBE shows this column).
+    • Joins to purchase orders (po) → supplier for a readable name.
+      Change table/column names if yours differ.
     """
     query = """
         SELECT  i.ItemID,
@@ -49,16 +48,17 @@ def _load_inventory() -> pd.DataFrame:
                 i.ItemPicture,
                 i.ItemNameEnglish,
                 inv.Quantity,
-                inv.ReceiveDate,                 -- make sure this column exists
-                s.SupplierName,                  -- via JOIN below
+                inv.DateReceived        AS ReceiveDate,
+                s.SupplierName,
                 inv.ExpirationDate,
                 inv.StorageLocation,
                 i.ClassCat, i.DepartmentCat, i.SectionCat,
                 i.FamilyCat, i.SubFamilyCat,
                 i.Threshold, i.AverageRequired
-        FROM        `inventory` AS inv
-        JOIN        `item`      AS i  ON inv.ItemID = i.ItemID
-        LEFT JOIN   `supplier`  AS s  ON inv.SupplierID = s.SupplierID
+        FROM        `inventory`      AS inv
+        JOIN        `item`           AS i   ON inv.ItemID = i.ItemID
+        LEFT JOIN   `purchaseorder`  AS po  ON inv.POID   = po.POID          -- ↙ adjust if your PO table is named differently
+        LEFT JOIN   `supplier`       AS s   ON po.SupplierID = s.SupplierID
     """
     db = DatabaseManager()
     df = db.fetch_data(query)
@@ -66,13 +66,17 @@ def _load_inventory() -> pd.DataFrame:
     if df.empty:
         return df
 
+    # normalise column names
     df.columns = df.columns.str.lower()
+
+    # convert / format
     df["itempicture"] = df["itempicture"].apply(_image_uri)
     df["quantity"]    = pd.to_numeric(df["quantity"], errors="coerce").astype("Int64")
+
     return df
 
 
-# ────────────────────────────────  Main page  ──────────────────────────────
+# ─────────────────────────────-  Main page  ────────────────────────────────
 def home() -> None:
     _inject_css()
     st.title("🏠 Inventory Home")
@@ -82,7 +86,6 @@ def home() -> None:
         st.info("No inventory data available.")
         return
 
-    # ── Hero banner ─────────────────────────────────────────────────────────
     st.markdown(
         "<div class='hero'>"
         "<h2>Inventory Portal</h2>"
@@ -91,47 +94,50 @@ def home() -> None:
         unsafe_allow_html=True,
     )
 
-    # ── Inline filters ──────────────────────────────────────────────────────
+    # ── inline filters ──────────────────────────────────────────────────────
     col_barcode, col_name = st.columns(2)
     with col_barcode:
         f_barcode = st.text_input("Filter by Barcode").strip()
     with col_name:
         f_name = st.text_input("Filter by Item Name").strip()
 
-    filtered = df.copy()
+    fdf = df.copy()
     if f_barcode:
-        filtered = filtered[filtered["barcode"].str.contains(f_barcode, case=False, na=False)]
+        fdf = fdf[fdf["barcode"].str.contains(f_barcode, case=False, na=False)]
     if f_name:
-        filtered = filtered[filtered["itemnameenglish"].str.contains(f_name, case=False, na=False)]
+        fdf = fdf[fdf["itemnameenglish"].str.contains(f_name, case=False, na=False)]
 
-    # ── Re-order & display table ────────────────────────────────────────────
+    # ── column order & table ───────────────────────────────────────────────
     col_order = [
-        "itemid", "itempicture", "barcode", "itemnameenglish",
-        "quantity", "receivedate", "suppliername"
+        "itemid",
+        "itempicture",
+        "barcode",
+        "itemnameenglish",
+        "quantity",
+        "receivedate",
+        "suppliername",
     ]
-    # append the rest of the columns in original order
-    other_cols = [c for c in filtered.columns if c not in col_order]
-    final_df = filtered[col_order + other_cols]
+    col_order += [c for c in fdf.columns if c not in col_order]  # append the rest
 
     st.data_editor(
-        final_df,
+        fdf[col_order],
         hide_index=True,
         use_container_width=True,
         column_config={
-            "itempicture": st.column_config.ImageColumn("Pic", width="small"),
-            "itemid":      st.column_config.NumberColumn("ID", width="small"),
-            "barcode":     st.column_config.TextColumn("Barcode"),
+            "itempicture":   st.column_config.ImageColumn("Pic", width="small"),
+            "itemid":        st.column_config.NumberColumn("ID", width="small"),
+            "barcode":       st.column_config.TextColumn("Barcode"),
             "itemnameenglish": st.column_config.TextColumn("English Name", width="medium"),
-            "quantity":    st.column_config.NumberColumn("Qty", width="small"),
-            "receivedate": st.column_config.DatetimeColumn("Receive Date"),
-            "suppliername": st.column_config.TextColumn("Supplier"),
+            "quantity":      st.column_config.NumberColumn("Qty", width="small"),
+            "receivedate":   st.column_config.DatetimeColumn("Receive Date"),
+            "suppliername":  st.column_config.TextColumn("Supplier"),
         },
         num_rows="dynamic",
     )
 
     st.download_button(
-        "Download as CSV",
-        data=final_df.to_csv(index=False),
-        file_name="inventory_full.csv",
-        mime="text/csv",
+        "Download CSV",
+        fdf[col_order].to_csv(index=False).encode(),
+        "inventory_full.csv",
+        "text/csv",
     )
