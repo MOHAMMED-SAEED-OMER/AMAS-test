@@ -1,4 +1,4 @@
-# home.py – consolidated table, KPI totals, no charts
+# home.py – consolidated table, KPI totals, no charts, no hero banner
 import base64
 import pandas as pd
 import streamlit as st
@@ -17,11 +17,6 @@ def _inject_css() -> None:
         html,body,[class*="css"],.stApp{
             font-family:'Roboto',sans-serif;
             background:#f8f9fb;
-        }
-        .hero{
-            background:linear-gradient(90deg,#5c8df6,#a66ef6);
-            color:#fff;border-radius:8px;text-align:center;
-            padding:2rem 1rem;margin-bottom:1.5rem;
         }
         /* KPI cards */
         .kpi-card{
@@ -63,9 +58,6 @@ def _kpi_cards(kpis: list[tuple[str, int | float, str]]) -> None:
 # ─────────────────────────── data loader ───────────────────────────
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory() -> pd.DataFrame:
-    """
-    Pull inventory joined to item. Adjust column names if needed.
-    """
     query = """
         SELECT  i.ItemID,
                 i.Barcode,
@@ -101,38 +93,32 @@ def home() -> None:
         st.info("No inventory data available.")
         return
 
-    st.markdown(
-        "<div class='hero'><h2>Inventory Portal</h2>"
-        "<p>Search and manage all stock in one place.</p></div>",
-        unsafe_allow_html=True,
-    )
-
     # ── KPI totals ──────────────────────────────────────────────────
-    total_items = df["itemid"].nunique()
-    total_qty   = int(df["quantity"].sum())
+    total_items   = df["itemid"].nunique()
+    total_qty     = int(df["quantity"].sum())
+    today         = pd.Timestamp.today().normalize()
+    exp_dates     = pd.to_datetime(df["expirationdate"], errors="coerce")
 
-    today = pd.Timestamp.today().normalize()
-    exp_dates = pd.to_datetime(df["expirationdate"], errors="coerce")
-    near_exp_cnt = ((exp_dates >= today) &
-                    (exp_dates <= today + pd.Timedelta(days=30))).sum()
-    expired_cnt  = (exp_dates < today).sum()
+    near_exp_cnt  = ((exp_dates >= today) &
+                     (exp_dates <= today + pd.Timedelta(days=30))).sum()
+    expired_cnt   = (exp_dates < today).sum()
     low_stock_cnt = (df["quantity"] < df["threshold"]).sum()
 
     _kpi_cards(
         [
-            ("Items",          total_items,  "🗃️"),
-            ("Total Stock",    total_qty,    "📦"),
-            ("Near-Expiry",    near_exp_cnt, "⏳"),
-            ("Expired",        expired_cnt,  "❌"),
-            ("Low Stock",      low_stock_cnt,"⚠️"),
+            ("Items",       total_items,  "🗃️"),
+            ("Total Stock", total_qty,    "📦"),
+            ("Near-Expiry", near_exp_cnt, "⏳"),
+            ("Expired",     expired_cnt,  "❌"),
+            ("Low Stock",   low_stock_cnt,"⚠️"),
         ]
     )
 
     # ── inline filters ─────────────────────────────────────────────
-    col_bc, col_nm = st.columns(2)
-    with col_bc:
+    c_bc, c_nm = st.columns(2)
+    with c_bc:
         f_bc = st.text_input("Filter by Barcode").strip()
-    with col_nm:
+    with c_nm:
         f_nm = st.text_input("Filter by Item Name").strip()
 
     fdf = df.copy()
