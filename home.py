@@ -57,7 +57,7 @@ def _kpi_cards(kpis: list[tuple[str, int | float, str]]) -> None:
 
 
 # ─────────────────────── data loaders ────────────────────────
-@st.cache_data(show_spinner="Loading inventory …")
+@st.cache_data(ttl=30, show_spinner="Loading inventory …")        # ← refresh every 30 s
 def _load_inventory_view() -> pd.DataFrame:
     """Joined view for the main table."""
     query = """
@@ -85,7 +85,7 @@ def _load_inventory_view() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)                       # ← refresh every 30 s
 def _load_inventory_raw() -> pd.DataFrame:
     """Exact columns from inventory table."""
     return DatabaseManager().fetch_data("SELECT * FROM `inventory`")
@@ -95,10 +95,8 @@ def _load_inventory_raw() -> pd.DataFrame:
 def _excel_from_df(df: pd.DataFrame, sheet: str) -> BytesIO:
     """Return BytesIO of Excel file (drops image columns, casts ids to str)."""
     cleaned = df.copy()
-    # drop any image / picture columns
     pic_cols = [c for c in cleaned.columns if "picture" in c or "image" in c]
     cleaned = cleaned.drop(columns=pic_cols)
-    # cast id / barcode to str if present
     for col in ("itemid", "barcode"):
         if col in cleaned.columns:
             cleaned[col] = cleaned[col].astype(str)
