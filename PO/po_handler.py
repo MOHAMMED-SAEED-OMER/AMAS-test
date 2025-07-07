@@ -8,7 +8,7 @@ from typing import Any, List, Dict
 import pandas as pd
 import mysql.connector
 from mysql.connector import Error as MySQLError
-from mysql.connector.cursor_cext import CMySQLCursorDict
+from mysql.connector.cursor import MySQLCursorDict  # pure-Python implementation
 
 from db_handler import DatabaseManager
 
