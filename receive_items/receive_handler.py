@@ -37,19 +37,18 @@ class ReceiveHandler(DatabaseManager):
         )
 
     # ─────────────────── inventory & qty updates ──────────────────────
-    def _next_batch_id(self) -> int:
-        """
-        Return MAX(batchid) + 1 (starts at 1 if the table is empty).
-        """
-        df = self.fetch_data("SELECT COALESCE(MAX(batchid), 0) + 1 AS next FROM inventory")
+def _next_batch_id(self) -> int:
+        """Return MAX(batchid)+1 (starts at 1 when table is empty)."""
+        df = self.fetch_data("SELECT COALESCE(MAX(batchid),0)+1 AS next FROM inventory")
         return int(df.iat[0, 0])
 
     def add_items_to_inventory(self, items: list[dict]) -> None:
         """
         Insert / upsert inventory rows for one Receive action.
+
         • One new batchid is generated and reused for every row.
-        • datereceived and lastupdated are set to NOW().
-        • Duplicate-key rows get quantity += and lastupdated refreshed.
+        • datereceived and lastupdated are set to   NOW()  on insert.
+        • Duplicate-key rows add quantity and refresh batchid/lastupdated.
         """
         if not items:
             return
@@ -58,14 +57,14 @@ class ReceiveHandler(DatabaseManager):
 
         rows = [
             (
-                batch_id,                       # NEW
-                int(itm["item_id"]),
-                int(itm["quantity"]),
-                itm["expiration_date"],
-                itm["storage_location"],
-                float(itm.get("cost_per_unit", 0.0)),
-                itm.get("poid"),
-                itm.get("costid"),
+                batch_id,                       # 1
+                int(itm["item_id"]),            # 2
+                int(itm["quantity"]),           # 3
+                itm["expiration_date"],         # 4
+                itm["storage_location"],        # 5
+                float(itm.get("cost_per_unit", 0.0)),  # 6
+                itm.get("poid"),                # 7
+                itm.get("costid"),              # 8
             )
             for itm in items
         ]
@@ -77,16 +76,18 @@ class ReceiveHandler(DatabaseManager):
                  poid, costid,
                  datereceived, lastupdated)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            AS new                                        -- ✨ alias for VALUES list
             ON DUPLICATE KEY UPDATE
-                quantity    = quantity + VALUES(quantity),
+                quantity    = quantity + new.quantity,
                 lastupdated = NOW(),
-                batchid     = VALUES(batchid)   -- keep latest batch reference
+                batchid     = new.batchid                 -- keep latest batch ref
         """
 
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
             cur.executemany(sql, rows)
         self.conn.commit()
+
 
     def update_received_quantity(self, poid: int, item_id: int, qty: int) -> None:
         self.execute_command(
