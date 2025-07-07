@@ -1,4 +1,4 @@
-# receive_items/receive_handler.py  – MySQL backend (fixed batchid, dates)
+# receive_items/receive_handler.py  – MySQL backend (batchid + VALUES-alias fix)
 from db_handler import DatabaseManager
 
 
@@ -37,8 +37,10 @@ class ReceiveHandler(DatabaseManager):
         )
 
     # ─────────────────── inventory & qty updates ──────────────────────
-def _next_batch_id(self) -> int:
-        """Return MAX(batchid)+1 (starts at 1 when table is empty)."""
+    def _next_batch_id(self) -> int:
+        """
+        Return MAX(batchid) + 1 (starts at 1 if table is empty).
+        """
         df = self.fetch_data("SELECT COALESCE(MAX(batchid),0)+1 AS next FROM inventory")
         return int(df.iat[0, 0])
 
@@ -46,9 +48,9 @@ def _next_batch_id(self) -> int:
         """
         Insert / upsert inventory rows for one Receive action.
 
-        • One new batchid is generated and reused for every row.
-        • datereceived and lastupdated are set to   NOW()  on insert.
-        • Duplicate-key rows add quantity and refresh batchid/lastupdated.
+        • Generates a single batchid and reuses it for every line in this batch.
+        • Inserts datereceived and lastupdated as NOW().
+        • On duplicate key: adds quantity, refreshes lastupdated and batchid.
         """
         if not items:
             return
@@ -76,18 +78,17 @@ def _next_batch_id(self) -> int:
                  poid, costid,
                  datereceived, lastupdated)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-            AS new                                        -- ✨ alias for VALUES list
+            AS new
             ON DUPLICATE KEY UPDATE
                 quantity    = quantity + new.quantity,
                 lastupdated = NOW(),
-                batchid     = new.batchid                 -- keep latest batch ref
+                batchid     = new.batchid
         """
 
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
             cur.executemany(sql, rows)
         self.conn.commit()
-
 
     def update_received_quantity(self, poid: int, item_id: int, qty: int) -> None:
         self.execute_command(
