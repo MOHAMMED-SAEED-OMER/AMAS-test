@@ -1,4 +1,4 @@
-# home.py – consolidated view + raw inventory table + KPI cards + Excel download
+# home.py – consolidated view, raw table, two Excel downloads
 import base64
 from io import BytesIO
 
@@ -7,7 +7,7 @@ import streamlit as st
 from db_handler import DatabaseManager
 
 
-# ───────────────────────── CSS & UI helpers ─────────────────────────
+# ───────────────────── CSS & UI helpers ──────────────────────
 def _inject_css() -> None:
     if st.session_state.get("_home_css_done"):
         return
@@ -20,7 +20,6 @@ def _inject_css() -> None:
             font-family:'Roboto',sans-serif;
             background:#f8f9fb;
         }
-        /* KPI cards */
         .kpi-card{
             background:#fff;border-radius:10px;
             box-shadow:0 3px 8px rgba(0,0,0,0.06);
@@ -57,10 +56,10 @@ def _kpi_cards(kpis: list[tuple[str, int | float, str]]) -> None:
         )
 
 
-# ─────────────────────────── data loaders ──────────────────────────
+# ─────────────────────── data loaders ────────────────────────
 @st.cache_data(show_spinner="Loading inventory …")
 def _load_inventory_view() -> pd.DataFrame:
-    """Joined view with item details & picture (for the main table)."""
+    """Joined view for the main table."""
     query = """
         SELECT  i.ItemID,
                 i.Barcode,
@@ -88,12 +87,30 @@ def _load_inventory_view() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def _load_inventory_raw() -> pd.DataFrame:
-    """Exact schema of `inventory` table (no joins, no column drops)."""
-    df = DatabaseManager().fetch_data("SELECT * FROM `inventory`")
-    return df  # keep column order as MySQL returns
+    """Exact columns from inventory table."""
+    return DatabaseManager().fetch_data("SELECT * FROM `inventory`")
 
 
-# ──────────────────────────── main page ────────────────────────────
+# ────────────────────────── helpers ──────────────────────────
+def _excel_from_df(df: pd.DataFrame, sheet: str) -> BytesIO:
+    """Return BytesIO of Excel file (drops image columns, casts ids to str)."""
+    cleaned = df.copy()
+    # drop any image / picture columns
+    pic_cols = [c for c in cleaned.columns if "picture" in c or "image" in c]
+    cleaned = cleaned.drop(columns=pic_cols)
+    # cast id / barcode to str if present
+    for col in ("itemid", "barcode"):
+        if col in cleaned.columns:
+            cleaned[col] = cleaned[col].astype(str)
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as wrt:
+        cleaned.to_excel(wrt, index=False, sheet_name=sheet)
+    buf.seek(0)
+    return buf
+
+
+# ─────────────────────────── main page ───────────────────────
 def home() -> None:
     _inject_css()
     st.title("🏠 Inventory Home")
@@ -103,28 +120,28 @@ def home() -> None:
         st.info("No inventory data available.")
         return
 
-    # ── KPI totals ─────────────────────────────────────────────────
-    total_items   = view_df["itemid"].nunique()
-    total_qty     = int(view_df["quantity"].sum())
-    today         = pd.Timestamp.today().normalize()
-    exp_dates     = pd.to_datetime(view_df["expirationdate"], errors="coerce")
+    # KPIs
+    total_items = view_df["itemid"].nunique()
+    total_qty   = int(view_df["quantity"].sum())
+    today       = pd.Timestamp.today().normalize()
+    exp_dates   = pd.to_datetime(view_df["expirationdate"], errors="coerce")
 
-    near_exp_cnt  = ((exp_dates >= today) &
-                     (exp_dates <= today + pd.Timedelta(days=30))).sum()
-    expired_cnt   = (exp_dates < today).sum()
-    low_stock_cnt = (view_df["quantity"] < view_df["threshold"]).sum()
+    near_exp   = ((exp_dates >= today) &
+                  (exp_dates <= today + pd.Timedelta(days=30))).sum()
+    expired    = (exp_dates < today).sum()
+    low_stock  = (view_df["quantity"] < view_df["threshold"]).sum()
 
     _kpi_cards(
         [
-            ("Items",       total_items,  "🗃️"),
-            ("Total Stock", total_qty,    "📦"),
-            ("Near-Expiry", near_exp_cnt, "⏳"),
-            ("Expired",     expired_cnt,  "❌"),
-            ("Low Stock",   low_stock_cnt,"⚠️"),
+            ("Items",       total_items, "🗃️"),
+            ("Total Stock", total_qty,   "📦"),
+            ("Near-Expiry", near_exp,    "⏳"),
+            ("Expired",     expired,     "❌"),
+            ("Low Stock",   low_stock,   "⚠️"),
         ]
     )
 
-    # ── inline filters ────────────────────────────────────────────
+    # Filters
     c_bc, c_nm = st.columns(2)
     with c_bc:
         f_bc = st.text_input("Filter by Barcode").strip()
@@ -137,7 +154,7 @@ def home() -> None:
     if f_nm:
         fdf = fdf[fdf["itemnameenglish"].str.contains(f_nm, case=False, na=False)]
 
-    # ── main (consolidated) table ─────────────────────────────────
+    # Main table
     col_order = [
         "itemid", "itempicture", "barcode", "itemnameenglish",
         "quantity", "receivedate"
@@ -157,37 +174,33 @@ def home() -> None:
             "quantity":       st.column_config.NumberColumn("Qty", width="small"),
             "receivedate":    st.column_config.DatetimeColumn("Receive Date"),
         },
-        num_rows="dynamic",
     )
 
-    # ── Excel download (image column removed) ─────────────────────
-    export_df = fdf.drop(columns=["itempicture"]).copy()
-    export_df["itemid"]  = export_df["itemid"].astype(str)
-    export_df["barcode"] = export_df["barcode"].astype(str)
-
-    xlsx_buf = BytesIO()
-    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
-        export_df.to_excel(writer, index=False, sheet_name="Inventory_View")
-    xlsx_buf.seek(0)
-
+    # Download main view
     st.download_button(
-        "Download Excel",
-        data=xlsx_buf,
-        file_name="inventory_full.xlsx",
+        "Download Inventory View (Excel)",
+        data=_excel_from_df(fdf, "Inventory_View"),
+        file_name="inventory_view.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # ── raw inventory table ───────────────────────────────────────
+    # Raw inventory table
     st.subheader("🗄️ Raw `inventory` Table")
     raw_df = _load_inventory_raw()
     if raw_df.empty:
         st.info("Inventory table is empty.")
         return
 
-    # display exactly as-is, no transformations
     st.data_editor(
         raw_df,
         hide_index=True,
         use_container_width=True,
         num_rows="dynamic",
+    )
+
+    st.download_button(
+        "Download Raw Inventory (Excel)",
+        data=_excel_from_df(raw_df, "Inventory_Raw"),
+        file_name="inventory_raw.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
