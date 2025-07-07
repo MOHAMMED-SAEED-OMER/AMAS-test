@@ -1,11 +1,10 @@
-# receive_items/receive_handler.py  – MySQL backend
+# receive_items/receive_handler.py  – MySQL backend (fixed batchid, dates)
 from db_handler import DatabaseManager
 
 
 class ReceiveHandler(DatabaseManager):
     """
-    DB helpers for the receiving workflow
-    (rewritten to avoid Postgres-only RETURNING / execute_values).
+    DB helpers for the receiving workflow (MySQL).
     """
 
     # ───────────────────── POs eligible to receive ─────────────────────
@@ -38,15 +37,28 @@ class ReceiveHandler(DatabaseManager):
         )
 
     # ─────────────────── inventory & qty updates ──────────────────────
+    def _next_batch_id(self) -> int:
+        """
+        Return MAX(batchid) + 1 (starts at 1 if the table is empty).
+        """
+        df = self.fetch_data("SELECT COALESCE(MAX(batchid), 0) + 1 AS next FROM inventory")
+        return int(df.iat[0, 0])
+
     def add_items_to_inventory(self, items: list[dict]) -> None:
         """
-        Batch-insert inventory rows with a single executemany().
+        Insert / upsert inventory rows for one Receive action.
+        • One new batchid is generated and reused for every row.
+        • datereceived and lastupdated are set to NOW().
+        • Duplicate-key rows get quantity += and lastupdated refreshed.
         """
         if not items:
             return
 
+        batch_id = self._next_batch_id()
+
         rows = [
             (
+                batch_id,                       # NEW
                 int(itm["item_id"]),
                 int(itm["quantity"]),
                 itm["expiration_date"],
@@ -60,10 +72,15 @@ class ReceiveHandler(DatabaseManager):
 
         sql = """
             INSERT INTO inventory
-                  (itemid, quantity, expirationdate,
-                   storagelocation, cost_per_unit,
-                   poid, costid)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (batchid, itemid, quantity, expirationdate,
+                 storagelocation, cost_per_unit,
+                 poid, costid,
+                 datereceived, lastupdated)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON DUPLICATE KEY UPDATE
+                quantity    = quantity + VALUES(quantity),
+                lastupdated = NOW(),
+                batchid     = VALUES(batchid)   -- keep latest batch reference
         """
 
         self._ensure_live_conn()
