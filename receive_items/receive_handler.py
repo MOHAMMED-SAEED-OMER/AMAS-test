@@ -69,8 +69,8 @@ class ReceiveHandler(DatabaseManager):
             for itm in items
         ]
 
-        sql = """
-            INSERT INTO inventory AS dest
+                sql = """
+            INSERT INTO inventory
                 (batchid, itemid, quantity, expirationdate,
                  storagelocation, cost_per_unit,
                  poid, costid,
@@ -78,10 +78,11 @@ class ReceiveHandler(DatabaseManager):
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
             AS new
             ON DUPLICATE KEY UPDATE
-                dest.quantity   = dest.quantity + new.quantity,
-                dest.lastupdated = NOW(),
-                dest.batchid    = new.batchid
+                inventory.quantity  = inventory.quantity + new.quantity,
+                inventory.lastupdated = NOW(),
+                inventory.batchid   = new.batchid
         """
+
 
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
