@@ -1,10 +1,10 @@
-# receive_items/receive_handler.py  – MySQL backend (batchid + dates + alias fix)
+# receive_items/receive_handler.py  – MySQL backend (batchid, CURDATE fix)
 from db_handler import DatabaseManager
 
 
 class ReceiveHandler(DatabaseManager):
     """
-    DB helpers for the receiving workflow (MySQL backend).
+    Database helpers for the receiving workflow (MySQL backend).
     """
 
     # ───────────────────── POs eligible to receive ─────────────────────
@@ -38,13 +38,17 @@ class ReceiveHandler(DatabaseManager):
 
     # ─────────────────── inventory & qty updates ──────────────────────
     def _next_batch_id(self) -> int:
-        """Return MAX(batchid) + 1 (starts at 1)."""
+        """Return MAX(batchid)+1 (1 if table empty)."""
         df = self.fetch_data("SELECT COALESCE(MAX(batchid),0)+1 AS next FROM inventory")
         return int(df.iat[0, 0])
 
     def add_items_to_inventory(self, items: list[dict]) -> None:
         """
         Insert / upsert inventory rows for one Receive action.
+
+        • All rows in this call share a new batchid.
+        • CURDATE() used for DATE column datereceived; NOW() for lastupdated.
+        • On duplicate key: add quantity, refresh lastupdated & batchid.
         """
         if not items:
             return
@@ -53,14 +57,14 @@ class ReceiveHandler(DatabaseManager):
 
         rows = [
             (
-                batch_id,
-                int(itm["item_id"]),
-                int(itm["quantity"]),
-                itm["expiration_date"],
-                itm["storage_location"],
-                float(itm.get("cost_per_unit", 0.0)),
-                itm.get("poid"),
-                itm.get("costid"),
+                batch_id,                           # 1
+                int(itm["item_id"]),                # 2
+                int(itm["quantity"]),               # 3
+                itm["expiration_date"],             # 4
+                itm["storage_location"],            # 5
+                float(itm.get("cost_per_unit", 0.0)),  # 6
+                itm.get("poid"),                    # 7
+                itm.get("costid"),                  # 8
             )
             for itm in items
         ]
@@ -71,7 +75,7 @@ class ReceiveHandler(DatabaseManager):
                  storagelocation, cost_per_unit,
                  poid, costid,
                  datereceived, lastupdated)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURDATE(), NOW())
             AS new
             ON DUPLICATE KEY UPDATE
                 inventory.quantity   = inventory.quantity + new.quantity,
@@ -104,6 +108,9 @@ class ReceiveHandler(DatabaseManager):
         qty: int,
         note: str = "",
     ) -> int:
+        """
+        Insert cost row and return new costid (AUTO_INCREMENT).
+        """
         sql = """
             INSERT INTO poitemcost
                 (poid, itemid, cost_per_unit, quantity, cost_date, note)
@@ -112,11 +119,14 @@ class ReceiveHandler(DatabaseManager):
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
             cur.execute(sql, (poid, item_id, cost_per_unit, qty, note))
-            cost_id = cur.lastrowid
+            cid = cur.lastrowid
         self.conn.commit()
-        return int(cost_id)
+        return int(cid)
 
     def refresh_po_total_cost(self, poid: int) -> None:
+        """
+        Update totalcost on a PO from its poitemcost rows.
+        """
         self.execute_command(
             """
             UPDATE purchaseorders
@@ -132,6 +142,9 @@ class ReceiveHandler(DatabaseManager):
 
     # ─────────────── synthetic / manual PO helpers ────────────────────
     def create_manual_po(self, supplier_id: int, note: str = "") -> int:
+        """
+        Create a synthetic PO header (status='Completed') and return POID.
+        """
         sql = """
             INSERT INTO purchaseorders
                   (supplierid, status, orderdate, expecteddelivery,
@@ -166,6 +179,9 @@ class ReceiveHandler(DatabaseManager):
 
     # ───────────── location queries & updates ────────────────────────
     def get_items_with_locations_and_expirations(self):
+        """
+        Current qty for each (Item, Location, ExpirationDate) trio.
+        """
         return self.fetch_data(
             """
             SELECT  i.itemid,
@@ -186,6 +202,9 @@ class ReceiveHandler(DatabaseManager):
         )
 
     def get_items_without_location(self):
+        """
+        Items whose inventory rows lack a storage location.
+        """
         return self.fetch_data(
             """
             SELECT  i.itemid,
@@ -200,6 +219,9 @@ class ReceiveHandler(DatabaseManager):
         )
 
     def update_item_location(self, item_id: int, new_loc: str) -> None:
+        """
+        Fill blank storagelocation for all rows of an item.
+        """
         self.execute_command(
             """
             UPDATE inventory
@@ -213,6 +235,9 @@ class ReceiveHandler(DatabaseManager):
     def update_item_location_specific(
         self, item_id: int, exp_date, new_loc: str
     ) -> None:
+        """
+        Change location for a specific expiry batch.
+        """
         self.execute_command(
             """
             UPDATE inventory
