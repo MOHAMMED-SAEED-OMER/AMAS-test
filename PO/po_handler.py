@@ -1,7 +1,7 @@
 # PO/po_handler.py  ── MySQL backend
-#   • Handles “zero” DATETIME values safely
-#   • Temporarily removes NO_ZERO_DATE from sql_mode when selecting
-#   • Otherwise identical behaviour to the working Postgres->MySQL version
+#   • Handles legacy zero-dates AND sql_mode warning 3135
+#   • Drops NO_ZERO_DATE, NO_ZERO_IN_DATE, ERROR_FOR_DIVISION_BY_ZERO
+#   • Otherwise identical to previous version
 
 from datetime import datetime
 import pandas as pd
@@ -10,15 +10,14 @@ from db_handler import DatabaseManager
 
 
 class POHandler(DatabaseManager):
-    """All database interactions for purchase-orders (MySQL)."""
+    """All DB interactions for purchase-orders (MySQL)."""
 
     # ───────────────────────── internal helpers ─────────────────────────
     @staticmethod
     def _dt_safe(col: str) -> str:
         """
-        Wrap a DATETIME / TIMESTAMP column so the legacy literal
-        '0000-00-00 00:00:00' is returned as NULL, preventing MySQL
-        error 1525 / 1292 when sql_mode contains NO_ZERO_DATE.
+        Return NULL instead of the legacy literal '0000-00-00 00:00:00'
+        so SELECTs never violate sql_mode.
         """
         return (
             f"CASE WHEN {col} = '0000-00-00 00:00:00' "
@@ -27,17 +26,25 @@ class POHandler(DatabaseManager):
 
     def _patch_sql_mode(self) -> None:
         """
-        Remove NO_ZERO_DATE from the current session’s sql_mode.
-        Safe to run repeatedly; does nothing if the flag isn’t present.
+        Strip the three deprecated flags that trigger MySQL 8 warning 3135
+        when strict mode is inactive.
         """
         self.execute_command(
-            "SET SESSION sql_mode = "
-            "(SELECT REPLACE(@@SESSION.sql_mode,'NO_ZERO_DATE',''))"
+            """
+            SET SESSION sql_mode = (
+               SELECT REPLACE(
+                          REPLACE(
+                              REPLACE(@@SESSION.sql_mode,
+                                      'NO_ZERO_DATE',''),
+                              'NO_ZERO_IN_DATE',''),
+                          'ERROR_FOR_DIVISION_BY_ZERO','')
+            )
+            """
         )
 
     # ───────────────────── active / pending POs ─────────────────────
     def get_all_purchase_orders(self) -> pd.DataFrame:
-        self._patch_sql_mode()                      # allow zero dates
+        self._patch_sql_mode()
         safe_orderdate = self._dt_safe("po.OrderDate")
 
         query = f"""
