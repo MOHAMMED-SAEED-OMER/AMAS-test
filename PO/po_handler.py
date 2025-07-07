@@ -1,30 +1,34 @@
-# PO/po_handler.py  – MySQL backend (all zero-datetime columns sanitized)
-import pandas as pd
+# PO/po_handler.py  – MySQL backend (zero-datetime safe everywhere)
 from datetime import datetime
+
+import pandas as pd
 
 from db_handler import DatabaseManager
 
 
 class POHandler(DatabaseManager):
-    """Handles all database interactions related to purchase orders (MySQL)."""
+    """All database interactions related to purchase orders (MySQL)."""
 
-    # ───────────────────────── fetch helpers ──────────────────────────
+    # ───────────────────────── internal helper ─────────────────────────
     def _dt_safe(self, col: str) -> str:
-        """Return CASE expression that turns 0000-timestamp in `col` to NULL."""
+        """
+        Return a CASE expression that converts the invalid
+        '0000-00-00 00:00:00' value found in some MySQL dumps
+        to NULL, preventing warning 1525 / 1292.
+        """
         return (
             f"CASE WHEN {col} = '0000-00-00 00:00:00' "
             f"THEN NULL ELSE {col} END"
         )
 
+    # ────────────────────── active / pending POs ──────────────────────
     def get_all_purchase_orders(self) -> pd.DataFrame:
-        """
-        Active & pending POs (everything that is *not* archived).
-        All DATETIME/DATE columns are zero-safe.
-        """
+        safe_orderdate = self._dt_safe("po.OrderDate")  # reuse in ORDER BY
+
         query = f"""
             SELECT  po.POID             AS poid,
                     po.SupplierID       AS supplierid,
-                    {self._dt_safe('po.OrderDate')}        AS orderdate,
+                    {safe_orderdate}        AS orderdate,
                     {self._dt_safe('po.ExpectedDelivery')} AS expecteddelivery,
                     po.Status           AS status,
                     {self._dt_safe('po.RespondedAt')}      AS respondedat,
@@ -52,18 +56,18 @@ class POHandler(DatabaseManager):
                                       'Declined',
                                       'Declined by AMAS',
                                       'Declined by Supplier')
-            ORDER BY po.OrderDate DESC
+            ORDER BY {safe_orderdate} DESC
         """
         return self.fetch_data(query)
 
+    # ───────────────────── archived (completed / declined) POs ─────────────────────
     def get_archived_purchase_orders(self) -> pd.DataFrame:
-        """
-        Completed *or* declined POs.
-        """
+        safe_orderdate = self._dt_safe("po.OrderDate")
+
         query = f"""
             SELECT  po.POID             AS poid,
                     po.SupplierID       AS supplierid,
-                    {self._dt_safe('po.OrderDate')}        AS orderdate,
+                    {safe_orderdate}        AS orderdate,
                     {self._dt_safe('po.ExpectedDelivery')} AS expecteddelivery,
                     po.Status           AS status,
                     {self._dt_safe('po.RespondedAt')}      AS respondedat,
@@ -87,11 +91,11 @@ class POHandler(DatabaseManager):
                                   'Declined',
                                   'Declined by AMAS',
                                   'Declined by Supplier')
-            ORDER BY po.OrderDate DESC
+            ORDER BY {safe_orderdate} DESC
         """
         return self.fetch_data(query)
 
-    # ───────────── other fetch helpers (unchanged) ──────────────
+    # ───────────────────────── other fetch helpers ─────────────────────────
     def get_items(self) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -113,7 +117,7 @@ class POHandler(DatabaseManager):
             "SELECT SupplierID AS supplierid, SupplierName AS suppliername FROM supplier"
         )
 
-    # ───────────────────────── write helpers ──────────────────────────
+    # ───────────────────────── write helpers ─────────────────────────
     def create_manual_po(
         self,
         supplier_id: int | None,
@@ -131,6 +135,7 @@ class POHandler(DatabaseManager):
         self._ensure_live_conn()
         with self.conn:
             with self.conn.cursor() as cur:
+                # purchaseorders header
                 cur.execute(
                     """
                     INSERT INTO purchaseorders
@@ -141,13 +146,14 @@ class POHandler(DatabaseManager):
                 )
                 po_id = cur.lastrowid
 
+                # purchaseorderitems lines
                 rows = [
                     (
                         po_id,
                         int(it["item_id"]),
                         int(it["quantity"]),
                         it.get("estimated_price"),
-                        0,
+                        0,  # ReceivedQuantity
                     )
                     for it in items
                 ]
@@ -184,26 +190,29 @@ class POHandler(DatabaseManager):
             (int(received_quantity), int(poid), int(item_id)),
         )
 
-    # ───────────── proposed-PO workflow (unchanged) ─────────────
+    # ───────────────────── proposed-PO workflow ─────────────────────
     def accept_proposed_po(self, proposed_po_id: int) -> int | None:
         proposed_po_id = int(proposed_po_id)
 
         po_info_df = self.fetch_data(
             "SELECT * FROM purchaseorders WHERE POID = %s", (proposed_po_id,)
         ).rename(columns=str.lower)
-
         if po_info_df.empty:
             return None
+        po_info = po_info_df.iloc[0]
 
-        po_info   = po_info_df.iloc[0]
-        items_df  = self.fetch_data(
+        items_df = self.fetch_data(
             "SELECT * FROM purchaseorderitems WHERE POID = %s", (proposed_po_id,)
         ).rename(columns=str.lower)
 
-        supplier_id = int(po_info["supplierid"]) if pd.notnull(po_info["supplierid"]) else None
+        supplier_id = (
+            int(po_info["supplierid"]) if pd.notnull(po_info["supplierid"]) else None
+        )
 
         sup_proposed_date = None
-        if pd.notnull(po_info.get("supproposeddeliver")) and po_info.get("supproposeddeliver") != '0000-00-00 00:00:00':
+        if pd.notnull(po_info.get("supproposeddeliver")) and po_info.get(
+            "supproposeddeliver"
+        ) != "0000-00-00 00:00:00":
             sup_proposed_date = pd.to_datetime(
                 po_info["supproposeddeliver"]
             ).to_pydatetime()
@@ -262,7 +271,9 @@ class POHandler(DatabaseManager):
             return None
         po_info = po_info_df.iloc[0]
 
-        supplier_id = int(po_info["supplierid"]) if pd.notnull(po_info["supplierid"]) else None
+        supplier_id = (
+            int(po_info["supplierid"]) if pd.notnull(po_info["supplierid"]) else None
+        )
 
         new_poid = self.create_manual_po(
             supplier_id=supplier_id,
