@@ -1,29 +1,45 @@
-# PO/po_handler.py
+# PO/po_handler.py  – MySQL backend (zero-datetime safe)
 import pandas as pd
 from datetime import datetime
 
 from db_handler import DatabaseManager
-import streamlit as st  # only used for logging; keep if desired
+import streamlit as st  # retained only for optional logging
 
 
 class POHandler(DatabaseManager):
     """Handles all database interactions related to purchase orders (MySQL)."""
 
-    # ───────────────────────────────────────────────────────────
-    # Fetch helpers
-    # ───────────────────────────────────────────────────────────
+    # ───────────────────────── fetch helpers ──────────────────────────
     def get_all_purchase_orders(self) -> pd.DataFrame:
-        """Active & pending POs (everything that is *not* archived)."""
+        """
+        Active & pending POs (everything that is *not* archived).
+        Zero DATETIME values are converted to NULL in-query.
+        """
         query = """
             SELECT  po.POID             AS poid,
                     po.SupplierID       AS supplierid,
                     po.OrderDate        AS orderdate,
                     po.ExpectedDelivery AS expecteddelivery,
                     po.Status           AS status,
-                    po.RespondedAt      AS respondedat,
-                    po.ActualDelivery   AS actualdelivery,
+
+                    /* 0000-00-00 00:00:00 → NULL */
+                    CASE
+                      WHEN po.RespondedAt = '0000-00-00 00:00:00'
+                      THEN NULL ELSE po.RespondedAt
+                    END                 AS respondedat,
+
+                    CASE
+                      WHEN po.ActualDelivery = '0000-00-00 00:00:00'
+                      THEN NULL ELSE po.ActualDelivery
+                    END                 AS actualdelivery,
+
                     po.CreatedBy        AS createdby,
-                    po.supproposeddeliver       AS sup_proposeddeliver,
+
+                    CASE
+                      WHEN po.SupProposedDeliver = '0000-00-00 00:00:00'
+                      THEN NULL ELSE po.SupProposedDeliver
+                    END                 AS sup_proposeddeliver,
+
                     po.SupplierNote     AS suppliernote,
                     po.OriginalPOID     AS originalpoid,
                     s.SupplierName      AS suppliername,
@@ -37,10 +53,10 @@ class POHandler(DatabaseManager):
 
                     i.ItemNameEnglish   AS itemnameenglish,
                     i.ItemPicture       AS itempicture
-            FROM    `purchaseorders`      po
-            JOIN    `supplier`            s   ON po.SupplierID = s.SupplierID
-            JOIN    `purchaseorderitems`  poi ON po.POID      = poi.POID
-            JOIN    `item`                i   ON poi.ItemID   = i.ItemID
+            FROM    purchaseorders      po
+            JOIN    supplier            s   ON po.SupplierID = s.SupplierID
+            JOIN    purchaseorderitems  poi ON po.POID      = poi.POID
+            JOIN    item                i   ON poi.ItemID   = i.ItemID
             WHERE   po.Status NOT IN ('Completed',
                                       'Declined',
                                       'Declined by AMAS',
@@ -50,15 +66,26 @@ class POHandler(DatabaseManager):
         return self.fetch_data(query)
 
     def get_archived_purchase_orders(self) -> pd.DataFrame:
-        """Completed *or* declined POs."""
+        """
+        Completed *or* declined POs.
+        """
         query = """
             SELECT  po.POID             AS poid,
                     po.SupplierID       AS supplierid,
                     po.OrderDate        AS orderdate,
                     po.ExpectedDelivery AS expecteddelivery,
                     po.Status           AS status,
-                    po.RespondedAt      AS respondedat,
-                    po.ActualDelivery   AS actualdelivery,
+
+                    CASE
+                      WHEN po.RespondedAt = '0000-00-00 00:00:00'
+                      THEN NULL ELSE po.RespondedAt
+                    END                 AS respondedat,
+
+                    CASE
+                      WHEN po.ActualDelivery = '0000-00-00 00:00:00'
+                      THEN NULL ELSE po.ActualDelivery
+                    END                 AS actualdelivery,
+
                     po.CreatedBy        AS createdby,
                     po.SupplierNote     AS suppliernote,
                     s.SupplierName      AS suppliername,
@@ -70,10 +97,10 @@ class POHandler(DatabaseManager):
 
                     i.ItemNameEnglish   AS itemnameenglish,
                     i.ItemPicture       AS itempicture
-            FROM    `purchaseorders`      po
-            JOIN    `supplier`            s   ON po.SupplierID = s.SupplierID
-            JOIN    `purchaseorderitems`  poi ON po.POID      = poi.POID
-            JOIN    `item`                i   ON poi.ItemID   = i.ItemID
+            FROM    purchaseorders      po
+            JOIN    supplier            s   ON po.SupplierID = s.SupplierID
+            JOIN    purchaseorderitems  poi ON po.POID      = poi.POID
+            JOIN    item                i   ON poi.ItemID   = i.ItemID
             WHERE   po.Status IN ('Completed',
                                   'Declined',
                                   'Declined by AMAS',
@@ -88,27 +115,24 @@ class POHandler(DatabaseManager):
                     ItemNameEnglish AS itemnameenglish,
                     ItemPicture     AS itempicture,
                     AverageRequired AS averagerequired
-            FROM    `item`
+            FROM    item
         """
         return self.fetch_data(query)
 
     def get_item_supplier_mapping(self) -> pd.DataFrame:
         query = """
-            SELECT  ItemID    AS itemid,
+            SELECT  ItemID     AS itemid,
                     SupplierID AS supplierid
-            FROM    `itemsupplier`
+            FROM    itemsupplier
         """
         return self.fetch_data(query)
 
     def get_suppliers(self) -> pd.DataFrame:
-        # Override parent to ensure lower-case table name
         return self.fetch_data(
-            "SELECT SupplierID AS supplierid, SupplierName AS suppliername FROM `supplier`"
+            "SELECT SupplierID AS supplierid, SupplierName AS suppliername FROM supplier"
         )
 
-    # ───────────────────────────────────────────────────────────
-    # Write helpers
-    # ───────────────────────────────────────────────────────────
+    # ───────────────────────── write helpers ──────────────────────────
     def create_manual_po(
         self,
         supplier_id: int | None,
@@ -130,31 +154,31 @@ class POHandler(DatabaseManager):
         self._ensure_live_conn()
         with self.conn:
             with self.conn.cursor() as cur:
-                # 1️⃣  Insert into purchaseorders
+                # 1️⃣  purchaseorders header
                 cur.execute(
                     """
-                    INSERT INTO `purchaseorders`
+                    INSERT INTO purchaseorders
                         (SupplierID, ExpectedDelivery, CreatedBy, OriginalPOID)
                     VALUES (%s, %s, %s, %s)
                     """,
                     (supplier_id, expected_delivery, created_by, original_poid),
                 )
-                po_id = cur.lastrowid  # MySQL way to grab AUTO_INCREMENT value
+                po_id = cur.lastrowid
 
-                # 2️⃣  Bulk-insert PO items
+                # 2️⃣  purchaseorderitems lines
                 rows = [
                     (
                         po_id,
                         int(it["item_id"]),
                         int(it["quantity"]),
                         it.get("estimated_price"),
-                        0,  # ReceivedQuantity starts at 0
+                        0,  # ReceivedQuantity
                     )
                     for it in items
                 ]
                 cur.executemany(
                     """
-                    INSERT INTO `purchaseorderitems`
+                    INSERT INTO purchaseorderitems
                         (POID, ItemID, OrderedQuantity, EstimatedPrice, ReceivedQuantity)
                     VALUES (%s, %s, %s, %s, %s)
                     """,
@@ -163,41 +187,42 @@ class POHandler(DatabaseManager):
         return po_id
 
     def update_po_status_to_received(self, poid: int) -> None:
-        query = """
-            UPDATE `purchaseorders`
-            SET    Status = 'Received',
+        self.execute_command(
+            """
+            UPDATE purchaseorders
+               SET Status = 'Received',
                    ActualDelivery = CURRENT_TIMESTAMP
-            WHERE  POID = %s
-        """
-        self.execute_command(query, (int(poid),))
+             WHERE POID = %s
+            """,
+            (int(poid),),
+        )
 
     def update_received_quantity(
         self, poid: int, item_id: int, received_quantity: int
     ) -> None:
-        query = """
-            UPDATE `purchaseorderitems`
-            SET    ReceivedQuantity = %s
-            WHERE  POID = %s AND ItemID = %s
-        """
-        self.execute_command(query, (int(received_quantity), int(poid), int(item_id)))
+        self.execute_command(
+            """
+            UPDATE purchaseorderitems
+               SET ReceivedQuantity = %s
+             WHERE POID = %s AND ItemID = %s
+            """,
+            (int(received_quantity), int(poid), int(item_id)),
+        )
 
-    # ───────────────────────────────────────────────────────────
-    # Proposed-PO workflow
-    # ───────────────────────────────────────────────────────────
+    # ───────────────────── proposed-PO workflow ──────────────────────
     def accept_proposed_po(self, proposed_po_id: int) -> int | None:
         proposed_po_id = int(proposed_po_id)
 
         po_info_df = self.fetch_data(
-            "SELECT * FROM `purchaseorders` WHERE POID = %s", (proposed_po_id,)
+            "SELECT * FROM purchaseorders WHERE POID = %s", (proposed_po_id,)
         ).rename(columns=str.lower)
 
         if po_info_df.empty:
             return None
 
-        po_info = po_info_df.iloc[0]
-
-        items_info = self.fetch_data(
-            "SELECT * FROM `purchaseorderitems` WHERE POID = %s", (proposed_po_id,)
+        po_info   = po_info_df.iloc[0]
+        items_df  = self.fetch_data(
+            "SELECT * FROM purchaseorderitems WHERE POID = %s", (proposed_po_id,)
         ).rename(columns=str.lower)
 
         supplier_id = int(po_info["supplierid"]) if pd.notnull(po_info["supplierid"]) else None
@@ -209,7 +234,7 @@ class POHandler(DatabaseManager):
             ).to_pydatetime()
 
         new_items = []
-        for _, row in items_info.iterrows():
+        for _, row in items_df.iterrows():
             qty = (
                 int(row["supproposedquantity"])
                 if pd.notnull(row.get("supproposedquantity"))
@@ -235,14 +260,14 @@ class POHandler(DatabaseManager):
         )
 
         self.execute_command(
-            "UPDATE `purchaseorders` SET Status = 'Accepted by AMAS' WHERE POID = %s",
+            "UPDATE purchaseorders SET Status = 'Accepted by AMAS' WHERE POID = %s",
             (proposed_po_id,),
         )
         return new_poid
 
     def decline_proposed_po(self, proposed_po_id: int) -> None:
         self.execute_command(
-            "UPDATE `purchaseorders` SET Status = 'Declined by AMAS' WHERE POID = %s",
+            "UPDATE purchaseorders SET Status = 'Declined by AMAS' WHERE POID = %s",
             (int(proposed_po_id),),
         )
 
@@ -256,15 +281,13 @@ class POHandler(DatabaseManager):
         proposed_po_id = int(proposed_po_id)
 
         po_info_df = self.fetch_data(
-            "SELECT * FROM `purchaseorders` WHERE POID = %s", (proposed_po_id,)
+            "SELECT * FROM purchaseorders WHERE POID = %s", (proposed_po_id,)
         )
         if po_info_df.empty:
             return None
         po_info = po_info_df.iloc[0]
 
-        supplier_id = (
-            int(po_info["supplierid"]) if pd.notnull(po_info["supplierid"]) else None
-        )
+        supplier_id = int(po_info["supplierid"]) if pd.notnull(po_info["supplierid"]) else None
 
         new_poid = self.create_manual_po(
             supplier_id=supplier_id,
@@ -275,7 +298,7 @@ class POHandler(DatabaseManager):
         )
 
         self.execute_command(
-            "UPDATE `purchaseorders` SET Status = 'Modified by AMAS' WHERE POID = %s",
+            "UPDATE purchaseorders SET Status = 'Modified by AMAS' WHERE POID = %s",
             (proposed_po_id,),
         )
         return new_poid
