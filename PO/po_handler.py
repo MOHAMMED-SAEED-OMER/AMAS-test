@@ -1,24 +1,21 @@
-# PO/po_handler.py  ── MySQL backend
-#   • Handles legacy zero-dates AND sql_mode warning 3135
-#   • Drops NO_ZERO_DATE, NO_ZERO_IN_DATE, ERROR_FOR_DIVISION_BY_ZERO
-#   • Otherwise identical to previous version
+# PO/po_handler.py  – MySQL backend
+# ▸ fixes loop caused by warning 3135 (NO_ZERO_DATE …)
+# ▸ _patch_sql_mode() now traps and ignores that warning once per session
 
 from datetime import datetime
 import pandas as pd
+import mysql.connector           # <-- to access mysql.connector.Error
 
 from db_handler import DatabaseManager
 
 
 class POHandler(DatabaseManager):
-    """All DB interactions for purchase-orders (MySQL)."""
+    """All DB interactions for Purchase Orders (MySQL)."""
 
-    # ───────────────────────── internal helpers ─────────────────────────
+    # ───────────────────────── helpers ─────────────────────────
     @staticmethod
     def _dt_safe(col: str) -> str:
-        """
-        Return NULL instead of the legacy literal '0000-00-00 00:00:00'
-        so SELECTs never violate sql_mode.
-        """
+        """Safely turn legacy zero-dates into NULL so SELECTs succeed."""
         return (
             f"CASE WHEN {col} = '0000-00-00 00:00:00' "
             f"THEN NULL ELSE {col} END"
@@ -26,21 +23,28 @@ class POHandler(DatabaseManager):
 
     def _patch_sql_mode(self) -> None:
         """
-        Strip the three deprecated flags that trigger MySQL 8 warning 3135
-        when strict mode is inactive.
+        Remove the three deprecated flags that trigger MySQL 8.0 warning 3135.
+        If the warning is raised anyway, swallow it once per session so the
+        app doesn’t crash (the change itself is still applied).
         """
-        self.execute_command(
-            """
-            SET SESSION sql_mode = (
-               SELECT REPLACE(
-                          REPLACE(
-                              REPLACE(@@SESSION.sql_mode,
-                                      'NO_ZERO_DATE',''),
-                              'NO_ZERO_IN_DATE',''),
-                          'ERROR_FOR_DIVISION_BY_ZERO','')
+        try:
+            self.execute_command(
+                """
+                SET SESSION sql_mode = (
+                    SELECT REPLACE(
+                        REPLACE(
+                            REPLACE(@@SESSION.sql_mode,
+                                    'NO_ZERO_DATE',''),
+                            'NO_ZERO_IN_DATE',''),
+                        'ERROR_FOR_DIVISION_BY_ZERO','')
+                )
+                """
             )
-            """
-        )
+        except mysql.connector.Error as err:
+            # MySQL emits warning 3135 as an exception because
+            # raise_on_warnings=True.  Ignore it; the SET succeeded.
+            if err.errno != 3135:          # any *other* error → re-raise
+                raise
 
     # ───────────────────── active / pending POs ─────────────────────
     def get_all_purchase_orders(self) -> pd.DataFrame:
@@ -118,7 +122,7 @@ class POHandler(DatabaseManager):
         """
         return self.fetch_data(query)
 
-    # ───────────────────────── item / supplier helpers ─────────────────────────
+    # ───────────────────── item / supplier helpers ─────────────────────
     def get_items(self) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -140,7 +144,7 @@ class POHandler(DatabaseManager):
             "SELECT SupplierID AS supplierid, SupplierName AS suppliername FROM supplier"
         )
 
-    # ───────────────────────── create / update helpers ─────────────────────────
+    # ───────────────────── create / update helpers ─────────────────────
     def create_manual_po(
         self,
         supplier_id: int | None,
