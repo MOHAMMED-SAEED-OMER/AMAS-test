@@ -3,6 +3,9 @@ import pandas as pd
 from db_handler import DatabaseManager
 
 
+INVALID_DT = "0000-00-00 00:00:00"      # helper constant
+
+
 class ReturnHandler(DatabaseManager):
     """
     DB helper for supplier returns (MySQL edition).
@@ -52,10 +55,10 @@ class ReturnHandler(DatabaseManager):
     # ---------- BULK insert of return items ------------------------
     def add_return_items_bulk(self, items: list[dict]) -> None:
         """
-        One round-trip INSERT for many lines – MySQL build-values version.
-        Required keys in each dict:
+        One round-trip INSERT for many lines.
+        Required keys per dict:
           returnid • itemid • quantity • itemprice
-        Optional:
+        Optional keys:
           reason • poid • expiredate
         """
         if not items:
@@ -88,7 +91,7 @@ class ReturnHandler(DatabaseManager):
             cur.executemany(sql, rows)
             self.conn.commit()
 
-    # ---- single-row helper (wraps the bulk method) ---------------
+    # ---- single-row helper (wraps bulk) --------------------------
     def add_return_item(
         self,
         *,
@@ -133,7 +136,7 @@ class ReturnHandler(DatabaseManager):
     def get_purchase_orders_by_supplier(self, supplier_id: int) -> pd.DataFrame:
         sql = """
         SELECT poid,
-               DATE(orderdate)         AS orderdate,     -- DATE() ≈  ::date
+               DATE(orderdate) AS orderdate,
                totalcost,
                status
           FROM purchaseorders
@@ -159,18 +162,18 @@ class ReturnHandler(DatabaseManager):
     # Reporting helpers
     # ───────────────────────────────────────────────────────────────
     def get_returns_summary(self) -> pd.DataFrame:
-        sql = """
+        sql = f"""
         SELECT r.returnid,
                r.supplierid,
                s.suppliername,
-               r.createddate,
+               NULLIF(r.createddate, '{INVALID_DT}')  AS createddate,
                r.returnstatus,
                r.creditnote,
                r.notes,
-               NULLIF(r.approvedate, '0000-00-00 00:00:00') AS approvedate
+               NULLIF(r.approvedate, '{INVALID_DT}')  AS approvedate
           FROM supplierreturns r
           JOIN supplier s ON s.supplierid = r.supplierid
-         ORDER BY r.createddate DESC
+         ORDER BY createddate DESC
         """
         return self.fetch_data(sql)
 
@@ -192,9 +195,10 @@ class ReturnHandler(DatabaseManager):
         return self.fetch_data(sql, (returnid,))
 
     def get_return_header(self, returnid: int) -> pd.DataFrame:
-        sql = """
+        sql = f"""
         SELECT *,
-               NULLIF(approvedate, '0000-00-00 00:00:00') AS approvedate
+               NULLIF(createddate, '{INVALID_DT}')  AS createddate,
+               NULLIF(approvedate, '{INVALID_DT}') AS approvedate
           FROM supplierreturns
          WHERE returnid = %s
         """
