@@ -42,10 +42,12 @@ class ReturnHandler(DatabaseManager):
 
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
-            cur.execute(sql, (supplier_id, creditnote, notes, createdby, total_return_cost))
+            cur.execute(
+                sql,
+                (supplier_id, creditnote, notes, createdby, total_return_cost),
+            )
             self.conn.commit()
             return int(cur.lastrowid)        # MySQL way to get the PK
-
 
     # ---------- BULK insert of return items ------------------------
     def add_return_items_bulk(self, items: list[dict]) -> None:
@@ -86,7 +88,6 @@ class ReturnHandler(DatabaseManager):
             cur.executemany(sql, rows)
             self.conn.commit()
 
-
     # ---- single-row helper (wraps the bulk method) ---------------
     def add_return_item(
         self,
@@ -100,15 +101,17 @@ class ReturnHandler(DatabaseManager):
         expiredate: str | None = None,
     ) -> None:
         self.add_return_items_bulk(
-            [{
-                "returnid":   returnid,
-                "itemid":     itemid,
-                "quantity":   quantity,
-                "itemprice":  itemprice,
-                "reason":     reason,
-                "poid":       poid,
-                "expiredate": expiredate,
-            }]
+            [
+                {
+                    "returnid":   returnid,
+                    "itemid":     itemid,
+                    "quantity":   quantity,
+                    "itemprice":  itemprice,
+                    "reason":     reason,
+                    "poid":       poid,
+                    "expiredate": expiredate,
+                }
+            ]
         )
 
     # ───────────────────────────────────────────────────────────────
@@ -164,7 +167,7 @@ class ReturnHandler(DatabaseManager):
                r.returnstatus,
                r.creditnote,
                r.notes,
-               r.approvedate
+               NULLIF(r.approvedate, '0000-00-00 00:00:00') AS approvedate
           FROM supplierreturns r
           JOIN supplier s ON s.supplierid = r.supplierid
          ORDER BY r.createddate DESC
@@ -189,12 +192,15 @@ class ReturnHandler(DatabaseManager):
         return self.fetch_data(sql, (returnid,))
 
     def get_return_header(self, returnid: int) -> pd.DataFrame:
-        return self.fetch_data(
-            "SELECT * FROM supplierreturns WHERE returnid = %s",
-            (returnid,),
-        )
+        sql = """
+        SELECT *,
+               NULLIF(approvedate, '0000-00-00 00:00:00') AS approvedate
+          FROM supplierreturns
+         WHERE returnid = %s
+        """
+        return self.fetch_data(sql, (returnid,))
 
-    # ───────────────────────── inventory adjustment ─────────────────
+    # ───────────────────────── inventory adjustment ────────────────
     def reduce_inventory(self, *, itemid: int, expiredate: str, qty: int) -> None:
         sql = """
         UPDATE inventory
