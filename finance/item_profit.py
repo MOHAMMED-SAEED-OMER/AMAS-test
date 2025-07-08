@@ -102,7 +102,11 @@ def profit_tab():
     )
 
     def highlight_neg(v):
-        return "color: red;" if v < 0 else ""
+        # style helper for Styler.map
+        try:
+            return "color: red;" if float(v) < 0 else ""
+        except (TypeError, ValueError):
+            return ""
 
     st.dataframe(
         df_display.style.format(
@@ -112,7 +116,7 @@ def profit_tab():
                 "Profit/Unit": "{:.2f}",
                 "Margin %": "{:.1f} %",
             }
-        ).applymap(highlight_neg, subset=["Profit/Unit", "Margin %"]),
+        ).map(highlight_neg, subset=["Profit/Unit", "Margin %"]),   # <- use .map
         use_container_width=True,
     )
 
