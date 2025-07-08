@@ -23,6 +23,25 @@ class ShelfHandler(DatabaseManager):
         """
         return self.fetch_data(query)
 
+    # ────────────────────── recent shelf location ───────────────────
+    def last_locid(self, itemid: int) -> str | None:
+        """
+        Most recent non-NULL `locid` where this item was placed
+        (from `shelfentries`). Returns None if not found.
+        """
+        df = self.fetch_data(
+            """
+            SELECT locid
+            FROM   shelfentries
+            WHERE  itemid = %s
+              AND  locid  IS NOT NULL
+            ORDER  BY entrydate DESC
+            LIMIT 1
+            """,
+            (itemid,),
+        )
+        return None if df.empty else str(df.iloc[0, 0])
+
     # ───────────────── add / update shelf (+ log) ───────────────────
     def add_to_shelf(
         self,
@@ -34,10 +53,9 @@ class ShelfHandler(DatabaseManager):
         cur=None,          # optional open cursor for transaction use
     ):
         """
-        Upserts (insert or increment) a shelf row and logs the move.
-        Works on MySQL 8.0+ using ON DUPLICATE KEY UPDATE.
-        The UNIQUE or PRIMARY KEY on `shelf` must include
-        (itemid, expirationdate, cost_per_unit).
+        Upsert (insert or increment) a shelf row and log the move.
+        MySQL 8-compatible `ON DUPLICATE KEY UPDATE`.
+        The UNIQUE/PK on `shelf` must include (itemid, expirationdate, cost_per_unit).
         """
         own_cursor = False
         if cur is None:
