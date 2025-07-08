@@ -1,31 +1,43 @@
-# admin/user_management.py  – edit users & permissions (MySQL backend)
+# admin/user_management.py  ───────────────────────────────────────────────
+"""
+Admin page: view / edit users and their page-level permissions.
+
+• Uses MySQL for storage (via db_handler.DatabaseManager).
+• Permission-column list is discovered lazily and cached with Streamlit.
+• PIN resetting is optional and validated (4-8 digits).
+"""
+
+from __future__ import annotations
 
 import html
-
 import streamlit as st
-
-from auth_utils   import hash_pin           # ✅ hashing helper
+from auth_utils   import hash_pin
 from db_handler   import DatabaseManager
 
-
-# ────────────────────────── discover permission columns ──────────────────────────
-@st.cache_data(ttl=600)
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
 def _discover_perm_cols() -> list[str]:
     """
-    Return list of columns in `users` that start with 'canaccess'.
-    MySQL note: use LIKE instead of ILIKE.
+    Introspect the `users` table and return all columns beginning
+    with 'canaccess'.  Falls back to a hard-coded list if the query
+    fails (e.g. DB offline or no INFORMATION_SCHEMA privileges).
     """
     db = DatabaseManager()
-    q = """
-        SELECT column_name
-        FROM   information_schema.columns
-        WHERE  table_name = 'users' AND column_name LIKE 'canaccess%%'
-        ORDER  BY column_name;
-    """
+    q = (
+        "SELECT column_name "
+        "FROM   information_schema.columns "
+        "WHERE  table_name = 'users' "
+        "  AND  column_name LIKE 'canaccess%%' "
+        "ORDER  BY column_name;"
+    )
     try:
-        return db.fetch_data(q)["column_name"].tolist()
+        return (
+            db.fetch_data(q)["column_name"]
+            .str.lower()
+            .tolist()
+        )
     except Exception:
-        # Fallback if introspection fails
         return [
             "canaccesshome", "canaccessitems", "canaccessreceive",
             "canaccesspo", "canaccessreports", "canaccesssellingarea",
@@ -34,44 +46,60 @@ def _discover_perm_cols() -> list[str]:
         ]
 
 
-PERM_COLS = _discover_perm_cols()
-_pretty   = lambda c: c.replace("canaccess", "").title()
+@st.cache_data(ttl=600, show_spinner=False)
+def _get_perm_cols() -> list[str]:
+    """Cached wrapper around `_discover_perm_cols()` (10-minute TTL)."""
+    return _discover_perm_cols()
 
 
-# ────────────────────────── cached user list ──────────────────────────
-@st.cache_data(ttl=600)
-def load_users(col_str: str):
+def _pretty(col: str) -> str:
+    """`canaccesscashier` → `Cashier`."""
+    return col.replace("canaccess", "").title()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_users(cols: list[str]):
+    """Return a DataFrame of all users (cached 10 min)."""
     db = DatabaseManager()
+    col_str = ", ".join(cols)
     return db.fetch_data(f"SELECT {col_str} FROM `users` ORDER BY name;")
 
 
-# ────────────────────────── main page ──────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Page entry-point
+# ─────────────────────────────────────────────────────────────
 def user_management() -> None:
+    """Render the User-Management admin view."""
     st.title("👤 User Management")
 
-    # ---- fetch users -------------------------------------------------
+    # 1) Pull permission columns lazily
+    PERM_COLS = _get_perm_cols()
+
+    # 2) Fetch user records
     col_list = ["userid", "name", "email", "role"] + PERM_COLS
-    users_df = load_users(", ".join(col_list))
+    users_df = _load_users(col_list)
+
     if users_df.empty:
         st.warning("No users found.")
         return
 
-    email_map = dict(zip(users_df.email, users_df.userid))
-    name_map  = dict(zip(users_df.email, users_df.name))
-    emails    = list(email_map.keys())
+    # 3) Drop-downs & selection helpers
+    email_to_uid  = dict(zip(users_df.email, users_df.userid))
+    email_to_name = dict(zip(users_df.email, users_df.name))
+    email_list    = list(email_to_uid)
 
-    sel_email = st.session_state.get("um_selected_email", emails[0])
-    if sel_email not in emails:
-        sel_email = emails[0]
+    sel_email = st.session_state.get("um_selected_email", email_list[0])
+    if sel_email not in email_list:
+        sel_email = email_list[0]
     st.session_state["um_selected_email"] = sel_email
 
     row = users_df[users_df.email == sel_email].iloc[0]
     uid = int(row.userid)
 
-    st.subheader(f"Editing: **{row['name']}** ({row['email']})")
+    st.subheader(f"Editing: **{row.name}** ({row.email})")
 
-    # ---- edit form ---------------------------------------------------
-    with st.form("edit_permissions_form"):
+    # ── Edit-form ────────────────────────────────────────────
+    with st.form("um_edit_form"):
         new_role = st.selectbox(
             "Role",
             ["User", "Admin"],
@@ -79,40 +107,39 @@ def user_management() -> None:
             key="um_role",
         )
 
-        st.subheader("Access Permissions")
+        st.subheader("Access permissions")
         new_perms = {
             col: st.checkbox(_pretty(col), bool(row[col]), key=f"perm_{col}")
             for col in PERM_COLS
         }
 
-        # Optional PIN reset
         st.subheader("Reset PIN (optional)")
         new_pin = st.text_input(
-            "Enter a new 4–8 digit PIN (leave blank to keep current)",
+            "Enter a new 4-8 digit PIN (leave blank to keep current)",
             type="password",
             key="um_new_pin",
-        )
+        ).strip()
 
-        submitted = st.form_submit_button("💾 Review & Confirm")
+        submitted = st.form_submit_button("💾 Review & confirm")
 
-    # ---- stash pending changes --------------------------------------
+    # ── Queue pending changes & refresh ─────────────────────
     if submitted:
         st.session_state["um_pending"] = {
             "uid":   uid,
             "role":  new_role,
             "perms": new_perms,
-            "name":  row["name"],
-            "email": row["email"],
-            "new_pin": new_pin.strip(),
+            "name":  row.name,
+            "email": row.email,
+            "new_pin": new_pin,
         }
-        st.rerun()
+        st.rerun()                       # show confirmation banner
 
-    # ---- select another user ----------------------------------------
+    # ── Allow quick user switch (no form) ───────────────────
     new_email = st.selectbox(
-        "📧 Select User",
-        emails,
-        index=emails.index(sel_email),
-        format_func=lambda e: f"{name_map[e]} ({e})",
+        "📧 Select user",
+        email_list,
+        index=email_list.index(sel_email),
+        format_func=lambda e: f"{email_to_name[e]} ({e})",
         key="um_user_picker",
     )
     if new_email != sel_email:
@@ -120,7 +147,7 @@ def user_management() -> None:
         st.session_state.pop("um_pending", None)
         st.rerun()
 
-    # ---- confirmation banner ----------------------------------------
+    # ── Confirmation banner ─────────────────────────────────
     if "um_pending" in st.session_state:
         p = st.session_state["um_pending"]
 
@@ -134,24 +161,30 @@ def user_management() -> None:
         )
         st.markdown(f"**New role:** {blue(p['role'])}", unsafe_allow_html=True)
 
-        pages = ", ".join([_pretty(c) for c, v in p["perms"].items() if v]) or "None"
-        st.markdown(f"**Pages with access:** {blue(pages)}", unsafe_allow_html=True)
+        page_list = ", ".join(
+            [_pretty(c) for c, v in p["perms"].items() if v]
+        ) or "None"
+        st.markdown(
+            f"**Pages with access:** {blue(page_list)}",
+            unsafe_allow_html=True,
+        )
 
         if p["new_pin"]:
             st.markdown("**PIN will be reset.**")
 
         c_yes, c_no = st.columns(2)
 
+        # ── Apply changes ───────────────────────────────────
         if c_yes.button("✅ Apply changes"):
             db = DatabaseManager()
 
-            # role update
+            # role
             db.execute_command(
                 "UPDATE `users` SET role = %s WHERE userid = %s",
                 (p["role"], p["uid"]),
             )
 
-            # permissions update
+            # permissions
             for col, val in p["perms"].items():
                 db.execute_command(
                     f"UPDATE `users` SET {col} = %s WHERE userid = %s",
@@ -162,7 +195,9 @@ def user_management() -> None:
             if p["new_pin"]:
                 if p["new_pin"].isdigit() and 4 <= len(p["new_pin"]) <= 8:
                     db.execute_command(
-                        "UPDATE `users` SET pin_hash = %s WHERE userid = %s",
+                        "UPDATE `users` "
+                        "SET pin_hash = %s "
+                        "WHERE userid  = %s",
                         (hash_pin(p["new_pin"]), p["uid"]),
                     )
                 else:
@@ -171,15 +206,17 @@ def user_management() -> None:
                     return
 
             st.success("Changes saved ✅")
-            load_users.clear()  # clear cache
+            _load_users.clear()          # clear both caches
+            _get_perm_cols.clear()
             st.session_state.pop("um_pending")
             st.rerun()
 
+        # ── Cancel ──────────────────────────────────────────
         if c_no.button("❌ Cancel"):
             st.session_state.pop("um_pending")
             st.rerun()
 
 
-# run standalone
+# Stand-alone debugging hook
 if __name__ == "__main__":
     user_management()
