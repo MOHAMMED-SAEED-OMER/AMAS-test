@@ -1,12 +1,13 @@
 # item/dropdowns.py
 """
-Manage Dropdown Values tab.
+Manage Dropdown Values tab (stable form-based version).
 
-Fixes:
-    • Eliminates StreamlitAPIException caused by writing to st.session_state
-      keys that belong to widgets after they were instantiated.
-    • Uses “clear-on-next-run” flags so text-area / multiselect can be reset
-      without breaking Streamlit’s rules.
+Why this won’t crash:
+    • No code writes to `st.session_state[widget_key]` after the widget exists.
+    • We wrap add & delete actions in `st.form(..., clear_on_submit=True)`,
+      which clears text-areas / multiselects automatically once the form is
+      successfully submitted.
+    • No need for manual flags, reruns are still used to refresh the list.
 """
 
 from __future__ import annotations
@@ -22,19 +23,9 @@ item_handler = ItemHandler()
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _uniq(values: list[str] | list[Any]) -> List[str]:
-    """Normalise → strip → deduplicate → sort."""
+def _uniq(values: list[Any]) -> List[str]:
+    """Normalise → strip → deduplicate → sorted list."""
     return sorted({str(v).strip() for v in values if str(v).strip()})
-
-
-def _maybe_clear_widget(key: str, flag_key: str) -> None:
-    """
-    If *flag_key* exists in session_state, remove *key* (the widget’s value)
-    BEFORE the widget is created, then drop the flag.
-    """
-    if st.session_state.get(flag_key):
-        st.session_state.pop(key, None)
-        st.session_state.pop(flag_key, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,16 +49,6 @@ def manage_dropdowns_tab() -> None:
 
     selected_section = st.selectbox("Select Dropdown Section", sections, key="section")
 
-    # Build widget keys (+ matching “please clear” flag names)
-    add_key = f"bulk_add_{selected_section}"
-    del_key = f"bulk_delete_{selected_section}"
-    add_flag = f"clear___{add_key}"
-    del_flag = f"clear___{del_key}"
-
-    # Clear widget state *before* widgets are drawn if flagged
-    _maybe_clear_widget(add_key, add_flag)
-    _maybe_clear_widget(del_key, del_flag)
-
     # ---------------------------------------------------------------------
     # Current values
     # ---------------------------------------------------------------------
@@ -78,54 +59,53 @@ def manage_dropdowns_tab() -> None:
     st.divider()
 
     # ---------------------------------------------------------------------
-    # 1️⃣  Bulk ADD
+    # 1️⃣  Bulk ADD (form clears textarea automatically)
     # ---------------------------------------------------------------------
     st.markdown("### ➕ Bulk Add Values")
 
-    new_values_str = st.text_area("Enter one value per line", key=add_key)
+    with st.form(f"add_form_{selected_section}", clear_on_submit=True):
+        new_values_str = st.text_area("Enter one value per line")
+        submitted_add  = st.form_submit_button("Add Values")
 
-    if st.button("Add Values", key=f"btn_add_{selected_section}"):
-        new_values = _uniq(new_values_str.splitlines())
+        if submitted_add:
+            new_values = _uniq(new_values_str.splitlines())
 
-        if not new_values:
-            st.error("❌ Please enter at least one value.")
-        else:
-            added, skipped = [], []
-            for val in new_values:
-                if val in current_values:
-                    skipped.append(val)
-                else:
-                    item_handler.add_dropdown_value(selected_section, val)
-                    added.append(val)
+            if not new_values:
+                st.error("❌ Please enter at least one value.")
+            else:
+                added, skipped = [], []
+                for val in new_values:
+                    if val in current_values:
+                        skipped.append(val)
+                    else:
+                        item_handler.add_dropdown_value(selected_section, val)
+                        added.append(val)
 
-            if added:
-                st.success(f"✅ Added: {', '.join(added)}")
-            if skipped:
-                st.warning(f"⚠️ Already existed (skipped): {', '.join(skipped)}")
+                if added:
+                    st.success(f"✅ Added: {', '.join(added)}")
+                if skipped:
+                    st.warning(f"⚠️ Already existed (skipped): {', '.join(skipped)}")
 
-            # Ask next run to clear the textarea, then rerun
-            st.session_state[add_flag] = True
-            st.experimental_rerun()
+                st.experimental_rerun()   # refresh list
 
     st.divider()
 
     # ---------------------------------------------------------------------
-    # 2️⃣  Bulk DELETE
+    # 2️⃣  Bulk DELETE (form clears selection automatically)
     # ---------------------------------------------------------------------
     st.markdown("### 🗑️ Bulk Delete Values")
 
-    values_to_delete = st.multiselect(
-        "Select values to delete", options=current_values, key=del_key
-    )
+    with st.form(f"del_form_{selected_section}", clear_on_submit=True):
+        values_to_delete = st.multiselect(
+            "Select values to delete", options=current_values
+        )
+        submitted_del = st.form_submit_button("Delete Selected Values")
 
-    if st.button("Delete Selected Values", key=f"btn_del_{selected_section}"):
-        if not values_to_delete:
-            st.error("❌ Please select at least one value to delete.")
-        else:
-            for val in values_to_delete:
-                item_handler.delete_dropdown_value(selected_section, val)
-            st.success(f"✅ Deleted: {', '.join(values_to_delete)}")
-
-            # Ask next run to clear the multiselect selection, then rerun
-            st.session_state[del_flag] = True
-            st.experimental_rerun()
+        if submitted_del:
+            if not values_to_delete:
+                st.error("❌ Please select at least one value to delete.")
+            else:
+                for val in values_to_delete:
+                    item_handler.delete_dropdown_value(selected_section, val)
+                st.success(f"✅ Deleted: {', '.join(values_to_delete)}")
+                st.experimental_rerun()   # refresh list
