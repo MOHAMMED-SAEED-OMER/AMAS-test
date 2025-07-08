@@ -4,7 +4,6 @@ from db_handler import DatabaseManager
 
 
 INVALID_DT = "0000-00-00 00:00:00"
-FMT_STR   = "%%Y-%%m-%%d %%H:%%i:%%s"   # escape % → %% so connector won’t treat them as %s
 
 
 class ReturnHandler(DatabaseManager):
@@ -42,7 +41,7 @@ class ReturnHandler(DatabaseManager):
                 (supplier_id, creditnote, notes, createdby, total_return_cost),
             )
             self.conn.commit()
-            return int(cur.lastrowid)   # new PK
+            return int(cur.lastrowid)
 
     # ---------- BULK insert of return items ------------------------
     def add_return_items_bulk(self, items: list[dict]) -> None:
@@ -74,8 +73,8 @@ class ReturnHandler(DatabaseManager):
             cur.executemany(sql, rows)
             self.conn.commit()
 
-    # convenience wrapper
     def add_return_item(self, **kw) -> None:
+        """Thin wrapper around bulk insert for a single line."""
         self.add_return_items_bulk([kw])
 
     # ───────────────────────────────────────────────────────────────
@@ -122,19 +121,17 @@ class ReturnHandler(DatabaseManager):
     # ───────────────────────────────────────────────────────────────
     # Reporting helpers
     # ───────────────────────────────────────────────────────────────
-    def _clean_date_expr(self, col: str) -> str:
+    @staticmethod
+    def _clean_date_expr(col: str) -> str:
         """
-        Build a SQL fragment that turns zero-date in `col` into NULL and
-        gives back a proper DATETIME for valid rows.
+        Return a SQL fragment that yields NULL when `col` holds the illegal
+        zero-date literal, otherwise the original DATETIME value.
         """
-        return (
-            f"STR_TO_DATE("
-            f"NULLIF(CAST({col} AS CHAR), '{INVALID_DT}'), "
-            f"'{FMT_STR}')"
-        )
+        # Compare the column *as text* to avoid MySQL validating the literal
+        return f"CASE WHEN CAST({col} AS CHAR) = '{INVALID_DT}' THEN NULL ELSE {col} END"
 
     def get_returns_summary(self) -> pd.DataFrame:
-        created = self._clean_date_expr("r.createddate")
+        created  = self._clean_date_expr("r.createddate")
         approved = self._clean_date_expr("r.approvedate")
 
         sql = f"""
@@ -170,7 +167,7 @@ class ReturnHandler(DatabaseManager):
         return self.fetch_data(sql, (returnid,))
 
     def get_return_header(self, returnid: int) -> pd.DataFrame:
-        created = self._clean_date_expr("createddate")
+        created  = self._clean_date_expr("createddate")
         approved = self._clean_date_expr("approvedate")
 
         sql = f"""
@@ -182,7 +179,7 @@ class ReturnHandler(DatabaseManager):
         """
         return self.fetch_data(sql, (returnid,))
 
-    # ──────────────────────── inventory adjustment ─────────────────
+    # ───────────────────────── inventory adjustment ────────────────
     def reduce_inventory(self, *, itemid: int, expiredate: str, qty: int) -> None:
         sql = """
         UPDATE inventory
