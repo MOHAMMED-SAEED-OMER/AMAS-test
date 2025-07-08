@@ -55,11 +55,11 @@ class ItemHandler(DatabaseManager):
     def add_item(self, item_data: dict, supplier_ids: list[int]) -> int | None:
         """
         Insert a new item (prepared statement for safe BLOB handling),
-        then link suppliers.  Returns new itemid or None.
+        then link suppliers.  Returns the new itemid or None.
         """
         cols = ", ".join(item_data.keys())
-        ph = ", ".join(["%s"] * len(item_data))
-        sql = (
+        ph   = ", ".join(["%s"] * len(item_data))
+        sql  = (
             f"INSERT INTO `item` ({cols}, createdat, updatedat) "
             f"VALUES ({ph}, NOW(), NOW())"
         )
@@ -71,7 +71,7 @@ class ItemHandler(DatabaseManager):
             cur.execute(sql, list(item_data.values()))
 
         # 2️⃣  fetch the new AUTO_INCREMENT id reliably
-        with self.conn.cursor() as cur2:  # regular cursor ok here
+        with self.conn.cursor() as cur2:         # regular cursor is fine here
             cur2.execute("SELECT LAST_INSERT_ID()")
             item_id = cur2.fetchone()[0]
 
@@ -150,7 +150,7 @@ class ItemHandler(DatabaseManager):
             cur.execute(sql, (picture_data, item_id))
         self.conn.commit()
 
-        # ───────────────────── Dropdown utilities ──────────────────────
+    # ───────────────────── Dropdown utilities ──────────────────────
     def get_dropdown_values(self, section: str) -> list[str]:
         """
         Return the list of dropdown values for a section, ordered alphabetically.
@@ -178,8 +178,8 @@ class ItemHandler(DatabaseManager):
             )
             self.conn.commit()
 
-            if cur.rowcount:           # 1 → inserted
-                return cur.lastrowid   # new id
+            if cur.rowcount:                # 1 → inserted
+                return cur.lastrowid        # new id
 
             # rowcount 0 → duplicate skipped; fetch current id
             cur.execute(
