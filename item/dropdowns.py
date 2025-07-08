@@ -1,9 +1,9 @@
 # item/dropdowns.py
 """
-Manage Dropdown Values tab (form-based, Streamlit ≥ 1.28).
+Manage Dropdown Values tab (Streamlit ≥ 1.28, cache-optimised).
 
-Fixes:
-    • Uses st.rerun() instead of deprecated st.experimental_rerun().
+• No manual st.rerun() – avoids double-rerun loops.
+• Fetch list of values via @st.cache_data (3-min TTL) for snappy UI.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from item.item_handler import ItemHandler
 
 item_handler = ItemHandler()
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,12 +23,9 @@ def _uniq(values: list[Any]) -> List[str]:
     return sorted({str(v).strip() for v in values if str(v).strip()})
 
 
-def _rerun() -> None:
-    """Compatible rerun for both new and old Streamlit versions."""
-    if hasattr(st, "rerun"):
-        st.rerun()
-    else:  # pragma: no cover  – older Streamlit
-        st.experimental_rerun()
+@st.cache_data(ttl=180, show_spinner=False)   # 3-minute cache per section
+def _cached_dropdown_values(section: str) -> List[str]:
+    return _uniq(item_handler.get_dropdown_values(section))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,9 +49,9 @@ def manage_dropdowns_tab() -> None:
     selected_section = st.selectbox("Select Dropdown Section", sections, key="section")
 
     # ---------------------------------------------------------------------
-    # Current values
+    # Current values (cached)
     # ---------------------------------------------------------------------
-    current_values = _uniq(item_handler.get_dropdown_values(selected_section))
+    current_values = _cached_dropdown_values(selected_section)
     st.markdown("**Current Values:**")
     st.write(", ".join(current_values) if current_values else "—")
 
@@ -71,23 +67,26 @@ def manage_dropdowns_tab() -> None:
 
         if submitted_add:
             new_values = _uniq(new_values_str.splitlines())
+
             if not new_values:
                 st.error("❌ Please enter at least one value.")
             else:
                 added, skipped = [], []
-                for val in new_values:
-                    if val in current_values:
-                        skipped.append(val)
-                    else:
-                        item_handler.add_dropdown_value(selected_section, val)
-                        added.append(val)
+                with st.spinner("Adding…"):
+                    for val in new_values:
+                        if val in current_values:
+                            skipped.append(val)
+                        else:
+                            item_handler.add_dropdown_value(selected_section, val)
+                            added.append(val)
 
                 if added:
                     st.success(f"✅ Added: {', '.join(added)}")
                 if skipped:
                     st.warning(f"⚠️ Already existed (skipped): {', '.join(skipped)}")
 
-                _rerun()  # refresh list
+                # Clear the cache for this section so next rerun shows fresh list
+                _cached_dropdown_values.clear()         # type: ignore[attr-defined]
 
     st.divider()
 
@@ -105,7 +104,10 @@ def manage_dropdowns_tab() -> None:
             if not values_to_delete:
                 st.error("❌ Please select at least one value to delete.")
             else:
-                for val in values_to_delete:
-                    item_handler.delete_dropdown_value(selected_section, val)
+                with st.spinner("Deleting…"):
+                    for val in values_to_delete:
+                        item_handler.delete_dropdown_value(selected_section, val)
                 st.success(f"✅ Deleted: {', '.join(values_to_delete)}")
-                _rerun()  # refresh list
+
+                # Invalidate cache so updated list is fetched automatically
+                _cached_dropdown_values.clear()         # type: ignore[attr-defined]
