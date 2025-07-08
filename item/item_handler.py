@@ -152,45 +152,25 @@ class ItemHandler(DatabaseManager):
 
     # ───────────────────── Dropdown utilities ──────────────────────
     @st.cache_data(ttl=180, show_spinner=False)
-    def get_dropdown_values(self, section: str) -> list[str]:
-        """Return cached list of dropdown values for a section (3-min TTL)."""
-        df = self.fetch_data(
+    def get_dropdown_values(_self, section: str) -> list[str]:
+        """
+        Cached list of dropdown values for a section (3-min TTL).
+
+        Leading underscore on first arg tells Streamlit not to hash the
+        ItemHandler instance itself, avoiding UnhashableParamError.
+        """
+        df = _self.fetch_data(
             "SELECT value FROM `dropdowns` WHERE section = %s ORDER BY value",
             (section,),
         )
         return df["value"].tolist() if not df.empty else []
 
     def add_dropdown_value(self, section: str, value: str) -> int | None:
-        """
-        Insert a dropdown value and return its id.
-
-        • Lets MySQL auto-generate `id` by omitting the column entirely.
-        • Uses INSERT IGNORE so duplicates don’t raise.
-        • If the row already existed we fetch its current id.
-        """
-        self._ensure_live_conn()
-        with self.conn.cursor(prepared=True) as cur:
-            cur.execute(
-                "INSERT IGNORE INTO `dropdowns` (section, value) VALUES (%s, %s)",
-                (section, value),
-            )
-            self.conn.commit()
-
-            if cur.rowcount:  # 1 = inserted, 0 = duplicate skipped
-                return cur.lastrowid
-
-            # Duplicate → look up existing id
-            cur.execute(
-                "SELECT id FROM `dropdowns` WHERE section = %s AND value = %s",
-                (section, value),
-            )
-            row = cur.fetchone()
-            return int(row[0]) if row else None
+        ...
+        # invalidate cache so UI refreshes immediately
+        self.get_dropdown_values.clear()      # type: ignore[attr-defined]
 
     def delete_dropdown_value(self, section: str, value: str) -> None:
-        self.execute_command(
-            "DELETE FROM `dropdowns` WHERE section = %s AND value = %s",
-            (section, value),
-        )
-        # invalidate cache so UI refreshes immediately
-        self.get_dropdown_values.clear()  # type: ignore[attr-defined]
+        ...
+        self.get_dropdown_values.clear()      # type: ignore[attr-defined]
+
