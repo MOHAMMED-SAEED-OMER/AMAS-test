@@ -103,7 +103,7 @@ def alerts_tab() -> None:
 
         subtab_days, subtab_frac = st.tabs(["📅 Days-Based", "📐 Shelf-Life %"])
 
-        # -------------- Days-Based -----------------
+        # -------------- Days-Based --------------
         with subtab_days:
             st.markdown("#### ⚙️ Alert thresholds (days)")
             c1, c2, c3 = st.columns(3)
@@ -117,7 +117,6 @@ def alerts_tab() -> None:
             if near.empty:
                 st.success(f"✅ No items expiring within {green} days.")
             else:
-                # colour column via gradient so Streamlit handles styling
                 near["risk"] = pd.cut(
                     near.days_left,
                     bins=[-1, red, orange, green],
@@ -134,12 +133,11 @@ def alerts_tab() -> None:
                             format="%d",
                             min_value=0,
                             max_value=green,
-                            color_gradient=["#ff4d4d", "#ffa500", "#63be7b"],
                         )
                     },
                 )
 
-        # -------------- Fraction-Based -------------
+        # -------------- Fraction-Based ----------
         with subtab_frac:
             st.markdown("#### ⚙️ Alert thresholds (fraction of shelf-life)")
             c1, c2, c3 = st.columns(3)
@@ -176,7 +174,6 @@ def alerts_tab() -> None:
                                 format="%.2f",
                                 min_value=0.0,
                                 max_value=green_f,
-                                color_gradient=["#ff4d4d", "#ffa500", "#63be7b"],
                             )
                         },
                     )
