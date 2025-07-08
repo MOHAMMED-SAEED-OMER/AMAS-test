@@ -3,7 +3,7 @@ import pandas as pd
 from db_handler import DatabaseManager
 
 
-INVALID_DT = "0000-00-00 00:00:00"      # helper constant
+INVALID_DT = "0000-00-00 00:00:00"
 
 
 class ReturnHandler(DatabaseManager):
@@ -27,22 +27,13 @@ class ReturnHandler(DatabaseManager):
         creditnote: str = "",
         notes: str = "",
     ) -> int | None:
-        """
-        Insert a row into `supplierreturns` and return the new PK.
-        (Uses cursor.lastrowid instead of the Postgres RETURNING clause.)
-        """
         sql = """
         INSERT INTO supplierreturns (
-            supplierid,
-            creditnote,
-            notes,
-            returnstatus,
-            createdby,
-            totalreturncost
+            supplierid, creditnote, notes,
+            returnstatus, createdby, totalreturncost
         )
         VALUES (%s, %s, %s, 'Pending Approval', %s, %s)
         """
-
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
             cur.execute(
@@ -50,17 +41,10 @@ class ReturnHandler(DatabaseManager):
                 (supplier_id, creditnote, notes, createdby, total_return_cost),
             )
             self.conn.commit()
-            return int(cur.lastrowid)        # MySQL way to get the PK
+            return int(cur.lastrowid)
 
     # ---------- BULK insert of return items ------------------------
     def add_return_items_bulk(self, items: list[dict]) -> None:
-        """
-        One round-trip INSERT for many lines.
-        Required keys per dict:
-          returnid • itemid • quantity • itemprice
-        Optional keys:
-          reason • poid • expiredate
-        """
         if not items:
             return
 
@@ -77,7 +61,6 @@ class ReturnHandler(DatabaseManager):
             )
             for it in items
         ]
-
         sql = """
         INSERT INTO supplierreturnitems (
               returnid, itemid, quantity,
@@ -85,37 +68,14 @@ class ReturnHandler(DatabaseManager):
               poid, expirationdate
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
-
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
             cur.executemany(sql, rows)
             self.conn.commit()
 
-    # ---- single-row helper (wraps bulk) --------------------------
-    def add_return_item(
-        self,
-        *,
-        returnid: int,
-        itemid: int,
-        quantity: float,
-        itemprice: float,
-        reason: str = "",
-        poid: int | None = None,
-        expiredate: str | None = None,
-    ) -> None:
-        self.add_return_items_bulk(
-            [
-                {
-                    "returnid":   returnid,
-                    "itemid":     itemid,
-                    "quantity":   quantity,
-                    "itemprice":  itemprice,
-                    "reason":     reason,
-                    "poid":       poid,
-                    "expiredate": expiredate,
-                }
-            ]
-        )
+    # shortcut wrapper
+    def add_return_item(self, **kw) -> None:
+        self.add_return_items_bulk([kw | {"returnid": kw["returnid"]}])
 
     # ───────────────────────────────────────────────────────────────
     # Approval
@@ -161,16 +121,33 @@ class ReturnHandler(DatabaseManager):
     # ───────────────────────────────────────────────────────────────
     # Reporting helpers
     # ───────────────────────────────────────────────────────────────
+    def _clean_date_expr(self, col: str) -> str:
+        """
+        Returns a SQL fragment that converts an invalid zero-date in `col`
+        to NULL, but keeps valid datetimes as proper DATETIME values.
+        """
+        # Step 1: turn to CHAR so MySQL doesn't validate right away
+        # Step 2: NULLIF against INVALID_DT
+        # Step 3: STR_TO_DATE back to DATETIME for sorting / display
+        return (
+            f"STR_TO_DATE("
+            f"NULLIF(CAST({col} AS CHAR), '{INVALID_DT}'), "
+            f"'%Y-%m-%d %H:%i:%s')"
+        )
+
     def get_returns_summary(self) -> pd.DataFrame:
+        created_expr  = self._clean_date_expr("r.createddate")
+        approve_expr  = self._clean_date_expr("r.approvedate")
+
         sql = f"""
         SELECT r.returnid,
                r.supplierid,
                s.suppliername,
-               NULLIF(r.createddate, '{INVALID_DT}')  AS createddate,
+               {created_expr}  AS createddate,
                r.returnstatus,
                r.creditnote,
                r.notes,
-               NULLIF(r.approvedate, '{INVALID_DT}')  AS approvedate
+               {approve_expr}  AS approvedate
           FROM supplierreturns r
           JOIN supplier s ON s.supplierid = r.supplierid
          ORDER BY createddate DESC
@@ -195,10 +172,12 @@ class ReturnHandler(DatabaseManager):
         return self.fetch_data(sql, (returnid,))
 
     def get_return_header(self, returnid: int) -> pd.DataFrame:
+        created_expr  = self._clean_date_expr("createddate")
+        approve_expr  = self._clean_date_expr("approvedate")
         sql = f"""
         SELECT *,
-               NULLIF(createddate, '{INVALID_DT}')  AS createddate,
-               NULLIF(approvedate, '{INVALID_DT}') AS approvedate
+               {created_expr}  AS createddate,
+               {approve_expr}  AS approvedate
           FROM supplierreturns
          WHERE returnid = %s
         """
