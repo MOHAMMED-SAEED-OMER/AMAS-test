@@ -4,6 +4,7 @@ from db_handler import DatabaseManager
 
 
 INVALID_DT = "0000-00-00 00:00:00"
+FMT_STR   = "%%Y-%%m-%%d %%H:%%i:%%s"   # escape % → %% so connector won’t treat them as %s
 
 
 class ReturnHandler(DatabaseManager):
@@ -41,7 +42,7 @@ class ReturnHandler(DatabaseManager):
                 (supplier_id, creditnote, notes, createdby, total_return_cost),
             )
             self.conn.commit()
-            return int(cur.lastrowid)
+            return int(cur.lastrowid)   # new PK
 
     # ---------- BULK insert of return items ------------------------
     def add_return_items_bulk(self, items: list[dict]) -> None:
@@ -73,9 +74,9 @@ class ReturnHandler(DatabaseManager):
             cur.executemany(sql, rows)
             self.conn.commit()
 
-    # shortcut wrapper
+    # convenience wrapper
     def add_return_item(self, **kw) -> None:
-        self.add_return_items_bulk([kw | {"returnid": kw["returnid"]}])
+        self.add_return_items_bulk([kw])
 
     # ───────────────────────────────────────────────────────────────
     # Approval
@@ -123,31 +124,28 @@ class ReturnHandler(DatabaseManager):
     # ───────────────────────────────────────────────────────────────
     def _clean_date_expr(self, col: str) -> str:
         """
-        Returns a SQL fragment that converts an invalid zero-date in `col`
-        to NULL, but keeps valid datetimes as proper DATETIME values.
+        Build a SQL fragment that turns zero-date in `col` into NULL and
+        gives back a proper DATETIME for valid rows.
         """
-        # Step 1: turn to CHAR so MySQL doesn't validate right away
-        # Step 2: NULLIF against INVALID_DT
-        # Step 3: STR_TO_DATE back to DATETIME for sorting / display
         return (
             f"STR_TO_DATE("
             f"NULLIF(CAST({col} AS CHAR), '{INVALID_DT}'), "
-            f"'%Y-%m-%d %H:%i:%s')"
+            f"'{FMT_STR}')"
         )
 
     def get_returns_summary(self) -> pd.DataFrame:
-        created_expr  = self._clean_date_expr("r.createddate")
-        approve_expr  = self._clean_date_expr("r.approvedate")
+        created = self._clean_date_expr("r.createddate")
+        approved = self._clean_date_expr("r.approvedate")
 
         sql = f"""
         SELECT r.returnid,
                r.supplierid,
                s.suppliername,
-               {created_expr}  AS createddate,
+               {created}  AS createddate,
                r.returnstatus,
                r.creditnote,
                r.notes,
-               {approve_expr}  AS approvedate
+               {approved} AS approvedate
           FROM supplierreturns r
           JOIN supplier s ON s.supplierid = r.supplierid
          ORDER BY createddate DESC
@@ -172,18 +170,19 @@ class ReturnHandler(DatabaseManager):
         return self.fetch_data(sql, (returnid,))
 
     def get_return_header(self, returnid: int) -> pd.DataFrame:
-        created_expr  = self._clean_date_expr("createddate")
-        approve_expr  = self._clean_date_expr("approvedate")
+        created = self._clean_date_expr("createddate")
+        approved = self._clean_date_expr("approvedate")
+
         sql = f"""
         SELECT *,
-               {created_expr}  AS createddate,
-               {approve_expr}  AS approvedate
+               {created}  AS createddate,
+               {approved} AS approvedate
           FROM supplierreturns
          WHERE returnid = %s
         """
         return self.fetch_data(sql, (returnid,))
 
-    # ───────────────────────── inventory adjustment ────────────────
+    # ──────────────────────── inventory adjustment ─────────────────
     def reduce_inventory(self, *, itemid: int, expiredate: str, qty: int) -> None:
         sql = """
         UPDATE inventory
