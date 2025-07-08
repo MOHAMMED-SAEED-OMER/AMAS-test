@@ -1,15 +1,18 @@
 # item/add_item.py  – handles binary images for MySQL
+from __future__ import annotations
+
+import mysql.connector            # for Binary()
 import streamlit as st
-import mysql.connector                       # for Binary()
+
 from item.item_handler import ItemHandler
 
 item_handler = ItemHandler()
 
 # ────────────────────────────────────────────────────────────────
-# 1. Cached dropdown lists (refresh every 10 min)
+# Cached dropdown lists (refresh every 10 min)
 # ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
-def load_dropdowns():
+def load_dropdowns() -> dict[str, list[str]]:
     dropdown_fields = {
         "Class Category":      "ClassCat",
         "Department Category": "DepartmentCat",
@@ -23,23 +26,27 @@ def load_dropdowns():
         "Brand":               "Brand",
     }
     return {
-        lbl: item_handler.get_dropdown_values(db_sec)
-        for lbl, db_sec in dropdown_fields.items()
+        label: item_handler.get_dropdown_values(section)
+        for label, section in dropdown_fields.items()
     }
 
-dropdown_values = load_dropdowns()
 
 # ────────────────────────────────────────────────────────────────
-def add_item_tab():
+# Main tab
+# ────────────────────────────────────────────────────────────────
+def add_item_tab() -> None:
     st.header("➕ Add New Item")
 
-    required = [
+    # 🔄 fetch fresh dropdown values on every rerun (10-min cache)
+    dropdown_values = load_dropdowns()
+
+    required = {
         "Item Name (English)",
         "Class Category",
         "Shelf Life",
         "Threshold",
         "Average Required",
-    ]
+    }
 
     def req(label: str) -> str:
         return f"{label} *" if label in required else label
