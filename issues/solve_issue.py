@@ -1,11 +1,12 @@
 # issues/solve_issue.py
 import base64
 import binascii
-import imghdr
+import io
 from datetime import datetime
 from typing import Union
 
 import streamlit as st
+from PIL import Image, UnidentifiedImageError  # Pillow ≥10 is already a Streamlit dep
 
 from .issue_handler import IssueHandler
 
@@ -23,18 +24,17 @@ def _display_issue_photo(raw: Union[bytes, memoryview, str, None]) -> None:
         • base-64 encoded str
         • None (nothing happens)
 
-    If the data is not a recognisable image, shows a warning instead of raising.
+    Any corrupted / non-image data is caught and shown as a warning
+    instead of crashing the app.
     """
     if raw is None:
         return
 
-    # ── Normalise to a `bytes` buffer ──────────────────────────────────
+    # ── Normalise to a bytes buffer ─────────────────────────────────────────
     if isinstance(raw, (bytes, memoryview)):
         data: bytes = bytes(raw)
     elif isinstance(raw, str):
         try:
-            # psycopg automatically decodes BYTEA to str in "hex" mode if
-            # bytea_output = 'hex'. But most people store base-64 in text.
             data = base64.b64decode(raw, validate=True)
         except binascii.Error:
             st.warning("⚠️ Photo field is not valid base-64 or binary data.")
@@ -43,12 +43,16 @@ def _display_issue_photo(raw: Union[bytes, memoryview, str, None]) -> None:
         st.warning(f"⚠️ Unsupported photo type: {type(raw).__name__}")
         return
 
-    # ── Validate the image header before calling st.image ──────────────
-    if imghdr.what(None, h=data) is None:
+    # ── Validate & display using Pillow ────────────────────────────────────
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.verify()               # quick header check
+        img = Image.open(io.BytesIO(data))  # reopen after verify()
+    except (UnidentifiedImageError, OSError):
         st.warning("⚠️ Could not identify image format – is the file corrupted?")
         return
 
-    st.image(data, width=250, caption="Reported photo")
+    st.image(img, width=250, caption="Reported photo")
 
 
 def solve_issue_tab() -> None:
@@ -63,7 +67,7 @@ def solve_issue_tab() -> None:
         st.success("No open issues – yay!")
         return
 
-    # Iterate deterministically – newest first
+    # Newest first for convenience
     open_df = open_df.sort_values("created_at", ascending=False)
 
     for _, row in open_df.iterrows():
@@ -71,10 +75,8 @@ def solve_issue_tab() -> None:
             st.markdown(f"**Category:** {row['category']}")
             st.write(row.get("description", ""))
 
-            # Display attached photo safely
             _display_issue_photo(row.get("photo"))
 
-            # Footer
             created_at: datetime = row["created_at"]
             reporter = row.get("reported_by", "unknown")
             st.caption(f"Reported {created_at:%Y-%m-%d %H:%M} by {reporter}")
