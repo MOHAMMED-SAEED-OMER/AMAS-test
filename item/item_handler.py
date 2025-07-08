@@ -150,27 +150,48 @@ class ItemHandler(DatabaseManager):
             cur.execute(sql, (picture_data, item_id))
         self.conn.commit()
 
-    # ───────────────────── Dropdown utilities ──────────────────────
-    @st.cache_data(ttl=180, show_spinner=False)
-    def get_dropdown_values(_self, section: str) -> list[str]:
+        # ───────────────────── Dropdown utilities ──────────────────────
+    def get_dropdown_values(self, section: str) -> list[str]:
         """
-        Cached list of dropdown values for a section (3-min TTL).
-
-        Leading underscore on first arg tells Streamlit not to hash the
-        ItemHandler instance itself, avoiding UnhashableParamError.
+        Return the list of dropdown values for a section, ordered alphabetically.
+        (No internal caching here; the calling tab handles caching.)
         """
-        df = _self.fetch_data(
+        df = self.fetch_data(
             "SELECT value FROM `dropdowns` WHERE section = %s ORDER BY value",
             (section,),
         )
         return df["value"].tolist() if not df.empty else []
 
     def add_dropdown_value(self, section: str, value: str) -> int | None:
-        ...
-        # invalidate cache so UI refreshes immediately
-        self.get_dropdown_values.clear()      # type: ignore[attr-defined]
+        """
+        Insert a dropdown value and return its id.
+
+        • Omits the `id` column so MySQL auto-generates it.
+        • Uses INSERT IGNORE to avoid duplicate errors.
+        • If the value already exists, fetch and return the existing id.
+        """
+        self._ensure_live_conn()
+        with self.conn.cursor(prepared=True) as cur:
+            cur.execute(
+                "INSERT IGNORE INTO `dropdowns` (section, value) VALUES (%s, %s)",
+                (section, value),
+            )
+            self.conn.commit()
+
+            if cur.rowcount:           # 1 → inserted
+                return cur.lastrowid   # new id
+
+            # rowcount 0 → duplicate skipped; fetch current id
+            cur.execute(
+                "SELECT id FROM `dropdowns` WHERE section = %s AND value = %s",
+                (section, value),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else None
 
     def delete_dropdown_value(self, section: str, value: str) -> None:
-        ...
-        self.get_dropdown_values.clear()      # type: ignore[attr-defined]
-
+        """Remove a dropdown entry (safe if it doesn’t exist)."""
+        self.execute_command(
+            "DELETE FROM `dropdowns` WHERE section = %s AND value = %s",
+            (section, value),
+        )
