@@ -46,7 +46,7 @@ class BarcodeShelfHandler(DatabaseManager):
         return None if df.empty else str(df.iloc[0, 0])
 
     # -----------------------------------------------------------------
-    # Shortage resolver (cashier logged shortages)
+    # Shortage resolver (cashier-logged shortages)
     # -----------------------------------------------------------------
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         rows = self.fetch_data(
@@ -92,6 +92,7 @@ class BarcodeShelfHandler(DatabaseManager):
     # MOVE a cost layer from Inventory → Shelf
     # -----------------------------------------------------------------
     def move_layer(self, *, itemid, expiration, qty, cost, locid, by):
+        """Deduct one layer from inventory and upsert it into the shelf table."""
         # 1) reduce that exact layer in inventory
         self.execute_command(
             """
@@ -105,13 +106,14 @@ class BarcodeShelfHandler(DatabaseManager):
             (qty, itemid, expiration, cost, qty),
         )
 
-        # 2) upsert into shelf  (★ MySQL syntax ★)
+        # 2) upsert into shelf  (MySQL-8 safe syntax: alias the VALUES row)
         self.execute_command(
             """
             INSERT INTO shelf (itemid, expirationdate, quantity, cost_per_unit, locid)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s) AS new
             ON DUPLICATE KEY UPDATE
-                quantity    = quantity + VALUES(quantity),
+                quantity    = shelf.quantity + new.quantity,
+                cost_per_unit = new.cost_per_unit,
                 lastupdated = CURRENT_TIMESTAMP
             """,
             (itemid, expiration, qty, cost, locid),
