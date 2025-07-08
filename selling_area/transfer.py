@@ -1,213 +1,271 @@
-# selling_area/transfer.py  – barcode → shelf transfer (stable)
-from typing import List, Dict, Any
-import streamlit as st
+# selling_area/shelf_handler.py
 import pandas as pd
-from selling_area.shelf_handler import ShelfHandler
-from datetime import date
+from db_handler import DatabaseManager
 
-handler = ShelfHandler()
 
-# ─────────────────── cached look-ups ─────────────────────────────
-@st.cache_data(ttl=60, show_spinner=False)
-def layers_for_barcode(bc: str) -> List[Dict[str, Any]]:
-    return handler.get_inventory_by_barcode(bc).to_dict("records")
+class ShelfHandler(DatabaseManager):
+    """Handles database operations related to the Shelf (Selling Area)."""
 
-@st.cache_data(ttl=300, show_spinner=False)
-def all_locids() -> List[str]:
-    df = handler.fetch_data("SELECT locid FROM shelf_map_locations ORDER BY locid")
-    return df["locid"].tolist() if not df.empty else []
+    # ───────────────────────── shelf queries ─────────────────────────
+    def get_shelf_items(self):
+        query = """
+        SELECT 
+            s.shelfid,
+            s.itemid,
+            i.itemnameenglish AS itemname,
+            s.quantity,
+            s.expirationdate,
+            s.cost_per_unit,
+            s.lastupdated
+        FROM   shelf s
+        JOIN   item  i ON s.itemid = i.itemid
+        ORDER  BY i.itemnameenglish, s.expirationdate;
+        """
+        return self.fetch_data(query)
 
-# ─────────────────── helpers ─────────────────────────────────────
-def _init_row_state(i: int):
-    defaults = {
-        f"bc_{i}": "",
-        f"name_{i}": "",
-        f"exp_{i}": "",
-        f"qty_{i}": 1,
-        f"loc_{i}": "",
-        f"layers_{i}": [],
-        f"_prevbc_{i}": "",
-    }
-    for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
-
-def _validate_rows(n_rows: int):
-    errors, batch = [], []
-    for i in range(n_rows):
-        bc  = st.session_state[f"bc_{i}"].strip()
-        exp = st.session_state[f"exp_{i}"].split(" ")[0]
-        qty = int(st.session_state[f"qty_{i}"])
-        loc = st.session_state[f"loc_{i}"].strip()
-        lays = st.session_state[f"layers_{i}"]
-
-        if not bc:
-            errors.append(f"Line {i+1}: barcode missing.")
-            continue
-        if not exp:
-            errors.append(f"Line {i+1}: expiration missing.")
-            continue
-        if not loc:
-            errors.append(f"Line {i+1}: location missing.")
-            continue
-
-        sel_layers = [l for l in lays if str(l["expirationdate"]) == exp]
-        stock = sum(l["quantity"] for l in sel_layers)
-        if qty > stock:
-            errors.append(f"Line {i+1}: only {stock} available.")
-            continue
-
-        batch.append(
-            {
-                "itemid": sel_layers[0]["itemid"],
-                "need": qty,
-                "loc": loc,
-                "layers": sel_layers,
-            }
+    # ────────────────────── recent shelf location ───────────────────
+    def last_locid(self, itemid: int) -> str | None:
+        """
+        Most recent non-NULL `locid` where this item was placed
+        (from `shelfentries`). Returns None if not found.
+        """
+        df = self.fetch_data(
+            """
+            SELECT locid
+            FROM   shelfentries
+            WHERE  itemid = %s
+              AND  locid  IS NOT NULL
+            ORDER  BY entrydate DESC
+            LIMIT 1
+            """,
+            (itemid,),
         )
-    return errors, batch
+        return None if df.empty else str(df.iloc[0, 0])
 
-def _clear_transfer_state():
-    for k in list(st.session_state.keys()):
-        if k.startswith(
-            ("bc_", "name_", "exp_", "qty_", "loc_", "layers_", "_prevbc_")
-        ):
-            del st.session_state[k]
-    layers_for_barcode.clear()
-
-# ─────────────────── UI ──────────────────────────────────────────
-def transfer_tab():
-    st.subheader("📤 Bulk Transfer (Barcode)")
-
-    n_rows = int(st.number_input("Lines to transfer", 1, 50, 1, 1))
-    loc_opts = all_locids()
-
-    # header
-    hdr = st.columns(5, gap="small")
-    for col, title in zip(
-        hdr,
-        ["**Barcode**", "**Item&nbsp;Name**", "**Expiration**", "**Qty**", "**Location**"],
+    # ───────────────── add / update shelf (+ log) ───────────────────
+    def add_to_shelf(
+        self,
+        itemid: int,
+        expirationdate,
+        quantity: int,
+        created_by: str,
+        cost_per_unit: float,
+        cur=None,          # optional open cursor for transaction use
     ):
-        col.markdown(title, unsafe_allow_html=True)
+        """
+        Upsert (insert or increment) a shelf row and log the move.
+        MySQL 8-compatible `ON DUPLICATE KEY UPDATE`.
+        The UNIQUE/PK on `shelf` must include (itemid, expirationdate, cost_per_unit).
+        """
+        own_cursor = False
+        if cur is None:
+            self._ensure_live_conn()
+            cur = self.conn.cursor()
+            own_cursor = True
 
-    # rows
-    for i in range(n_rows):
-        _init_row_state(i)
-        cols = st.columns(5, gap="small")
+        itemid = int(itemid)
+        qty    = int(quantity)
+        cost   = float(cost_per_unit)
 
-        # --- barcode ---
-        bc_key = f"bc_{i}"
-        bc_val = cols[0].text_input(
-            label=bc_key,               # non-empty, hidden
-            label_visibility="collapsed",
-            key=bc_key,
-        ).strip()
-
-        # barcode changed → refresh layers
-        if bc_val and bc_val != st.session_state[f"_prevbc_{i}"]:
-            layers = layers_for_barcode(bc_val)
-            st.session_state[f"layers_{i}"] = layers
-            st.session_state[f"name_{i}"] = layers[0]["itemname"] if layers else ""
-            st.session_state[f"exp_{i}"] = ""
-            if layers and st.session_state[f"loc_{i}"] == "":
-                st.session_state[f"loc_{i}"] = handler.last_locid(layers[0]["itemid"]) or ""
-            st.session_state[f"_prevbc_{i}"] = bc_val
-
-        # --- item name (read-only) ---
-        cols[1].text_input(
-            label=f"name_{i}",
-            label_visibility="collapsed",
-            key=f"name_{i}",
-            disabled=True,
+        # 1️⃣ upsert / increment shelf
+        cur.execute(
+            """
+            INSERT INTO shelf (itemid, expirationdate, quantity, cost_per_unit)
+            VALUES (%s, %s, %s, %s) AS new
+            ON DUPLICATE KEY UPDATE
+                quantity    = shelf.quantity + new.quantity,
+                lastupdated = CURRENT_TIMESTAMP
+            """,
+            (itemid, expirationdate, qty, cost),
         )
 
-        # --- expiration dropdown ---
-        layers = st.session_state[f"layers_{i}"]
-        exp_opts = [f"{l['expirationdate']} (Qty {l['quantity']})" for l in layers]
-        cols[2].selectbox(
-            label=f"exp_{i}",
-            label_visibility="collapsed",
-            options=[""] + exp_opts,
-            key=f"exp_{i}",
+        # 2️⃣ movement log
+        cur.execute(
+            """
+            INSERT INTO shelfentries (itemid, expirationdate, quantity, createdby)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (itemid, expirationdate, qty, created_by),
         )
 
-        exp_date = st.session_state[f"exp_{i}"].split(" ")[0]
-        avail_qty = sum(l["quantity"] for l in layers if str(l["expirationdate"]) == exp_date)
+        if own_cursor:
+            self.conn.commit()
+            cur.close()
 
-        # --- quantity ---
-        cols[3].number_input(
-            label=f"qty_{i}",
-            label_visibility="collapsed",
-            key=f"qty_{i}",
-            min_value=1,
-            max_value=max(avail_qty, 1),
-            value=min(1, avail_qty) or 1,
-            step=1,
-        )
+    # ───────────────────── inventory look-ups ──────────────────────
+    def get_inventory_items(self):
+        query = """
+        SELECT 
+            inv.itemid,
+            i.itemnameenglish AS itemname,
+            inv.quantity,
+            inv.expirationdate,
+            inv.storagelocation,
+            inv.cost_per_unit
+        FROM   inventory inv
+        JOIN   item       i ON inv.itemid = i.itemid
+        WHERE  inv.quantity > 0
+        ORDER  BY i.itemnameenglish, inv.expirationdate;
+        """
+        return self.fetch_data(query)
 
-        # --- location ---
-        current_loc = st.session_state[f"loc_{i}"]
-        loc_choices = [""] + loc_opts if current_loc == "" else loc_opts
-        cols[4].selectbox(
-            label=f"loc_{i}",
-            label_visibility="collapsed",
-            options=loc_choices,
-            key=f"loc_{i}",
-        )
+    # ───────── fast transfer from inventory (one transaction) ──────
+    def transfer_from_inventory(
+        self,
+        itemid: int,
+        expirationdate,
+        quantity: int,
+        cost_per_unit: float,
+        created_by: str,
+    ):
+        """
+        Move one cost layer from Inventory → Shelf inside ONE transaction.
+        """
+        itemid = int(itemid)
+        qty    = int(quantity)
+        cost   = float(cost_per_unit)
 
-    # ── action buttons ───────────────────────────────────────────
-    if "confirm_transfer" not in st.session_state:
-        if st.button("🚚 Transfer All"):
-            errs, batch = _validate_rows(n_rows)
-            if errs:
-                for e in errs:
-                    st.error(e)
-                return
-            st.session_state["pending_transfer"] = batch
-            st.session_state["confirm_transfer"] = True
-            st.rerun()
-    else:
-        batch = st.session_state["pending_transfer"]
-        st.markdown("### Please confirm transfer")
-        for job in batch:
-            st.write(f"• Item **{job['itemid']}** | Qty {job['need']} → Shelf {job['loc']}")
-
-        ok_col, cancel_col = st.columns(2)
-
-        # ---- confirm ----
-        if ok_col.button("✅ Confirm"):
-            user = st.session_state.get("user_email", "Unknown")
-            for job in batch:
-                left = handler.resolve_shortages(
-                    itemid=job["itemid"], qty_need=job["need"], user=user
+        self._ensure_live_conn()
+        with self.conn:                # BEGIN … COMMIT
+            with self.conn.cursor() as cur:
+                # 1. decrement that exact layer in inventory
+                cur.execute(
+                    """
+                    UPDATE inventory
+                    SET    quantity = quantity - %s
+                    WHERE  itemid         = %s
+                      AND  expirationdate = %s
+                      AND  cost_per_unit  = %s
+                      AND  quantity >= %s
+                    """,
+                    (qty, itemid, expirationdate, cost, qty),
                 )
-                remaining = left
-                for layer in sorted(job["layers"], key=lambda l: l["cost_per_unit"]):
-                    if remaining == 0:
-                        break
-                    take = min(remaining, layer["quantity"])
-                    handler.add_to_shelf(
-                        itemid=layer["itemid"],
-                        expirationdate=layer["expirationdate"],
-                        quantity=take,
-                        created_by=user,
-                        cost_per_unit=layer["cost_per_unit"],
-                    )
-                    # decrement inventory done in add_to_shelf call upstream
-                    remaining -= take
+                # 2. upsert into shelf + log entry
+                self.add_to_shelf(
+                    itemid,
+                    expirationdate,
+                    qty,
+                    created_by,
+                    cost,
+                    cur=cur,           # reuse open cursor
+                )
 
-            st.success("✅ Transfer completed.")
-            _clear_transfer_state()
-            st.session_state.pop("confirm_transfer", None)
-            st.session_state.pop("pending_transfer", None)
-            st.rerun()
+    # ───────────────────── alerts / misc helpers ───────────────────
+    def get_low_shelf_stock(self, threshold=10):
+        query = """
+        SELECT 
+            s.itemid,
+            i.itemnameenglish AS itemname,
+            s.quantity,
+            s.expirationdate
+        FROM   shelf s
+        JOIN   item  i ON s.itemid = i.itemid
+        WHERE  s.quantity <= %s
+        ORDER  BY s.quantity ASC;
+        """
+        return self.fetch_data(query, (threshold,))
 
-        # ---- cancel ----
-        if cancel_col.button("❌ Cancel"):
-            _clear_transfer_state()
-            st.session_state.pop("confirm_transfer", None)
-            st.session_state.pop("pending_transfer", None)
-            st.rerun()
+    def get_inventory_by_barcode(self, barcode):
+        query = """
+        SELECT 
+            inv.itemid,
+            i.itemnameenglish AS itemname,
+            inv.quantity,
+            inv.expirationdate,
+            inv.cost_per_unit
+        FROM   inventory inv
+        JOIN   item       i ON inv.itemid = i.itemid
+        WHERE  i.barcode = %s AND inv.quantity > 0
+        ORDER  BY inv.expirationdate;
+        """
+        return self.fetch_data(query, (barcode,))
 
+    # -------------- item master helpers ----------------------------
+    def get_all_items(self):
+        query = """
+        SELECT 
+            itemid,
+            itemnameenglish AS itemname,
+            shelfthreshold,
+            shelfaverage
+        FROM item
+        ORDER BY itemnameenglish;
+        """
+        df = self.fetch_data(query)
+        if not df.empty:
+            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
+        return df
 
-if __name__ == "__main__":
-    transfer_tab()
+    def update_shelf_settings(self, itemid, new_threshold, new_average):
+        query = """
+        UPDATE item
+        SET    shelfthreshold = %s,
+               shelfaverage   = %s
+        WHERE  itemid = %s;
+        """
+        self.execute_command(query, (int(new_threshold), int(new_average), int(itemid)))
+
+    def get_shelf_quantity_by_item(self):
+        query = """
+        SELECT 
+            i.itemid,
+            i.itemnameenglish AS itemname,
+            COALESCE(SUM(s.quantity), 0) AS totalquantity,
+            i.shelfthreshold,
+            i.shelfaverage
+        FROM   item  i
+        LEFT JOIN shelf s ON i.itemid = s.itemid
+        GROUP  BY i.itemid, i.itemnameenglish, i.shelfthreshold, i.shelfaverage
+        ORDER  BY i.itemnameenglish;
+        """
+        df = self.fetch_data(query)
+        if not df.empty:
+            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
+            df["totalquantity"]  = df["totalquantity"].astype(int)
+        return df
+
+    # ───────── shortage resolver (for transfer) ─────────
+    def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
+        """
+        Deduct open shortages for this itemid (FIFO). Returns qty still to place.
+        """
+        rows = self.fetch_data(
+            """
+            SELECT shortageid, shortage_qty
+            FROM   shelf_shortage
+            WHERE  itemid = %s AND resolved = FALSE
+            ORDER  BY logged_at
+            """,
+            (itemid,),
+        )
+
+        remaining = qty_need
+        for r in rows.itertuples():
+            if remaining == 0:
+                break
+            take = min(remaining, int(r.shortage_qty))
+
+            # shrink or resolve the shortage row
+            self.execute_command(
+                """
+                UPDATE shelf_shortage
+                SET    shortage_qty = shortage_qty - %s,
+                       resolved      = (shortage_qty - %s = 0),
+                       resolved_qty  = COALESCE(resolved_qty,0) + %s,
+                       resolved_at   = CASE
+                                         WHEN shortage_qty - %s = 0
+                                         THEN CURRENT_TIMESTAMP
+                                       END,
+                       resolved_by   = %s
+                WHERE  shortageid = %s
+                """,
+                (take, take, take, take, user, r.shortageid),
+            )
+            remaining -= take
+
+        # remove fully-resolved rows
+        self.execute_command("DELETE FROM shelf_shortage WHERE shortage_qty = 0;")
+
+        return remaining
