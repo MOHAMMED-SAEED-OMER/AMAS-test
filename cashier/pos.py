@@ -80,7 +80,7 @@ def display_pos_tab():
         SELECT  holdid,
                 hold_label,
                 created_at,
-                JSON_LENGTH(items) AS lines      -- 🔑 MySQL JSON helper
+                JSON_LENGTH(items) AS line_count   -- safe alias
         FROM    `pos_holds`
         ORDER BY created_at
         """
@@ -89,7 +89,7 @@ def display_pos_tab():
         st.markdown("### ⏸ Held Bills")
         for r in held.itertuples():
             c1, c2, c3 = st.columns([5, 2, 1])
-            c1.write(f"**{r.hold_label}** • {r.lines} items • {r.created_at:%H:%M}")
+            c1.write(f"**{r.hold_label}** • {r.line_count} items • {r.created_at:%H:%M}")
             if c2.button("Resume", key=f"resume_{r.holdid}"):
                 st.session_state.sales_table = cashier_handler.load_hold(r.holdid)
                 cashier_handler.delete_hold(r.holdid)
