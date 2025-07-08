@@ -13,9 +13,18 @@ from db_handler import DatabaseManager
 _db = DatabaseManager()
 DENOMS = [50_000, 25_000, 10_000, 5_000, 1_000, 500, 250]
 
+
+# ───────────────────────── helpers ──────────────────────────
+def _to_plain_datetime(ts) -> datetime:
+    """Convert pandas Timestamp or tz-aware datetime → naïve datetime."""
+    if isinstance(ts, pd.Timestamp):
+        ts = ts.to_pydatetime()
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
+
+
 # ---------- helper SQL functions ----------
-
-
 def get_shift_start(cashier: str):
     # last recorded closure
     df = _db.fetch_data(
@@ -29,7 +38,7 @@ def get_shift_start(cashier: str):
         (cashier,),
     )
     if not df.empty:
-        return df.iat[0, 0]
+        return _to_plain_datetime(df.iat[0, 0])
 
     # otherwise: first sale *today*
     df = _db.fetch_data(
@@ -41,10 +50,13 @@ def get_shift_start(cashier: str):
         """,
         (cashier,),
     )
-    return df.iat[0, 0] if not df.empty else None
+    return _to_plain_datetime(df.iat[0, 0]) if not df.empty else None
 
 
 def get_sales_totals(cashier: str, start, end):
+    start = _to_plain_datetime(start)
+    end = _to_plain_datetime(end)
+
     df = _db.fetch_data(
         """
         SELECT SUM(finalamount) AS system_total,
@@ -59,6 +71,9 @@ def get_sales_totals(cashier: str, start, end):
 
 
 def get_item_summary(cashier: str, start, end) -> pd.DataFrame:
+    start = _to_plain_datetime(start)
+    end = _to_plain_datetime(end)
+
     return _db.fetch_data(
         """
         SELECT  i.itemid                 AS "ID",
@@ -86,6 +101,9 @@ def save_closure(
     system_total,
     notes,
 ):
+    start = _to_plain_datetime(start)
+    end = _to_plain_datetime(end)
+
     _db.execute_command(
         """
         INSERT INTO `cashier_shift_closure` (
@@ -130,8 +148,6 @@ def fetch_last_closure(cashier):
 
 
 # ---------- UI ----------
-
-
 def render():
     st.markdown(
         "<h2 style='color:#1ABC9C;margin-bottom:0.2em'>🧾 Shift Check-Out</h2>",
@@ -148,7 +164,7 @@ def render():
         st.info("No sales recorded for today.")
         st.stop()
 
-    now = datetime.now(tz=timezone.utc)
+    now = _to_plain_datetime(datetime.utcnow())
     system_total, tx_count = get_sales_totals(cashier_email, shift_start, now)
 
     # Overview
