@@ -6,9 +6,9 @@ from db_handler import DatabaseManager
 
 
 class ShelfHandler(DatabaseManager):
-    """All DB helpers for the Selling-Area (front-of-store) shelf."""
+    """DB helpers for the Selling-Area Shelf (inventory that has reached the shop floor)."""
 
-    # ────────────────────────────── live shelf list ──────────────────────────
+    # ─────────────────────────────  current shelf snapshot  ─────────────────────────────
     def get_shelf_items(self) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -27,7 +27,7 @@ class ShelfHandler(DatabaseManager):
             """
         )
 
-    # ────────────────────── most-recent location for an item ─────────────────
+    # ─────────────────────────────  last used location helper  ──────────────────────────
     def last_locid(self, itemid: int) -> str | None:
         df = self.fetch_data(
             """
@@ -39,42 +39,39 @@ class ShelfHandler(DatabaseManager):
             """,
             (itemid,),
         )
-        return None if df.empty else str(df.loc[0, "locid"])
+        return None if df.empty else str(df.iloc[0, 0])
 
-    # ─────────────────────── insert / increment + log row ────────────────────
+    # ─────────────────────────────  upsert → shelf + movement log  ──────────────────────
     def add_to_shelf(
         self,
         *,
         itemid: int,
-        expirationdate,         # DATE / TIMESTAMP
+        expirationdate,
         quantity: int,
         created_by: str,
         cost_per_unit: float,
-        locid: str,             # ← NOT-NULL in schema
+        locid: str,
         cur=None,
-    ) -> None:
+    ):
         """
-        • Adds *quantity* of the cost layer to `shelf` (insert or increment).
-        • Logs the movement in `shelfentries`.
-        • Fills *every* NOT-NULL column so no blank fields are left.
-        """
-        if not locid:
-            raise ValueError("locid must be provided (column is NOT NULL).")
+        Insert or increment a shelf row, **and** log the movement in `shelfentries`.
 
-        own_cursor = False
-        if cur is None:
+        - `locid` is required because the column is NOT NULL in the schema.
+        - If a cursor (`cur`) is supplied this function **does not commit** (so the
+          caller can bundle several operations inside one transaction).  
+          Otherwise it opens its own cursor & commits.
+        """
+        own_cursor = cur is None
+        if own_cursor:
             self._ensure_live_conn()
             cur = self.conn.cursor()
-            own_cursor = True
 
-        # 1️⃣  Upsert / increment shelf row
+        # 1️⃣  upsert / increment shelf
         cur.execute(
             """
-            INSERT INTO shelf
-                  (itemid, expirationdate, quantity,
-                   cost_per_unit, locid, lastupdated)
-            VALUES (%s,     %s,             %s,
-                    %s,            %s,    NOW()) AS new
+            INSERT INTO shelf (itemid, expirationdate, quantity,
+                               cost_per_unit, locid)              -- AS new
+            VALUES (%s, %s, %s, %s, %s) AS new
             ON DUPLICATE KEY UPDATE
                 quantity    = shelf.quantity + new.quantity,
                 lastupdated = CURRENT_TIMESTAMP
@@ -82,21 +79,24 @@ class ShelfHandler(DatabaseManager):
             (itemid, expirationdate, quantity, cost_per_unit, locid),
         )
 
-        # 2️⃣  Movement log – AUTO_INCREMENT + DEFAULT CURRENT_TIMESTAMP
+        # 2️⃣  movement log  (now **includes cost_per_unit** ← FIX)
         cur.execute(
             """
             INSERT INTO shelfentries
-                  (itemid, expirationdate, quantity, createdby, locid)
-            VALUES (%s,     %s,             %s,       %s,        %s)
+                   (itemid, expirationdate, quantity,
+                    cost_per_unit, createdby, locid)
+            VALUES (%s,     %s,             %s,
+                    %s,            %s,       %s)
             """,
-            (itemid, expirationdate, quantity, created_by, locid),
+            (itemid, expirationdate, quantity,
+             cost_per_unit, created_by, locid),
         )
 
         if own_cursor:
             self.conn.commit()
             cur.close()
 
-    # ───────────────────────── inventory helper (barcode) ────────────────────
+    # ─────────────────────────────  inventory helper (barcode)  ─────────────────────────
     def get_inventory_by_barcode(self, barcode: str) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -108,14 +108,13 @@ class ShelfHandler(DatabaseManager):
                 inv.cost_per_unit
             FROM   inventory inv
             JOIN   item       i ON inv.itemid = i.itemid
-            WHERE  i.barcode = %s
-              AND  inv.quantity > 0
+            WHERE  i.barcode = %s AND inv.quantity > 0
             ORDER  BY inv.expirationdate
             """,
             (barcode,),
         )
 
-    # ─────────────────────── shortage resolver (transfer) ───────────────────
+    # ─────────────────────────────  shortage resolver (transfer)  ───────────────────────
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         rows = self.fetch_data(
             """
@@ -135,23 +134,20 @@ class ShelfHandler(DatabaseManager):
                 """
                 UPDATE shelf_shortage
                 SET shortage_qty = shortage_qty - %s,
-                    resolved      = (shortage_qty - %s = 0),
-                    resolved_qty  = COALESCE(resolved_qty,0) + %s,
-                    resolved_at   = CASE
-                                      WHEN shortage_qty - %s = 0
-                                      THEN CURRENT_TIMESTAMP
-                                    END,
-                    resolved_by   = %s
+                    resolved     = (shortage_qty - %s = 0),
+                    resolved_qty = COALESCE(resolved_qty,0) + %s,
+                    resolved_at  = CASE WHEN shortage_qty - %s = 0
+                                        THEN CURRENT_TIMESTAMP END,
+                    resolved_by  = %s
                 WHERE shortageid = %s
                 """,
                 (take, take, take, take, user, r.shortageid),
             )
             remaining -= take
-        # cleanup
         self.execute_command("DELETE FROM shelf_shortage WHERE shortage_qty = 0;")
         return remaining
 
-    # ─────────────────────────── low-stock quick query ───────────────────────
+    # ─────────────────────────────  low-stock quick query  ─────────────────────────────
     def get_low_shelf_stock(self, threshold: int = 10) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -163,12 +159,12 @@ class ShelfHandler(DatabaseManager):
             FROM   shelf s
             JOIN   item  i ON s.itemid = i.itemid
             WHERE  s.quantity <= %s
-            ORDER  BY s.quantity
+            ORDER  BY s.quantity ASC
             """,
             (threshold,),
         )
 
-    # ───────────────────────── master list for manage tab ────────────────────
+    # ─────────────────────────────  master item list (manage tab)  ─────────────────────
     def get_all_items(self) -> pd.DataFrame:
         df = self.fetch_data(
             """
@@ -183,7 +179,7 @@ class ShelfHandler(DatabaseManager):
         )
         if not df.empty:
             df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
-            df["shelfaverage"] = df["shelfaverage"].astype("Int64")
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
         return df
 
     def update_shelf_settings(self, itemid: int, thr: int, avg: int) -> None:
@@ -197,7 +193,7 @@ class ShelfHandler(DatabaseManager):
             (int(thr), int(avg), int(itemid)),
         )
 
-    # ─────────────────────── per-item shelf quantity (alerts) ────────────────
+    # ─────────────────────────────  quantity-by-item for alerts  ───────────────────────
     def get_shelf_quantity_by_item(self) -> pd.DataFrame:
         df = self.fetch_data(
             """
@@ -216,6 +212,6 @@ class ShelfHandler(DatabaseManager):
         )
         if not df.empty:
             df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
-            df["shelfaverage"] = df["shelfaverage"].astype("Int64")
-            df["totalquantity"] = df["totalquantity"].astype(int)
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
+            df["totalquantity"]  = df["totalquantity"].astype(int)
         return df
