@@ -107,10 +107,12 @@ def _load_supplier_po_detail(supplier_id: int) -> pd.DataFrame:
         LEFT JOIN po_totals t ON t.poid = p.poid
         LEFT JOIN po_paid   pa ON pa.poid = p.poid
         WHERE   p.supplierid = %s
-          AND   outstanding <> 0
+          AND   (COALESCE(t.received_value, 0) -
+                 COALESCE(pa.paid_value,    0)) <> 0   -- 👈 filter without alias
         ORDER   BY p.actualdelivery, p.poid
     """
     return fh.fetch_data(sql, (supplier_id, supplier_id))
+
 
 # ─────────────────────────── UI tab ──────────────────────────────
 def supplier_debts_tab():
