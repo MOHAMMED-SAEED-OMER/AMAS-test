@@ -1,18 +1,14 @@
 # item/dropdowns.py
 """
-Manage Dropdown Values tab (stable form-based version).
+Manage Dropdown Values tab (form-based, Streamlit ≥ 1.28).
 
-Why this won’t crash:
-    • No code writes to `st.session_state[widget_key]` after the widget exists.
-    • We wrap add & delete actions in `st.form(..., clear_on_submit=True)`,
-      which clears text-areas / multiselects automatically once the form is
-      successfully submitted.
-    • No need for manual flags, reruns are still used to refresh the list.
+Fixes:
+    • Uses st.rerun() instead of deprecated st.experimental_rerun().
 """
 
 from __future__ import annotations
 
-from typing import List, Any
+from typing import Any, List
 
 import streamlit as st
 from item.item_handler import ItemHandler
@@ -26,6 +22,14 @@ item_handler = ItemHandler()
 def _uniq(values: list[Any]) -> List[str]:
     """Normalise → strip → deduplicate → sorted list."""
     return sorted({str(v).strip() for v in values if str(v).strip()})
+
+
+def _rerun() -> None:
+    """Compatible rerun for both new and old Streamlit versions."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:  # pragma: no cover  – older Streamlit
+        st.experimental_rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,7 +50,6 @@ def manage_dropdowns_tab() -> None:
         "Manufacturer",
         "Brand",
     ]
-
     selected_section = st.selectbox("Select Dropdown Section", sections, key="section")
 
     # ---------------------------------------------------------------------
@@ -59,17 +62,15 @@ def manage_dropdowns_tab() -> None:
     st.divider()
 
     # ---------------------------------------------------------------------
-    # 1️⃣  Bulk ADD (form clears textarea automatically)
+    # 1️⃣  Bulk ADD
     # ---------------------------------------------------------------------
     st.markdown("### ➕ Bulk Add Values")
-
     with st.form(f"add_form_{selected_section}", clear_on_submit=True):
         new_values_str = st.text_area("Enter one value per line")
-        submitted_add  = st.form_submit_button("Add Values")
+        submitted_add = st.form_submit_button("Add Values")
 
         if submitted_add:
             new_values = _uniq(new_values_str.splitlines())
-
             if not new_values:
                 st.error("❌ Please enter at least one value.")
             else:
@@ -86,15 +87,14 @@ def manage_dropdowns_tab() -> None:
                 if skipped:
                     st.warning(f"⚠️ Already existed (skipped): {', '.join(skipped)}")
 
-                st.experimental_rerun()   # refresh list
+                _rerun()  # refresh list
 
     st.divider()
 
     # ---------------------------------------------------------------------
-    # 2️⃣  Bulk DELETE (form clears selection automatically)
+    # 2️⃣  Bulk DELETE
     # ---------------------------------------------------------------------
     st.markdown("### 🗑️ Bulk Delete Values")
-
     with st.form(f"del_form_{selected_section}", clear_on_submit=True):
         values_to_delete = st.multiselect(
             "Select values to delete", options=current_values
@@ -108,4 +108,4 @@ def manage_dropdowns_tab() -> None:
                 for val in values_to_delete:
                     item_handler.delete_dropdown_value(selected_section, val)
                 st.success(f"✅ Deleted: {', '.join(values_to_delete)}")
-                st.experimental_rerun()   # refresh list
+                _rerun()  # refresh list
