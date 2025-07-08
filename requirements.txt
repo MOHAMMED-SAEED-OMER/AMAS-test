@@ -20,4 +20,3 @@ pytest>=7.0
 streamlit-autorefresh          # NEW utility (no pin)
 
 # (psycopg2-binary removed – Postgres no longer used)
-pyarrow>=16.0,<17
