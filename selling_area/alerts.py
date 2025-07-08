@@ -1,4 +1,4 @@
-# selling_area/alerts.py  – shelf alerts (stable)
+# selling_area/alerts.py  – shelf alerts (crash-safe)
 from __future__ import annotations
 
 from datetime import date
@@ -22,7 +22,7 @@ def alerts_tab() -> None:
     st.title("📢 Shelf Alerts")
     tab1, tab2 = st.tabs(["⚠️ Low Stock Items", "⏰ Near Expiry Items"])
 
-    # ── TAB 1 : Low stock ──────────────────────────────────────────
+    # ── TAB 1 : Low stock ───────────────────────────────────────────
     with tab1:
         st.subheader("🚨 Global Low Stock Alerts")
         thr = st.number_input("🔢 Global Low Stock Threshold", 1, value=10)
@@ -70,7 +70,6 @@ def alerts_tab() -> None:
         if shelf_df.empty:
             st.info("No items in the selling area.")
             return
-
         if "expirationdate" not in shelf_df.columns:
             st.error("Column 'expirationdate' missing from shelf query.")
             return
@@ -84,7 +83,7 @@ def alerts_tab() -> None:
 
         sub_days, sub_frac = st.tabs(["📅 Days-Based", "📐 Shelf-Life %"])
 
-        # ── days-based view ────────────────────────────────────────
+        # ---- Days-based view ----
         with sub_days:
             c1, c2, c3 = st.columns(3)
             red, orange, green = (
@@ -103,7 +102,7 @@ def alerts_tab() -> None:
                     use_container_width=True, hide_index=True,
                 )
 
-        # ── fraction-based view ────────────────────────────────────
+        # ---- Fraction-based view ----
         with sub_frac:
             c1, c2, c3 = st.columns(3)
             red_f  = c1.number_input("🔴 red ≤ fraction", 0.0, 1.0, 0.20, 0.05, format="%.2f")
@@ -129,6 +128,6 @@ def alerts_tab() -> None:
                         use_container_width=True, hide_index=True,
                     )
 
-# manual
+# manual run
 if __name__ == "__main__":
     alerts_tab()
