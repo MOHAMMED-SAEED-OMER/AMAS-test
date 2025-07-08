@@ -13,13 +13,28 @@ class ItemHandler(DatabaseManager):
         if df.empty:
             return pd.DataFrame(
                 columns=[
-                    "itemid", "itemnameenglish", "itemnamekurdish",
-                    "classcat", "departmentcat", "sectioncat", "familycat",
-                    "subfamilycat", "shelflife", "threshold",
-                    "averagerequired", "origincountry", "manufacturer",
-                    "brand", "barcode", "packetbarcode", "cartonbarcode",
-                    "unittype", "packaging", "itempicture",
-                    "createdat", "updatedat",
+                    "itemid",
+                    "itemnameenglish",
+                    "itemnamekurdish",
+                    "classcat",
+                    "departmentcat",
+                    "sectioncat",
+                    "familycat",
+                    "subfamilycat",
+                    "shelflife",
+                    "threshold",
+                    "averagerequired",
+                    "origincountry",
+                    "manufacturer",
+                    "brand",
+                    "barcode",
+                    "packetbarcode",
+                    "cartonbarcode",
+                    "unittype",
+                    "packaging",
+                    "itempicture",
+                    "createdat",
+                    "updatedat",
                 ]
             )
         return df
@@ -40,11 +55,11 @@ class ItemHandler(DatabaseManager):
     def add_item(self, item_data: dict, supplier_ids: list[int]) -> int | None:
         """
         Insert a new item (prepared statement for safe BLOB handling),
-        then link suppliers. Returns new itemid or None.
+        then link suppliers.  Returns new itemid or None.
         """
         cols = ", ".join(item_data.keys())
-        ph   = ", ".join(["%s"] * len(item_data))
-        sql  = (
+        ph = ", ".join(["%s"] * len(item_data))
+        sql = (
             f"INSERT INTO `item` ({cols}, createdat, updatedat) "
             f"VALUES ({ph}, NOW(), NOW())"
         )
@@ -56,7 +71,7 @@ class ItemHandler(DatabaseManager):
             cur.execute(sql, list(item_data.values()))
 
         # 2️⃣  fetch the new AUTO_INCREMENT id reliably
-        with self.conn.cursor() as cur2:               # regular cursor ok here
+        with self.conn.cursor() as cur2:  # regular cursor ok here
             cur2.execute("SELECT LAST_INSERT_ID()")
             item_id = cur2.fetchone()[0]
 
@@ -91,9 +106,7 @@ class ItemHandler(DatabaseManager):
             st.warning("⚠️ No changes made.")
             return
         set_clause = ", ".join(f"{k} = %s" for k in updated_data)
-        sql = (
-            f"UPDATE `item` SET {set_clause}, updatedat = NOW() WHERE itemid = %s"
-        )
+        sql = f"UPDATE `item` SET {set_clause}, updatedat = NOW() WHERE itemid = %s"
         params = list(updated_data.values()) + [item_id]
 
         self._ensure_live_conn()
@@ -110,9 +123,7 @@ class ItemHandler(DatabaseManager):
             raise ValueError(
                 f"Cannot delete item {itemid}: still referenced by {', '.join(conflicts)}"
             )
-        self.execute_command(
-            "DELETE FROM `itemsupplier` WHERE itemid = %s", (itemid,)
-        )
+        self.execute_command("DELETE FROM `itemsupplier` WHERE itemid = %s", (itemid,))
         self.execute_command("DELETE FROM `item` WHERE itemid = %s", (itemid,))
 
     # ───────────── picture helpers (Add Pictures tab) ──────────────
@@ -120,9 +131,10 @@ class ItemHandler(DatabaseManager):
         return self.fetch_data(
             """
             SELECT itemid, itemnameenglish
-            FROM   `item`
-            WHERE  itempicture IS NULL OR LENGTH(itempicture) = 0
-            ORDER  BY itemnameenglish
+              FROM `item`
+             WHERE itempicture IS NULL
+                OR LENGTH(itempicture) = 0
+             ORDER BY itemnameenglish
             """
         )
 
@@ -139,20 +151,46 @@ class ItemHandler(DatabaseManager):
         self.conn.commit()
 
     # ───────────────────── Dropdown utilities ──────────────────────
+    @st.cache_data(ttl=180, show_spinner=False)
     def get_dropdown_values(self, section: str) -> list[str]:
+        """Return cached list of dropdown values for a section (3-min TTL)."""
         df = self.fetch_data(
-            "SELECT value FROM `dropdowns` WHERE section = %s ORDER BY value", (section,)
+            "SELECT value FROM `dropdowns` WHERE section = %s ORDER BY value",
+            (section,),
         )
         return df["value"].tolist() if not df.empty else []
 
-    def add_dropdown_value(self, section: str, value: str) -> None:
-        self.execute_command(
-            "INSERT IGNORE INTO `dropdowns` (section, value) VALUES (%s, %s)",
-            (section, value),
-        )
+    def add_dropdown_value(self, section: str, value: str) -> int | None:
+        """
+        Insert a dropdown value and return its id.
+
+        • Lets MySQL auto-generate `id` by omitting the column entirely.
+        • Uses INSERT IGNORE so duplicates don’t raise.
+        • If the row already existed we fetch its current id.
+        """
+        self._ensure_live_conn()
+        with self.conn.cursor(prepared=True) as cur:
+            cur.execute(
+                "INSERT IGNORE INTO `dropdowns` (section, value) VALUES (%s, %s)",
+                (section, value),
+            )
+            self.conn.commit()
+
+            if cur.rowcount:  # 1 = inserted, 0 = duplicate skipped
+                return cur.lastrowid
+
+            # Duplicate → look up existing id
+            cur.execute(
+                "SELECT id FROM `dropdowns` WHERE section = %s AND value = %s",
+                (section, value),
+            )
+            row = cur.fetchone()
+            return int(row[0]) if row else None
 
     def delete_dropdown_value(self, section: str, value: str) -> None:
         self.execute_command(
             "DELETE FROM `dropdowns` WHERE section = %s AND value = %s",
             (section, value),
         )
+        # invalidate cache so UI refreshes immediately
+        self.get_dropdown_values.clear()  # type: ignore[attr-defined]
