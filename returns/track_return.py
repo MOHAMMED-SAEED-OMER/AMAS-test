@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 
 from returns.return_handler   import ReturnHandler
-from finance.finance_handler  import FinanceHandler      # payment/allocation
+from finance.finance_handler  import FinanceHandler
 
 rh  = ReturnHandler()
 fin = FinanceHandler()
@@ -11,8 +11,13 @@ fin = FinanceHandler()
 # ────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────
+def _scalar(val):
+    """Return a plain scalar even when `val` is a Series with duplicates."""
+    if isinstance(val, pd.Series):
+        return val.iloc[0]
+    return val
+
 def _deduct_inventory(ret_id: int) -> None:
-    """Subtract returned quantity from inventory (batch aware)."""
     lines = rh.get_return_items(ret_id)
     for _, ln in lines.iterrows():
         if pd.isna(ln["expirationdate"]):
@@ -24,38 +29,24 @@ def _deduct_inventory(ret_id: int) -> None:
         )
 
 def _allocate_credit_payment(ret_id: int, header: pd.Series) -> None:
-    """
-    • Insert a row in *supplierpayments* (method='Return Credit')
-    • Insert rows in *popayments*           (strict PO links first,
-                                             remainder oldest-unpaid)
-    """
-    # 1️⃣ create supplierpayments header
     pay_id = fin.create_supplier_payment(
         supplier_id  = int(header["supplierid"]),
-        payment_date = header["approvedate"],
+        payment_date = _scalar(header["approvedate"]),
         amount       = float(header["totalreturncost"]),
         method       = "Return Credit",
         notes        = f"Return #{ret_id}",
     )
 
-    # 2️⃣ get strict PO allocations (i.e. POID was set on return lines)
-    strict_lines = rh.get_return_items(ret_id)
-    strict_lines = strict_lines.dropna(subset=["poid"])
-    strict_tot   = (
-        strict_lines.groupby("poid")["totalcost"]
-        .sum()
-        .reset_index()
-    )
+    strict_lines = rh.get_return_items(ret_id).dropna(subset=["poid"])
+    strict_tot   = strict_lines.groupby("poid")["totalcost"].sum().reset_index()
 
     allocated   = 0.0
     outstanding = fin.get_outstanding_pos_by_supplier(int(header["supplierid"]))
 
-    # helper → how much still owed on a PO *right now*
     def _owed(poid: int) -> float:
         row = outstanding.loc[outstanding["poid"] == poid]
         return float(row["outstanding_amount"].iloc[0]) if not row.empty else 0.0
 
-    # 2-a) apply strict allocations exactly
     for _, row in strict_tot.iterrows():
         poid  = int(row["poid"])
         alloc = float(row["totalcost"])
@@ -63,25 +54,21 @@ def _allocate_credit_payment(ret_id: int, header: pd.Series) -> None:
         fin.allocate_payment(pay_id, poid, alloc, status, return_id=ret_id)
         allocated += alloc
 
-    # 3️⃣ auto-allocate any remaining credit
     remaining = float(header["totalreturncost"]) - allocated
     if remaining <= 0.009:
         return
 
-    # identify whichever date column we got back from the DB
     candidate_cols = ["order_date", "orderdate", "orderDate"]
     sort_col       = next((c for c in candidate_cols if c in outstanding.columns), None)
     iterable_df    = outstanding if sort_col is None else outstanding.sort_values(sort_col)
 
     for _, po in iterable_df.iterrows():
         poid = int(po["poid"])
-        if poid in strict_tot["poid"].tolist():        # skip already-allocated strict POs
+        if poid in strict_tot["poid"].tolist():
             continue
-
         owe = float(po["outstanding_amount"])
         if owe <= 0.009:
             continue
-
         alloc  = min(remaining, owe)
         status = "Full" if alloc == owe else "Partial"
         fin.allocate_payment(pay_id, poid, alloc, status, return_id=ret_id)
@@ -93,7 +80,6 @@ def _allocate_credit_payment(ret_id: int, header: pd.Series) -> None:
 # Approve / Reject actions
 # ────────────────────────────────────────────────────────────────
 def _approve_return(ret_id: int, credit_note: str, user_email: str):
-    """Mark as approved, deduct inventory, create credit payment."""
     rh.execute_command(
         """
         UPDATE supplierreturns
@@ -105,7 +91,6 @@ def _approve_return(ret_id: int, credit_note: str, user_email: str):
         """,
         (credit_note, user_email, ret_id),
     )
-
     header = rh.get_return_header(ret_id).iloc[0]
     _deduct_inventory(ret_id)
     _allocate_credit_payment(ret_id, header)
@@ -133,7 +118,6 @@ def track_returns_tab() -> None:
         st.info("No returns recorded yet.")
         return
 
-    # ----- filters ----------------------------------------------------
     suppliers = ["All"] + sorted(df["suppliername"].unique())
     f_sup = st.selectbox("Supplier", suppliers)
     if f_sup != "All":
@@ -149,7 +133,6 @@ def track_returns_tab() -> None:
         & (df["createddate"].dt.date <= f_end)
     ]
 
-    # ----- summary grid ----------------------------------------------
     st.dataframe(
         df.rename(
             columns={
@@ -165,7 +148,6 @@ def track_returns_tab() -> None:
     )
     st.markdown("---")
 
-    # ----- drill-down -------------------------------------------------
     sel = st.selectbox(
         "Choose a return",
         df["returnid"].astype(str),
@@ -178,16 +160,19 @@ def track_returns_tab() -> None:
     header = rh.get_return_header(ret_id).iloc[0]
     lines  = rh.get_return_items(ret_id)
 
+    created_dt  = _scalar(header["createddate"])
+    approved_dt = _scalar(header.get("approvedate"))
+    approved_by = _scalar(header.get("approvedby"))
+
     st.subheader(f"Return #{ret_id} – {header['returnstatus']}")
     st.write(f"**Supplier ID:** {header['supplierid']}")
-    st.write(f"**Created:** {header['createddate']}")
+    st.write(f"**Created:** {created_dt}")
     st.write(f"**Total Cost:** {header['totalreturncost']:.2f}")
     st.write(f"**Credit-note:** {header.get('creditnote') or '—'}")
     st.write(f"**Notes:** {header.get('notes') or '—'}")
-    if pd.notna(header["approvedate"]):
-        st.write(f"**Approved:** {header['approvedate']} by {header.get('approvedby','–')}")
+    if pd.notna(approved_dt):
+        st.write(f"**Approved:** {approved_dt} by {approved_by or '–'}")
 
-    # line-items table
     st.markdown("#### Items")
     st.dataframe(
         lines[
@@ -203,21 +188,20 @@ def track_returns_tab() -> None:
             ]
         ].rename(
             columns={
-                "itemid":        "Item",
-                "itemnameenglish": "Name",
-                "quantity":      "Qty",
-                "itemprice":     "Unit",
-                "totalcost":     "Total",
-                "expirationdate":"Expiry",
-                "poid":          "PO",
-                "reason":        "Reason",
+                "itemid":         "Item",
+                "itemnameenglish":"Name",
+                "quantity":       "Qty",
+                "itemprice":      "Unit",
+                "totalcost":      "Total",
+                "expirationdate": "Expiry",
+                "poid":           "PO",
+                "reason":         "Reason",
             }
         ),
         hide_index=True,
         use_container_width=True,
     )
 
-    # action buttons when pending
     if header["returnstatus"] == "Pending Approval":
         st.markdown("### Action")
         credit_note = st.text_input("Supplier credit-note # (required)")
