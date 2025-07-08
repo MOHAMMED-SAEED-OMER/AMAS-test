@@ -6,25 +6,26 @@ from db_handler import DatabaseManager
 class ShelfHandler(DatabaseManager):
     """Handles DB operations for the Selling-Area shelf."""
 
-    # ───────────── current shelf contents ────────────────────────
+    # ─────────── current shelf contents ────────────────────────────
     def get_shelf_items(self):
-        query = """
-        SELECT
-            s.shelfid,
-            s.itemid,
-            i.itemnameenglish AS itemname,
-            s.quantity,
-            s.expirationdate,
-            s.cost_per_unit,
-            s.locid,
-            s.lastupdated
-        FROM   shelf s
-        JOIN   item  i ON s.itemid = i.itemid
-        ORDER  BY i.itemnameenglish, s.expirationdate
-        """
-        return self.fetch_data(query)
+        return self.fetch_data(
+            """
+            SELECT
+                s.shelfid,
+                s.itemid,
+                i.itemnameenglish AS itemname,
+                s.quantity,
+                s.expirationdate,
+                s.cost_per_unit,
+                s.locid,
+                s.lastupdated
+            FROM   shelf s
+            JOIN   item  i ON s.itemid = i.itemid
+            ORDER  BY i.itemnameenglish, s.expirationdate
+            """
+        )
 
-    # ───────────── most-recent location helper ───────────────────
+    # ─────────── recent shelf location (for transfer UX) ───────────
     def last_locid(self, itemid: int) -> str | None:
         df = self.fetch_data(
             """
@@ -38,7 +39,7 @@ class ShelfHandler(DatabaseManager):
         )
         return None if df.empty else str(df.iloc[0, 0])
 
-    # ───────────── insert / increment shelf row ──────────────────
+    # ─────────── insert / increment shelf row + log ────────────────
     def add_to_shelf(
         self,
         *,
@@ -56,7 +57,6 @@ class ShelfHandler(DatabaseManager):
             cur = self.conn.cursor()
             own = True
 
-        # 1️⃣ upsert shelf
         cur.execute(
             """
             INSERT INTO shelf (itemid, expirationdate, quantity, cost_per_unit, locid)
@@ -67,8 +67,6 @@ class ShelfHandler(DatabaseManager):
             """,
             (itemid, expirationdate, quantity, cost_per_unit, locid),
         )
-
-        # 2️⃣ movement log
         cur.execute(
             """
             INSERT INTO shelfentries
@@ -82,7 +80,7 @@ class ShelfHandler(DatabaseManager):
             self.conn.commit()
             cur.close()
 
-    # ───────────── inventory look-ups / transfer helpers ─────────
+    # ─────────── inventory helper used by transfer tab ─────────────
     def get_inventory_by_barcode(self, barcode):
         return self.fetch_data(
             """
@@ -100,6 +98,7 @@ class ShelfHandler(DatabaseManager):
             (barcode,),
         )
 
+    # ─────────── shortage resolver (transfer) ──────────────────────
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         rows = self.fetch_data(
             """
@@ -132,7 +131,7 @@ class ShelfHandler(DatabaseManager):
         self.execute_command("DELETE FROM shelf_shortage WHERE shortage_qty = 0;")
         return remaining
 
-    # ───────────── low-stock & thresholds (unchanged) ────────────
+    # ─────────── low-stock quick query ─────────────────────────────
     def get_low_shelf_stock(self, threshold=10):
         return self.fetch_data(
             """
@@ -149,6 +148,25 @@ class ShelfHandler(DatabaseManager):
             (threshold,),
         )
 
+    # ─────────── master item list for manage tab ──────────────────
+    def get_all_items(self) -> pd.DataFrame:
+        df = self.fetch_data(
+            """
+            SELECT
+                itemid,
+                itemnameenglish AS itemname,
+                shelfthreshold,
+                shelfaverage
+            FROM   item
+            ORDER  BY itemnameenglish
+            """
+        )
+        if not df.empty:
+            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
+        return df
+
+    # ─────────── quantity-by-item for alerts tab ──────────────────
     def get_shelf_quantity_by_item(self):
         df = self.fetch_data(
             """
@@ -169,5 +187,3 @@ class ShelfHandler(DatabaseManager):
             df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
             df["totalquantity"]  = df["totalquantity"].astype(int)
         return df
-
-    # (any other helper methods you had below can remain)
