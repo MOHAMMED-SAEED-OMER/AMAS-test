@@ -23,7 +23,7 @@ class ShelfHandler(DatabaseManager):
         """
         return self.fetch_data(query)
 
-    # ─────────────────────── add / update shelf (single call) ──────────────────
+    # ───────────────── add / update shelf (+ log) ───────────────────
     def add_to_shelf(
         self,
         itemid: int,
@@ -31,12 +31,13 @@ class ShelfHandler(DatabaseManager):
         quantity: int,
         created_by: str,
         cost_per_unit: float,
-        cur=None  # ← optional open cursor for transaction use
+        cur=None,          # optional open cursor for transaction use
     ):
         """
-        Upserts into Shelf and logs to ShelfEntries.
-        If `cur` is supplied, uses that cursor (no commit); otherwise
-        opens its own cursor/commit for backward compatibility.
+        Upserts (insert or increment) a shelf row and logs the move.
+        Works on MySQL 8.0+ using ON DUPLICATE KEY UPDATE.
+        The UNIQUE or PRIMARY KEY on `shelf` must include
+        (itemid, expirationdate, cost_per_unit).
         """
         own_cursor = False
         if cur is None:
@@ -44,36 +45,36 @@ class ShelfHandler(DatabaseManager):
             cur = self.conn.cursor()
             own_cursor = True
 
-        itemid_py   = int(itemid)
-        qty_py      = int(quantity)
-        cost_py     = float(cost_per_unit)
+        itemid = int(itemid)
+        qty    = int(quantity)
+        cost   = float(cost_per_unit)
 
-        # Upsert shelf row (unique on item+expiry+cost)
+        # 1️⃣ upsert / increment shelf
         cur.execute(
             """
             INSERT INTO shelf (itemid, expirationdate, quantity, cost_per_unit)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (itemid, expirationdate, cost_per_unit)
-            DO UPDATE SET quantity    = shelf.quantity + EXCLUDED.quantity,
-                          lastupdated = CURRENT_TIMESTAMP;
+            VALUES (%s, %s, %s, %s) AS new
+            ON DUPLICATE KEY UPDATE
+                quantity    = shelf.quantity + new.quantity,
+                lastupdated = CURRENT_TIMESTAMP
             """,
-            (itemid_py, expirationdate, qty_py, cost_py),
+            (itemid, expirationdate, qty, cost),
         )
 
-        # Movement log
+        # 2️⃣ movement log
         cur.execute(
             """
             INSERT INTO shelfentries (itemid, expirationdate, quantity, createdby)
-            VALUES (%s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s)
             """,
-            (itemid_py, expirationdate, qty_py, created_by),
+            (itemid, expirationdate, qty, created_by),
         )
 
         if own_cursor:
             self.conn.commit()
             cur.close()
 
-    # ───────────────────── inventory look-ups ───────────────────────
+    # ───────────────────── inventory look-ups ──────────────────────
     def get_inventory_items(self):
         query = """
         SELECT 
@@ -90,7 +91,7 @@ class ShelfHandler(DatabaseManager):
         """
         return self.fetch_data(query)
 
-    # ───────────────────── fast transfer from inventory ─────────────
+    # ───────── fast transfer from inventory (one transaction) ──────
     def transfer_from_inventory(
         self,
         itemid: int,
@@ -100,18 +101,16 @@ class ShelfHandler(DatabaseManager):
         created_by: str,
     ):
         """
-        Moves a specific cost layer (item + expiry + cost) 
-        from Inventory → Shelf in ONE transaction (one commit).
+        Move one cost layer from Inventory → Shelf inside ONE transaction.
         """
-        itemid_py   = int(itemid)
-        qty_py      = int(quantity)
-        cost_py     = float(cost_per_unit)
+        itemid = int(itemid)
+        qty    = int(quantity)
+        cost   = float(cost_per_unit)
 
         self._ensure_live_conn()
-        # one BEGIN / COMMIT block
-        with self.conn:
+        with self.conn:                # BEGIN … COMMIT
             with self.conn.cursor() as cur:
-                # 1. Decrement that exact layer in inventory
+                # 1. decrement that exact layer in inventory
                 cur.execute(
                     """
                     UPDATE inventory
@@ -119,22 +118,21 @@ class ShelfHandler(DatabaseManager):
                     WHERE  itemid         = %s
                       AND  expirationdate = %s
                       AND  cost_per_unit  = %s
-                      AND  quantity >= %s;
+                      AND  quantity >= %s
                     """,
-                    (qty_py, itemid_py, expirationdate, cost_py, qty_py),
+                    (qty, itemid, expirationdate, cost, qty),
                 )
-
-                # 2. Upsert into shelf + log entry (reuse same cursor, no extra commit)
+                # 2. upsert into shelf + log entry
                 self.add_to_shelf(
-                    itemid_py,
+                    itemid,
                     expirationdate,
-                    qty_py,
+                    qty,
                     created_by,
-                    cost_py,
-                    cur=cur,          # ← use existing cursor
+                    cost,
+                    cur=cur,           # reuse open cursor
                 )
 
-    # ───────────────────── alerts / misc helpers ────────────────────
+    # ───────────────────── alerts / misc helpers ───────────────────
     def get_low_shelf_stock(self, threshold=10):
         query = """
         SELECT 
@@ -164,7 +162,7 @@ class ShelfHandler(DatabaseManager):
         """
         return self.fetch_data(query, (barcode,))
 
-    # -------------- item master helpers (unchanged) -----------------
+    # -------------- item master helpers ----------------------------
     def get_all_items(self):
         query = """
         SELECT 
@@ -210,11 +208,10 @@ class ShelfHandler(DatabaseManager):
             df["totalquantity"]  = df["totalquantity"].astype(int)
         return df
 
-# ───────── shortage resolver (transfer side) ─────────
+    # ───────── shortage resolver (for transfer) ─────────
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         """
-        Consume open shortages for this itemid (oldest first).
-        Returns the qty still left to put on shelf.
+        Deduct open shortages for this itemid (FIFO). Returns qty still to place.
         """
         rows = self.fetch_data(
             """
@@ -250,7 +247,7 @@ class ShelfHandler(DatabaseManager):
             )
             remaining -= take
 
-        # optional tidy-up of zero rows
+        # remove fully-resolved rows
         self.execute_command("DELETE FROM shelf_shortage WHERE shortage_qty = 0;")
 
         return remaining
