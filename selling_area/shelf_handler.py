@@ -1,216 +1,221 @@
-# selling_area/transfer.py  – barcode ➜ shelf transfer (stable, v3)
+# selling_area/shelf_handler.py
+"""
+Database helpers for the Selling-Area Shelf.
+(Stand-alone – no Streamlit imports, no self-import.)
+"""
 from __future__ import annotations
 
-from typing import List, Dict, Any
-
-import streamlit as st
 import pandas as pd
 
-from selling_area.shelf_handler import ShelfHandler
+from db_handler import DatabaseManager
 
-__all__ = ["transfer_tab"]
 
-handler = ShelfHandler()
+class ShelfHandler(DatabaseManager):
+    """All DB operations for the ‘shelf’ and related tables."""
 
-# ───────────────────────── cache helpers ──────────────────────────
-@st.cache_data(ttl=60, show_spinner=False)
-def layers_for_barcode(bc: str) -> List[Dict[str, Any]]:
-    """Return inventory cost-layers for a barcode as plain dictionaries."""
-    return handler.get_inventory_by_barcode(bc).to_dict("records")
-
-@st.cache_data(ttl=300, show_spinner=False)
-def all_locids() -> List[str]:
-    df = handler.fetch_data("SELECT locid FROM shelf_map_locations ORDER BY locid")
-    return df.loc[:, "locid"].tolist() if not df.empty else []
-
-# ───────────────────────── state helpers ──────────────────────────
-def _init_row(i: int) -> None:
-    """Create per-row keys the first time we reference them."""
-    defaults = {
-        f"bc_{i}": "",
-        f"name_{i}": "",
-        f"exp_{i}": "",
-        f"qty_{i}": 0,
-        f"loc_{i}": "",
-        f"layers_{i}": [],
-        f"_prevbc_{i}": "",
-    }
-    for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
-
-def _clear_transfer_state() -> None:
-    """Purge all row keys + cached look-ups when job is done / cancelled."""
-    for k in list(st.session_state.keys()):
-        if k.startswith(("bc_", "name_", "exp_", "qty_", "loc_", "layers_", "_prevbc_")):
-            del st.session_state[k]
-    layers_for_barcode.clear()
-
-# ───────────────────────── validation helper ──────────────────────
-def _validate_rows(n_rows: int):
-    errors: list[str] = []
-    batch: list[Dict[str, Any]] = []
-
-    for i in range(n_rows):
-        bc   = st.session_state[f"bc_{i}"].strip()
-        exp  = st.session_state[f"exp_{i}"].split(" ")[0]
-        qty  = int(st.session_state[f"qty_{i}"])
-        loc  = st.session_state[f"loc_{i}"].strip()
-        rows = st.session_state[f"layers_{i}"]
-
-        if not bc:
-            errors.append(f"Line {i+1}: barcode missing.")
-            continue
-        if not exp:
-            errors.append(f"Line {i+1}: expiration missing.")
-            continue
-        if not loc:
-            errors.append(f"Line {i+1}: location missing.")
-            continue
-
-        sel_layers = [r for r in rows if str(r["expirationdate"]) == exp]
-        stock      = sum(r["quantity"] for r in sel_layers)
-        if qty > stock:
-            errors.append(f"Line {i+1}: only {stock} available.")
-            continue
-
-        batch.append(
-            {
-                "itemid": sel_layers[0]["itemid"],
-                "need":   qty,
-                "loc":    loc,
-                "layers": sel_layers,
-            }
+    # ─────────────────── current shelf contents ───────────────────
+    def get_shelf_items(self) -> pd.DataFrame:
+        return self.fetch_data(
+            """
+            SELECT
+                s.shelfid,
+                s.itemid,
+                i.itemnameenglish AS itemname,
+                s.quantity,
+                s.expirationdate,
+                s.cost_per_unit,
+                s.locid,
+                s.lastupdated
+            FROM   shelf s
+            JOIN   item  i ON s.itemid = i.itemid
+            ORDER  BY i.itemnameenglish, s.expirationdate
+            """
         )
-    return errors, batch
 
-# ───────────────────────── UI fragment (one grid row) ─────────────
-def _draw_rows(n: int, loc_opts: List[str]) -> None:
-    header = st.columns(5, gap="small")
-    for col, title in zip(
-        header,
-        ["**Barcode**", "**Item Name**", "**Expiration**", "**Qty**", "**Location**"],
+    # ─────────────────── most-recent shelf location ───────────────
+    def last_locid(self, itemid: int) -> str | None:
+        df = self.fetch_data(
+            """
+            SELECT locid
+              FROM shelfentries
+             WHERE itemid = %s
+               AND locid  IS NOT NULL
+          ORDER BY entrydate DESC
+             LIMIT 1
+            """,
+            (itemid,),
+        )
+        return None if df.empty else str(df.iloc[0, 0])
+
+    # ─────────────────── upsert shelf row (+ log) ─────────────────
+    def add_to_shelf(
+        self,
+        *,
+        itemid: int,
+        expirationdate,
+        quantity: int,
+        created_by: str,
+        cost_per_unit: float,
+        locid: str,
+        cur=None,
     ):
-        col.markdown(title)
+        """
+        Insert or increment a shelf row; mirror entry in *shelfentries*.
+        `locid` is mandatory (column defined NOT NULL).
+        """
+        own_cur = False
+        if cur is None:
+            self._ensure_live_conn()
+            cur, own_cur = self.conn.cursor(), True
 
-    for i in range(n):
-        _init_row(i)
-        cols = st.columns(5, gap="small")
-
-        # --- BARCODE ---------------------------------------------------
-        bc_inp = cols[0].text_input(
-            key=f"bc_{i}", label=f"Barcode {i}", label_visibility="collapsed"
-        ).strip()
-
-        if bc_inp and bc_inp != st.session_state[f"_prevbc_{i}"]:
-            layers = layers_for_barcode(bc_inp)
-            st.session_state[f"layers_{i}"] = layers
-            st.session_state[f"name_{i}"]   = layers[0]["itemname"] if layers else ""
-            st.session_state[f"exp_{i}"]    = ""
-            if layers and st.session_state[f"loc_{i}"] == "":
-                st.session_state[f"loc_{i}"] = handler.last_locid(layers[0]["itemid"]) or ""
-            st.session_state[f"_prevbc_{i}"] = bc_inp
-            # qty default = total available of first cost layer
-            st.session_state[f"qty_{i}"] = layers[0]["quantity"] if layers else 0
-
-        # --- ITEM NAME (read-only) -------------------------------------
-        cols[1].text_input(
-            key=f"name_{i}", label=f"Name {i}",
-            disabled=True, label_visibility="collapsed"
+        cur.execute(
+            """
+            INSERT INTO shelf (itemid, expirationdate, quantity,
+                               cost_per_unit, locid)            -- AS new
+            VALUES (%s, %s, %s, %s, %s) AS new
+            ON DUPLICATE KEY UPDATE
+                quantity    = shelf.quantity + new.quantity,
+                lastupdated = CURRENT_TIMESTAMP
+            """,
+            (itemid, expirationdate, quantity, cost_per_unit, locid),
         )
 
-        # --- EXPIRATION ------------------------------------------------
-        layers = st.session_state[f"layers_{i}"]
-        exp_opts = [f"{r['expirationdate']} (Qty {r['quantity']})" for r in layers]
-        exp_sel  = cols[2].selectbox(
-            key=f"exp_{i}", label=f"Exp {i}",
-            options=[""] + exp_opts, label_visibility="collapsed"
+        cur.execute(
+            """
+            INSERT INTO shelfentries
+                   (itemid, expirationdate, quantity, createdby, locid)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (itemid, expirationdate, quantity, created_by, locid),
         )
 
-        # --- QTY --------------------------------------------------------
-        exp_date    = exp_sel.split(" ")[0] if exp_sel else ""
-        avail_total = sum(r["quantity"] for r in layers if str(r["expirationdate"]) == exp_date)
-        current_val = st.session_state[f"qty_{i}"] or 1
+        if own_cur:
+            self.conn.commit()
+            cur.close()
 
-        cols[3].number_input(
-            key=f"qty_{i}", label=f"Qty {i}",
-            min_value=1, max_value=max(avail_total, 1),
-            value=min(current_val, max(avail_total, 1)),
-            step=1, label_visibility="collapsed"
+    # ─────────────────── inventory helper (barcode) ───────────────
+    def get_inventory_by_barcode(self, barcode: str) -> pd.DataFrame:
+        return self.fetch_data(
+            """
+            SELECT
+                inv.itemid,
+                i.itemnameenglish AS itemname,
+                inv.quantity,
+                inv.expirationdate,
+                inv.cost_per_unit
+            FROM   inventory inv
+            JOIN   item       i ON inv.itemid = i.itemid
+            WHERE  i.barcode = %s
+              AND  inv.quantity > 0
+            ORDER  BY inv.expirationdate
+            """,
+            (barcode,),
         )
 
-        # --- LOCATION ---------------------------------------------------
-        current_loc = st.session_state[f"loc_{i}"]
-        loc_options = [""] + loc_opts if current_loc == "" else loc_opts
-        cols[4].selectbox(
-            key=f"loc_{i}", label=f"Loc {i}",
-            options=loc_options, label_visibility="collapsed"
+    # ─────────────────── shortage resolver (transfer) ─────────────
+    def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
+        rows = self.fetch_data(
+            """
+            SELECT shortageid, shortage_qty
+              FROM shelf_shortage
+             WHERE itemid  = %s
+               AND resolved = FALSE
+          ORDER BY logged_at
+            """,
+            (itemid,),
         )
 
-# ───────────────────────── main tab  ───────────────────────────────
-def transfer_tab() -> None:
-    st.subheader("📤 Bulk Transfer (Barcode)")
-
-    n_rows   = int(st.number_input("Lines to transfer", 1, 50, 1, 1,
-                                   help="How many lines (barcodes) you want to enter"))
-    loc_opts = all_locids()
-
-    _draw_rows(n_rows, loc_opts)
-
-    # ---------------- first click: validate & ask confirmation -------
-    if "confirm_transfer" not in st.session_state:
-        if st.button("🚚 Transfer All"):
-            errs, batch = _validate_rows(n_rows)
-            if errs:
-                for e in errs:
-                    st.error(e)
-                return
-            st.session_state["pending_transfer"] = batch
-            st.session_state["confirm_transfer"] = True
-            st.rerun()
-        return  # stop rendering below if not yet confirming
-
-    # ---------------- confirmation screen -----------------------------
-    batch = st.session_state["pending_transfer"]
-    st.markdown("### Please confirm transfer")
-    for job in batch:
-        st.write(f"• **Item {job['itemid']}** | Qty **{job['need']}** → Shelf **{job['loc']}**")
-
-    ok_col, cancel_col = st.columns(2)
-
-    # ---------- CONFIRM ------------------------------------------------
-    if ok_col.button("✅ Confirm"):
-        user = st.session_state.get("user_email", "Unknown")
-        for job in batch:
-            remaining = handler.resolve_shortages(
-                itemid=job["itemid"], qty_need=job["need"], user=user
+        remaining = qty_need
+        for r in rows.itertuples():
+            if remaining == 0:
+                break
+            take = min(remaining, int(r.shortage_qty))
+            self.execute_command(
+                """
+                UPDATE shelf_shortage
+                   SET shortage_qty = shortage_qty - %s,
+                       resolved      = (shortage_qty - %s = 0),
+                       resolved_qty  = COALESCE(resolved_qty,0) + %s,
+                       resolved_at   = CASE
+                                         WHEN shortage_qty - %s = 0
+                                         THEN CURRENT_TIMESTAMP
+                                       END,
+                       resolved_by   = %s
+                 WHERE shortageid   = %s
+                """,
+                (take, take, take, take, user, r.shortageid),
             )
-            for layer in sorted(job["layers"], key=lambda r: r["cost_per_unit"]):
-                if remaining == 0:
-                    break
-                take = min(remaining, layer["quantity"])
-                handler.add_to_shelf(
-                    itemid=layer["itemid"],
-                    expirationdate=layer["expirationdate"],
-                    quantity=take,
-                    created_by=user,
-                    cost_per_unit=layer["cost_per_unit"],
-                    locid=job["loc"],                   # ← **now passed**
-                )
-                remaining -= take
+            remaining -= take
 
-        st.success("✅ Transfer completed.")
-        _clear_transfer_state()
-        st.session_state.pop("confirm_transfer", None)
-        st.session_state.pop("pending_transfer", None)
-        st.rerun()
+        # remove fully-zero rows
+        self.execute_command("DELETE FROM shelf_shortage WHERE shortage_qty = 0;")
+        return remaining
 
-    # ---------- CANCEL -------------------------------------------------
-    if cancel_col.button("❌ Cancel"):
-        _clear_transfer_state()
-        st.session_state.pop("confirm_transfer", None)
-        st.session_state.pop("pending_transfer", None)
-        st.rerun()
+    # ─────────────────── low-stock quick query ────────────────────
+    def get_low_shelf_stock(self, threshold: int = 10) -> pd.DataFrame:
+        return self.fetch_data(
+            """
+            SELECT
+                s.itemid,
+                i.itemnameenglish AS itemname,
+                s.quantity,
+                s.expirationdate
+              FROM shelf s
+              JOIN item  i ON s.itemid = i.itemid
+             WHERE s.quantity <= %s
+          ORDER BY s.quantity ASC
+            """,
+            (threshold,),
+        )
 
+    # ─────────────────── master item list (manage tab) ────────────
+    def get_all_items(self) -> pd.DataFrame:
+        df = self.fetch_data(
+            """
+            SELECT
+                itemid,
+                itemnameenglish AS itemname,
+                shelfthreshold,
+                shelfaverage
+              FROM item
+          ORDER BY itemnameenglish
+            """
+        )
+        if not df.empty:
+            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
+        return df
 
-if __name__ == "__main__":
-    transfer_tab()
+    def update_shelf_settings(self, itemid: int, thr: int, avg: int) -> None:
+        self.execute_command(
+            """
+            UPDATE item
+               SET shelfthreshold = %s,
+                   shelfaverage   = %s
+             WHERE itemid = %s
+            """,
+            (int(thr), int(avg), int(itemid)),
+        )
+
+    # ─────────────────── quantity-by-item (alerts tab) ────────────
+    def get_shelf_quantity_by_item(self) -> pd.DataFrame:
+        df = self.fetch_data(
+            """
+            SELECT
+                i.itemid,
+                i.itemnameenglish AS itemname,
+                COALESCE(SUM(s.quantity),0) AS totalquantity,
+                i.shelfthreshold,
+                i.shelfaverage
+              FROM item  i
+         LEFT JOIN shelf s ON i.itemid = s.itemid
+          GROUP BY i.itemid, i.itemnameenglish,
+                   i.shelfthreshold, i.shelfaverage
+          ORDER BY i.itemnameenglish
+            """
+        )
+        if not df.empty:
+            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
+            df["totalquantity"]  = df["totalquantity"].astype(int)
+        return df
