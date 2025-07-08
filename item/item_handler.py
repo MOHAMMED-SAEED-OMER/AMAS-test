@@ -66,12 +66,12 @@ class ItemHandler(DatabaseManager):
 
         self._ensure_live_conn()
 
-        # 1️⃣  prepared INSERT so binary data isn't checked for UTF-8
+        # 1️⃣ prepared INSERT so binary data isn't checked for UTF-8
         with self.conn.cursor(prepared=True) as cur:
             cur.execute(sql, list(item_data.values()))
 
-        # 2️⃣  fetch the new AUTO_INCREMENT id reliably
-        with self.conn.cursor() as cur2:         # regular cursor is fine here
+        # 2️⃣ fetch the new AUTO_INCREMENT id reliably
+        with self.conn.cursor() as cur2:
             cur2.execute("SELECT LAST_INSERT_ID()")
             item_id = cur2.fetchone()[0]
 
@@ -149,6 +149,23 @@ class ItemHandler(DatabaseManager):
         with self.conn.cursor(prepared=True) as cur:
             cur.execute(sql, (picture_data, item_id))
         self.conn.commit()
+
+    # ────────────────── quick existence check ───────────────────────
+    def item_name_exists(self, name_en: str) -> bool:
+        """
+        Return True if an item with the given English name already exists
+        (case- and whitespace-insensitive).
+        """
+        row = self.fetch_data(
+            """
+            SELECT 1
+              FROM `item`
+             WHERE LOWER(TRIM(itemnameenglish)) = %s
+             LIMIT 1
+            """,
+            (name_en.strip().lower(),),
+        )
+        return not row.empty
 
     # ───────────────────── Dropdown utilities ──────────────────────
     def get_dropdown_values(self, section: str) -> list[str]:
