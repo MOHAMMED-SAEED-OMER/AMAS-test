@@ -38,7 +38,7 @@ def item_locator(
     name_container=st,
     barcode_container=st,
 ) -> tuple[list[str] | None, int | None, bool]:
-    """Render inputs to locate an item and return matching ``locid``\s.
+    """Render inputs to locate an item and return matching ``locid``s.
 
     Parameters
     ----------
