@@ -1,19 +1,14 @@
 """
-db_handler.py  – MySQL edition, PyMySQL driver (no native crashes)
+db_handler.py  – PostgreSQL/Neon edition (psycopg 3 driver, no native crashes)
 
-Why the rewrite?
-────────────────
-• mysql-connector-python links against glibc/openssl and can corrupt the
-  heap on Alpine-based containers → “malloc(): unsorted double linked list
-  corrupted”.  Switching to **PyMySQL** avoids native code entirely.
-
-Key points
-──────────
-• One cached PyMySQL connection per Streamlit session (st.cache_resource).
-• Automatic keep-alive: conn.ping(reconnect=True) before each query avoids
-  the “MySQL server has gone away” error.
-• Public API identical to the old version (fetch_data, execute_command,
-  execute_command_returning, etc.).
+Compared with the old MySQL-based version
+──────────────────────────────────────────
+• Uses **psycopg 3** (pure-Python) – lighter than psycopg2 and fully async-ready.
+• One cached connection per Streamlit session (`st.cache_resource`).
+• Automatic keep-alive: a cheap `SELECT 1` (or reconnect) before every query
+  prevents “connection closed” errors when Neon pauses an idle session.
+• Public API and helper names are **unchanged**, so the rest of your codebase
+  (e.g. `ShelfHandler`, Supplier pages, etc.) can stay as-is.
 """
 
 from __future__ import annotations
@@ -22,8 +17,8 @@ import uuid
 from typing import Any, Sequence, List
 
 import pandas as pd
-import pymysql
-from pymysql.err import OperationalError, InterfaceError
+import psycopg                           # psycopg 3
+from psycopg.rows import dict_row        # rows → dict for painless DF build
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────
@@ -37,125 +32,130 @@ def _session_key() -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def _get_conn(params: dict, cache_key: str):
-    """Create a PyMySQL connection once per session."""
-    conn = pymysql.connect(**params)
+def _get_conn(params: dict, cache_key: str) -> psycopg.Connection:
+    """Create a psycopg 3 connection once per Streamlit session."""
+    conn = psycopg.connect(**params, row_factory=dict_row, autocommit=True)
     try:
-        st.on_session_end(conn.close)
-    except Exception:  # running outside interactive session
+        st.on_session_end(conn.close)    # tidy shutdown in the browser tab
+    except Exception:                    # running in a non-interactive context
         pass
     return conn
+
 
 # ─────────────────────────────────────────────────────────────
 # 2. DatabaseManager
 # ─────────────────────────────────────────────────────────────
 class DatabaseManager:
-    """Lightweight DB helper using a cached PyMySQL connection."""
+    """Lightweight DB helper using a cached psycopg 3 connection."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         # ---- read secrets ---------------------------------------------------
         secrets = st.secrets
-        if "mysql" in secrets:           # sectioned secrets.toml
-            secrets = secrets["mysql"]
+        if "postgres" in secrets:                 # allow sectioned [postgres]
+            secrets = secrets["postgres"]
 
-        def pick(*keys, default=None):
+        def pick(*keys: str, default: Any = None):
             """Return first present secret key (case-insensitive)."""
             for k in keys:
-                try:
-                    return secrets[k]
-                except KeyError:
-                    try:
-                        return secrets[k.lower()]  # allow lower-case
-                    except KeyError:
-                        continue
+                for variant in (k, k.lower()):
+                    if variant in secrets:
+                        return secrets[variant]
             return default
 
         self._params: dict[str, Any] = dict(
-            host            = pick("DB_HOST", "host"),
-            port            = int(pick("DB_PORT", "port", default=3306)),
-            user            = pick("DB_USER", "user"),
-            password        = pick("DB_PASS", "password"),
-            database        = pick("DB_NAME", "database"),
-            charset         = "utf8mb4",
-            autocommit      = True,
-            cursorclass     = pymysql.cursors.Cursor,  # plain tuples
+            host       = pick("DB_HOST",  "host"),
+            port       = int(pick("DB_PORT", "port", default=5432)),
+            dbname     = pick("DB_NAME",  "database"),
+            user       = pick("DB_USER",  "user"),
+            password   = pick("DB_PASS",  "password"),
+            sslmode    = pick("DB_SSLMODE", "sslmode", default="require"),
+            # Neon expects SSL; `require` is safest.
         )
 
         self._cache_key = _session_key()
         self.conn       = _get_conn(self._params, self._cache_key)
 
     # ---------- internal util ----------------------------------------------
-    def _ensure_live(self):
-        """Ping connection; reconnect if server closed it."""
+    def _ensure_live(self) -> None:
+        """Make sure the connection is open; reconnect if Neon suspended it."""
         try:
-            self.conn.ping(reconnect=True)
+            if self.conn.closed:                       # type: ignore[attr-defined]
+                raise psycopg.OperationalError
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT 1;")
         except Exception:
-            _get_conn.clear()
+            _get_conn.clear()                          # bust Streamlit cache
             self.conn = _get_conn(self._params, self._cache_key)
 
-    def _fetch_df(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
+    def _fetch_df(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None
+    ) -> pd.DataFrame:
         self._ensure_live()
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                rows = cur.fetchall()
-                cols = [c[0] for c in cur.description]
-            return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
-        except (OperationalError, InterfaceError):
-            # retry once after reconnect
-            _get_conn.clear()
-            self.conn = _get_conn(self._params, self._cache_key)
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                rows = cur.fetchall()
-                cols = [c[0] for c in cur.description]
-            return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            rows = cur.fetchall()
+            if not rows:               # empty result → empty DF with 0 columns
+                return pd.DataFrame()
+            return pd.DataFrame(rows)  # dict_row → keys become columns
 
-    def _execute(self, sql: str, params: Sequence[Any] | None = None, *, returning=False):
+    def _execute(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+        *,
+        returning: bool = False
+    ):
         self._ensure_live()
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                result = cur.fetchone() if returning else None
-            return result
-        except (OperationalError, InterfaceError):
-            _get_conn.clear()
-            self.conn = _get_conn(self._params, self._cache_key)
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                result = cur.fetchone() if returning else None
-            return result
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            return cur.fetchone() if returning else None
 
     # ---------- public API --------------------------------------------------
-    def fetch_data(self, query: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
+    def fetch_data(
+        self,
+        query: str,
+        params: Sequence[Any] | None = None
+    ) -> pd.DataFrame:
         return self._fetch_df(query, params)
 
-    def execute_command(self, query: str, params: Sequence[Any] | None = None) -> None:
+    def execute_command(
+        self,
+        query: str,
+        params: Sequence[Any] | None = None
+    ) -> None:
         self._execute(query, params)
 
     def execute_command_returning(
-        self, query: str, params: Sequence[Any] | None = None
+        self,
+        query: str,
+        params: Sequence[Any] | None = None,
     ):
         return self._execute(query, params, returning=True)
 
     # ---------- Dropdown helpers -------------------------------------------
     def get_all_sections(self) -> List[str]:
-        df = self.fetch_data("SELECT DISTINCT section FROM dropdowns")
+        df = self.fetch_data("SELECT DISTINCT section FROM dropdowns;")
         return df["section"].tolist()
 
     def get_dropdown_values(self, section: str) -> List[str]:
-        df = self.fetch_data("SELECT value FROM dropdowns WHERE section = %s", (section,))
+        df = self.fetch_data(
+            "SELECT value FROM dropdowns WHERE section = %s;", (section,)
+        )
         return df["value"].tolist()
 
     # ---------- Supplier helpers -------------------------------------------
     def get_suppliers(self) -> pd.DataFrame:
-        return self.fetch_data("SELECT supplierid, suppliername FROM supplier")
+        return self.fetch_data(
+            "SELECT supplierid, suppliername FROM supplier;"
+        )
 
     # ---------- Inventory helpers ------------------------------------------
     def add_inventory(self, data: dict[str, Any]) -> None:
         cols = ", ".join(data.keys())
         ph   = ", ".join(["%s"] * len(data))
-        q = f"INSERT INTO inventory ({cols}) VALUES ({ph})"
+        q    = f"INSERT INTO inventory ({cols}) VALUES ({ph});"
         self.execute_command(q, list(data.values()))
 
     # ---------- FK safety helper -------------------------------------------
