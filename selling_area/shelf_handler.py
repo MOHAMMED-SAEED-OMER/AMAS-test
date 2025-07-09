@@ -1,9 +1,10 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-MySQL 8.0 helper – now uses a pooled SQLAlchemy engine for
-all pandas reads (no more read_sql warnings) and keeps the
-mysql-connector pool for fast transactional writes.
+• Uses SQLAlchemy engine for all pandas reads (silences read_sql warnings)
+• Keeps mysql-connector pool for fast transactional writes
+• FIX: removed `cost_per_unit` from INSERT INTO shelfentries
+  (table does not have that column → ProgrammingError 1054)
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import streamlit as st
 import mysql.connector
 import mysql.connector.pooling
 from mysql.connector import errors as sqlerr
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -27,20 +28,24 @@ from sqlalchemy.exc import SQLAlchemyError
 # ╰────────────────────────────────────────────────────────────╯
 @st.cache_resource(show_spinner=False)
 def _get_engine() -> Engine:
-    """A small SQLAlchemy engine pool (for pandas.read_sql_query)."""
+    """Small SQLAlchemy pool for read-only queries."""
     cfg = st.secrets["mysql"]
     uri = (
         "mysql+mysqlconnector://"
         f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port',3306)}/"
         f"{cfg['database']}"
     )
-    # pool_pre_ping avoids 'MySQL server has gone away'
-    return create_engine(uri, pool_size=4, pool_recycle=3_600, pool_pre_ping=True)
+    return create_engine(
+        uri,
+        pool_size=4,
+        pool_recycle=3_600,
+        pool_pre_ping=True,  # auto-reconnect
+    )
 
 
 @st.cache_resource(show_spinner=False)
 def _get_pool() -> mysql.connector.pooling.MySQLConnectionPool | None:
-    """MySQL-connector pool for write / transactional work."""
+    """mysql-connector pool for transactional statements."""
     cfg = st.secrets["mysql"]
     try:
         return mysql.connector.pooling.MySQLConnectionPool(
@@ -61,7 +66,7 @@ def _get_pool() -> mysql.connector.pooling.MySQLConnectionPool | None:
 
 
 def _safe_conn(retries: int = 2):
-    """Grab a connector-style connection or raise after quick retries."""
+    """Get a connector connection or raise after quick retries."""
     pool = _get_pool()
     if pool is None:
         raise RuntimeError("Database unreachable")
@@ -71,19 +76,18 @@ def _safe_conn(retries: int = 2):
             return pool.get_connection()
         except sqlerr.InterfaceError as err:
             last = err
-            time.sleep(back)  # linear back-off: 0 s → 1 s
+            time.sleep(back)  # 0 s → 1 s
     raise last or RuntimeError("Unknown DB error")
 
 
 # ╭────────────────────────────────────────────────────────────╮
-# │ 1.  Thin wrapper                                           │
+# │ 1.  Base DB wrapper                                        │
 # ╰────────────────────────────────────────────────────────────╯
 class DatabaseManager:
     # ---------- READ ----------
     def fetch_data(
         self, sql: str, params: Sequence[Any] | None = None
     ) -> pd.DataFrame:
-        """Return a DataFrame using SQLAlchemy (no read_sql warnings)."""
         try:
             return pd.read_sql_query(sql, _get_engine(), params=params)
         except (SQLAlchemyError, ValueError) as err:
@@ -92,7 +96,6 @@ class DatabaseManager:
 
     # ---------- WRITE ----------
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
-        """Execute mutation queries with mysql-connector (fast autocommit)."""
         conn = _safe_conn()
         try:
             with closing(conn.cursor()) as cur:
@@ -170,32 +173,31 @@ class ShelfHandler(DatabaseManager):
                     ),
                 )
 
-                # ② movement log
+                # ② movement log  (cost_per_unit removed – table lacks it)
                 cur.execute(
                     """
                     INSERT INTO shelfentries
                            (itemid, expirationdate, quantity,
-                            cost_per_unit, createdby, locid)
-                    VALUES (%s,%s,%s,%s,%s,%s)
+                            createdby, locid)
+                    VALUES (%s,%s,%s,%s,%s)
                     """,
                     (
                         itemid,
                         expirationdate,
                         int(quantity),
-                        float(cost_per_unit),
                         created_by,
                         locid,
                     ),
                 )
 
-                # ③ inventory decrement
+                # ③ inventory decrement (keeps cost_per_unit filter)
                 cur.execute(
                     """
                     UPDATE inventory
                     SET quantity = quantity - %s
-                    WHERE itemid=%s
-                      AND expirationdate=%s
-                      AND cost_per_unit = %s
+                    WHERE itemid          = %s
+                      AND expirationdate  = %s
+                      AND cost_per_unit   = %s
                     """,
                     (
                         int(quantity),
