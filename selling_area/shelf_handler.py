@@ -1,227 +1,165 @@
 """
-db_handler.py – MySQL edition (PyMySQL driver, no native crashes)
+selling_area/shelf_handler.py
+─────────────────────────────
+Thin wrapper around the DB layer for shelf management tasks.
 
-Key points
-──────────
-• One cached PyMySQL connection per Streamlit session (`st.cache_resource`).
-• Automatic keep-alive (`conn.ping(reconnect=True)`) before every query.
-• Any `OperationalError`, `InterfaceError`, or `InternalError`
-  → clear cache, reconnect, retry once.
-• NEW: Safe handling when a cursor returns no description
-  (e.g. SELECT with zero columns after a reconnect): returns an
-  empty DataFrame instead of raising a TypeError.
+• Works with the existing DatabaseManager (`db_handler.py`).
+• Resilient: pings / reconnects handled by DatabaseManager.
+• Exposes **ShelfHandler** plus the modern and legacy helper methods
+  expected by shelf.py, transfer.py, alerts.py, shelf_manage.py, etc.
 """
 
 from __future__ import annotations
 
-import uuid
-from typing import Any, Sequence, List
+from typing import Any, Sequence, List, Dict
 
 import pandas as pd
-import pymysql
-from pymysql.err import OperationalError, InterfaceError, InternalError
-import streamlit as st
 
-# ─────────────────────────────────────────────────────────────
-# 1. Helpers for session-scoped connection
-# ─────────────────────────────────────────────────────────────
-def _session_key() -> str:
-    """Unique key per Streamlit browser session."""
-    if "_session_key" not in st.session_state:
-        st.session_state["_session_key"] = uuid.uuid4().hex
-    return st.session_state["_session_key"]
+# Import your project-wide DB helper
+from db_handler import DatabaseManager
 
 
-@st.cache_resource(show_spinner=False)
-def _get_conn(params: dict, cache_key: str):
-    """Create a PyMySQL connection once per session."""
-    conn = pymysql.connect(**params)
-    try:
-        st.on_session_end(conn.close)
-    except Exception:  # running outside interactive session
-        pass
-    return conn
+__all__ = ["ShelfHandler"]  # makes “from … import ShelfHandler” safe
 
-# ─────────────────────────────────────────────────────────────
-# 2. DatabaseManager
-# ─────────────────────────────────────────────────────────────
-class DatabaseManager:
-    """Lightweight DB helper using a cached PyMySQL connection."""
 
-    # ---------------------------------------------------------
-    # constructor
-    # ---------------------------------------------------------
-    def __init__(self):
-        # ---- read secrets -----------------------------------
-        secrets = st.secrets
-        if "mysql" in secrets:           # sectioned secrets.toml
-            secrets = secrets["mysql"]
+class ShelfHandler:
+    """High-level helper focused on shelf-area queries & updates."""
 
-        def pick(*keys, default=None):
-            """Return first present secret key (case-insensitive)."""
-            for k in keys:
-                try:
-                    return secrets[k]
-                except KeyError:
-                    try:
-                        return secrets[k.lower()]
-                    except KeyError:
-                        continue
-            return default
+    # --------------------------------------------------------------------- #
+    # Construction                                                          #
+    # --------------------------------------------------------------------- #
+    def __init__(self, db: DatabaseManager | None = None) -> None:
+        # Allow injection for unit-tests; otherwise use the singleton.
+        self.db: DatabaseManager = db or DatabaseManager()
 
-        self._params: dict[str, Any] = dict(
-            host        = pick("DB_HOST", "host"),
-            port        = int(pick("DB_PORT", "port", default=3306)),
-            user        = pick("DB_USER", "user"),
-            password    = pick("DB_PASS", "password"),
-            database    = pick("DB_NAME", "database"),
-            charset     = "utf8mb4",
-            autocommit  = True,
-            cursorclass = pymysql.cursors.Cursor,  # plain tuples
-        )
-
-        self._cache_key = _session_key()
-        self.conn       = _get_conn(self._params, self._cache_key)
-
-    # ---------------------------------------------------------
-    # internal utilities
-    # ---------------------------------------------------------
-    def _ensure_live(self) -> None:
-        """Ping connection; reconnect if server closed it."""
-        try:
-            self.conn.ping(reconnect=True)
-        except Exception:
-            _get_conn.clear()
-            self.conn = _get_conn(self._params, self._cache_key)
-
-    def _retryable(self, fn, *args, **kwargs):
-        """
-        Execute *fn* once; on connection-level failures (OperationalError,
-        InterfaceError, InternalError) clear cache, reconnect and retry once.
-        """
-        try:
-            return fn(*args, **kwargs)
-        except (OperationalError, InterfaceError, InternalError):
-            _get_conn.clear()
-            self.conn = _get_conn(self._params, self._cache_key)
-            return fn(*args, **kwargs)
-
-    # ---------------------------------------------------------
-    # low-level query helpers
-    # ---------------------------------------------------------
-    def _fetch_df(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
-        def _run() -> pd.DataFrame:
-            self._ensure_live()
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                rows = cur.fetchall()
-                # ── FIX: cur.description can be None (no result set) ──
-                if cur.description is None:
-                    return pd.DataFrame()
-                cols = [c[0] for c in cur.description]
-                return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
-
-        return self._retryable(_run)
-
-    def _execute(
-        self,
-        sql: str,
-        params: Sequence[Any] | None = None,
-        *,
-        returning: bool = False,
-    ):
-        def _run():
-            self._ensure_live()
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                result = cur.fetchone() if returning else None
-                # consume remainder so connection stays clean
-                if returning:
-                    cur.fetchall()
-            return result
-
-        return self._retryable(_run)
-
-    # ---------------------------------------------------------
-    # public API
-    # ---------------------------------------------------------
-    def fetch_data(self, query: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
-        return self._fetch_df(query, params)
-
-    def execute_command(self, query: str, params: Sequence[Any] | None = None) -> None:
-        self._execute(query, params)
-
-    def execute_command_returning(
-        self,
-        query: str,
-        params: Sequence[Any] | None = None,
-    ):
-        return self._execute(query, params, returning=True)
-
-    # ---------------------------------------------------------
-    # dropdown helpers
-    # ---------------------------------------------------------
-    def get_all_sections(self) -> List[str]:
-        df = self.fetch_data("SELECT DISTINCT section FROM dropdowns")
-        return df["section"].tolist()
-
-    def get_dropdown_values(self, section: str) -> List[str]:
-        df = self.fetch_data(
-            "SELECT value FROM dropdowns WHERE section = %s",
-            (section,),
-        )
-        return df["value"].tolist()
-
-    # ---------------------------------------------------------
-    # supplier helpers
-    # ---------------------------------------------------------
-    def get_suppliers(self) -> pd.DataFrame:
-        return self.fetch_data("SELECT supplierid, suppliername FROM supplier")
-
-    # ---------------------------------------------------------
-    # inventory helpers
-    # ---------------------------------------------------------
-    def add_inventory(self, data: dict[str, Any]) -> None:
-        cols = ", ".join(data.keys())
-        ph   = ", ".join(["%s"] * len(data))
-        q    = f"INSERT INTO inventory ({cols}) VALUES ({ph})"
-        self.execute_command(q, list(data.values()))
-
-    # ---------------------------------------------------------
-    # FK safety helper
-    # ---------------------------------------------------------
-    def check_foreign_key_references(
-        self,
-        referenced_table: str,
-        referenced_column: str,
-        value: Any,
-    ) -> List[str]:
-        fk_sql = """
-            SELECT tc.table_schema, tc.table_name
-            FROM   information_schema.table_constraints AS tc
-            JOIN   information_schema.key_column_usage AS kcu
-                   ON tc.constraint_name = kcu.constraint_name
-            JOIN   information_schema.constraint_column_usage AS ccu
-                   ON ccu.constraint_name = tc.constraint_name
-            WHERE  tc.constraint_type = 'FOREIGN KEY'
-              AND  ccu.table_name      = %s
-              AND  ccu.column_name     = %s;
-        """
-        fks = self.fetch_data(fk_sql, (referenced_table, referenced_column))
-
-        conflicts: List[str] = []
-        for _, row in fks.iterrows():
-            schema = row["table_schema"]
-            table  = row["table_name"]
-            exists_sql = f"""
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM   `{schema}`.`{table}`
-                    WHERE  {referenced_column} = %s
-                );
+    # --------------------------------------------------------------------- #
+    # READ QUERIES                                                          #
+    # --------------------------------------------------------------------- #
+    def get_all_items(self) -> pd.DataFrame:
+        """Return item list with threshold / average columns (used by UI)."""
+        df = self.db.fetch_data(
             """
-            exists = self.fetch_data(exists_sql, (value,)).iat[0, 0]
-            if exists:
-                conflicts.append(f"{schema}.{table}")
+            SELECT itemid,
+                   itemnameenglish AS itemname,
+                   shelfthreshold,
+                   shelfaverage
+            FROM   item
+            ORDER  BY itemnameenglish
+            """
+        )
+        if not df.empty:
+            # Convert nullable INT columns to pandas Int64 dtype
+            df[["shelfthreshold", "shelfaverage"]] = df[
+                ["shelfthreshold", "shelfaverage"]
+            ].astype("Int64")
+        return df
 
-        return sorted(set(conflicts))
+    # Legacy alias (transfer.py etc.) --------------------------------------
+    fetch_all_items = get_all_items  # type: ignore[assignment]
+
+    def get_shelf_grid(self) -> pd.DataFrame:
+        """Detailed view of every shelf row (used by shelf.py)."""
+        return self.db.fetch_data(
+            """
+            SELECT s.shelfid,
+                   s.itemid,
+                   i.itemnameenglish AS itemname,
+                   s.quantity,
+                   s.expirationdate,
+                   s.cost_per_unit,
+                   s.locid,
+                   s.lastupdated
+            FROM   shelf s
+            JOIN   item  i ON s.itemid = i.itemid
+            ORDER  BY i.itemnameenglish, s.expirationdate
+            """
+        )
+
+    # Legacy alias
+    get_shelf_items = get_shelf_grid  # type: ignore[assignment]
+
+    def low_stock(self, threshold: int = 10) -> pd.DataFrame:
+        """Return rows whose quantity <= threshold (used by alerts)."""
+        return self.db.fetch_data(
+            """
+            SELECT s.itemid,
+                   i.itemnameenglish AS itemname,
+                   s.quantity,
+                   s.expirationdate
+            FROM   shelf s
+            JOIN   item  i ON s.itemid = i.itemid
+            WHERE  s.quantity <= %s
+            ORDER  BY s.quantity
+            """,
+            (threshold,),
+        )
+
+    # Legacy alias
+    get_low_shelf_stock = low_stock  # type: ignore[assignment]
+
+    # --------------------------------------------------------------------- #
+    # WRITE / UPDATE OPERATIONS                                             #
+    # --------------------------------------------------------------------- #
+    def update_thresholds(self, itemid: int, thr: int, avg: int) -> None:
+        """Canonical method to persist new threshold / average."""
+        self.db.execute_command(
+            """
+            UPDATE item
+            SET shelfthreshold = %s,
+                shelfaverage   = %s
+            WHERE itemid       = %s
+            """,
+            (int(thr), int(avg), int(itemid)),
+        )
+
+    # === UI & back-compat synonyms =======================================
+    update_shelf_settings = update_thresholds           # shelf_manage.py
+    set_shelf_settings    = update_thresholds           # possible old naming
+    save_shelf_settings   = update_thresholds           # "
+
+    # --------------------------------------------------------------------- #
+    # Example mutation: add stock to shelf                                  #
+    # --------------------------------------------------------------------- #
+    def add_to_shelf(
+        self,
+        *,
+        itemid: int,
+        expirationdate,
+        quantity: int,
+        cost_per_unit: float,
+        locid: str,
+        created_by: str,
+    ) -> None:
+        """Upsert into shelf, add audit record, and deduct inventory."""
+        self.db.execute_command(
+            """
+            INSERT INTO shelf (itemid, expirationdate, quantity,
+                               cost_per_unit, locid)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                  quantity      = quantity + VALUES(quantity),
+                  cost_per_unit = VALUES(cost_per_unit),
+                  locid         = VALUES(locid),
+                  lastupdated   = CURRENT_TIMESTAMP
+            """,
+            (itemid, expirationdate, int(quantity), float(cost_per_unit), locid),
+        )
+        self.db.execute_command(
+            """
+            INSERT INTO shelfentries
+                   (itemid, quantity, expirationdate,
+                    createdby, locid)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (itemid, int(quantity), expirationdate, created_by, locid),
+        )
+        self.db.execute_command(
+            """
+            UPDATE inventory
+            SET quantity = quantity - %s
+            WHERE itemid = %s
+              AND expirationdate = %s
+              AND cost_per_unit  = %s
+            """,
+            (int(quantity), itemid, expirationdate, float(cost_per_unit)),
+        )
