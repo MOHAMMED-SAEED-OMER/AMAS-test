@@ -1,17 +1,9 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-Inventory/Selling‑Area DB helper.
-
-Highlights
-──────────
-• ONE SQLAlchemy engine handles all reads *and* writes
-  (mysql+mysqlconnector, `pool_pre_ping=True`, `pool_recycle=3600`).
-• All write ops wrapped in a lightweight retry that
-  disposes the pool on the first Operational/Interface failure.
-• Correct MySQL syntax for INSERT‑on‑duplicate‑update.
-• shelfentries insert fills `entrydate` (CURRENT_TIMESTAMP) and
-  leaves `entryid` to auto‑increment.
+• Single, resilient SQLAlchemy engine (pool_pre_ping=True)
+• Lightweight retry on Operational / Interface errors
+• Correct audit columns (entryid auto‑increment, entrydate filled)
 """
 
 from __future__ import annotations
@@ -37,8 +29,8 @@ def _get_engine() -> Engine:
     return create_engine(
         uri,
         pool_size=6,
-        pool_recycle=3_600,   # recycle after 1 h
-        pool_pre_ping=True,   # ping before checkout
+        pool_recycle=3_600,
+        pool_pre_ping=True,
     )
 
 
@@ -48,10 +40,7 @@ T = TypeVar("T")
 
 
 def _with_retry(func: Callable[..., T], /, *args, **kwargs) -> T:
-    """
-    Run `func` (usually a transactional block) once; on a transient
-    OperationalError/InterfaceError dispose the pool, wait 0.5 s, retry.
-    """
+    """Run a DB block once; dispose pool + retry once on transient errors."""
     for attempt in (1, 2):
         try:
             return func(*args, **kwargs)
@@ -64,7 +53,7 @@ def _with_retry(func: Callable[..., T], /, *args, **kwargs) -> T:
 
 # ── Base wrapper ────────────────────────────────────────────
 class DatabaseManager:
-    # ---------- READ ----------
+    # --- READ ---
     def fetch_data(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
         def _read():
             return pd.read_sql_query(text(sql), engine, params=params)
@@ -75,7 +64,7 @@ class DatabaseManager:
             st.error(f"❌ DB read failed: {err}")
             return pd.DataFrame()
 
-    # ---------- WRITE ----------
+    # --- WRITE ---
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
         def _write():
             with engine.begin() as conn:
@@ -85,7 +74,7 @@ class DatabaseManager:
 
 # ── Shelf-specific helpers ──────────────────────────────────
 class ShelfHandler(DatabaseManager):
-    # 2.1 current shelf items
+    # 1. current shelf items
     @st.cache_data(ttl=10)
     def get_shelf_items(_self) -> pd.DataFrame:
         return _self.fetch_data(
@@ -99,7 +88,7 @@ class ShelfHandler(DatabaseManager):
             """
         )
 
-    # 2.2 last locid helper
+    # 2. last locid helper
     def last_locid(self, itemid: int) -> str | None:
         df = self.fetch_data(
             """
@@ -113,7 +102,7 @@ class ShelfHandler(DatabaseManager):
         )
         return None if df.empty else str(df.iloc[0, 0])
 
-    # 2.3 add / increment shelf + log + inventory subtract
+    # 3. add / increment shelf + log + inventory subtract
     def add_to_shelf(
         self,
         *,
@@ -134,7 +123,7 @@ class ShelfHandler(DatabaseManager):
                                            cost_per_unit, locid)
                         VALUES (:itemid, :exp, :qty, :cpu, :loc)
                         ON DUPLICATE KEY UPDATE
-                            quantity      = shelf.quantity + VALUES(quantity),
+                            quantity      = quantity + VALUES(quantity),
                             cost_per_unit = VALUES(cost_per_unit),
                             locid         = VALUES(locid),
                             lastupdated   = CURRENT_TIMESTAMP
@@ -149,7 +138,7 @@ class ShelfHandler(DatabaseManager):
                     },
                 )
 
-                # ② movement log  (entrydate filled explicitly)
+                # ② movement log (entryid auto, entrydate explicit)
                 conn.execute(
                     text(
                         """
@@ -189,7 +178,7 @@ class ShelfHandler(DatabaseManager):
 
         _with_retry(_tx)
 
-    # 2.4 inventory lookup
+    # 4. inventory lookup
     def get_inventory_by_barcode(self, barcode: str) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -203,7 +192,7 @@ class ShelfHandler(DatabaseManager):
             {"bc": barcode},
         )
 
-    # 2.5 shortage resolver
+    # 5. shortage resolver
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         remaining = qty_need
 
@@ -251,7 +240,7 @@ class ShelfHandler(DatabaseManager):
 
         return _with_retry(_tx)
 
-    # 2.6 quick low stock
+    # 6. quick low stock
     @st.cache_data(ttl=10)
     def get_low_shelf_stock(_self, threshold: int = 10) -> pd.DataFrame:
         return _self.fetch_data(
@@ -266,7 +255,7 @@ class ShelfHandler(DatabaseManager):
             {"thr": threshold},
         )
 
-    # 2.7 item master list
+    # 7. item master list
     @st.cache_data(ttl=30)
     def get_all_items(_self) -> pd.DataFrame:
         df = _self.fetch_data(
@@ -284,7 +273,6 @@ class ShelfHandler(DatabaseManager):
             df["shelfaverage"] = df["shelfaverage"].astype("Int64")
         return df
 
-    # 2.7b update shelf settings
     def update_shelf_settings(self, itemid: int, thr: int, avg: int) -> None:
         self.execute(
             """
@@ -296,7 +284,7 @@ class ShelfHandler(DatabaseManager):
             {"thr": int(thr), "avg": int(avg), "id": int(itemid)},
         )
 
-    # 2.8 quantity by item
+    # 8. quantity by item
     @st.cache_data(ttl=10)
     def get_shelf_quantity_by_item(_self) -> pd.DataFrame:
         df = _self.fetch_data(
