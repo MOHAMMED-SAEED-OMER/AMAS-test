@@ -1,184 +1,333 @@
-# selling_area/shelf_handler.py
 """
-ShelfHandler – Selling-Area database helpers (MySQL / PyMySQL edition)
-======================================================================
-
-Depends on db_handler.DatabaseManager, which uses a cached PyMySQL
-connection under Streamlit’s session cache.
-
-Public methods
---------------
-• list_shelves()              → shelves with capacity & used_capacity
-• add_shelf(name, capacity)   → create shelf
-• delete_shelf(id)            → safe delete when empty
-• get_shelf_items()           → all items on all shelves   ← NEW
-• get_items_in_shelf(id)      → items on one shelf
-• search_items(term)          → fuzzy search
-• move_item(...)              → transfer + audit trail
-• low_stock_alerts(threshold) → items below threshold
+selling_area/shelf_handler.py
+─────────────────────────────
+MySQL 8.0 helper – now uses a pooled SQLAlchemy engine for
+all pandas reads (no more read_sql warnings) and keeps the
+mysql-connector pool for fast transactional writes.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import time
+from contextlib import closing
+from typing import Any, Sequence
 
 import pandas as pd
 import streamlit as st
+import mysql.connector
+import mysql.connector.pooling
+from mysql.connector import errors as sqlerr
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
-from db_handler import DatabaseManager
+
+# ╭────────────────────────────────────────────────────────────╮
+# │ 0.  Connection helpers                                     │
+# ╰────────────────────────────────────────────────────────────╯
+@st.cache_resource(show_spinner=False)
+def _get_engine() -> Engine:
+    """A small SQLAlchemy engine pool (for pandas.read_sql_query)."""
+    cfg = st.secrets["mysql"]
+    uri = (
+        "mysql+mysqlconnector://"
+        f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port',3306)}/"
+        f"{cfg['database']}"
+    )
+    # pool_pre_ping avoids 'MySQL server has gone away'
+    return create_engine(uri, pool_size=4, pool_recycle=3_600, pool_pre_ping=True)
 
 
+@st.cache_resource(show_spinner=False)
+def _get_pool() -> mysql.connector.pooling.MySQLConnectionPool | None:
+    """MySQL-connector pool for write / transactional work."""
+    cfg = st.secrets["mysql"]
+    try:
+        return mysql.connector.pooling.MySQLConnectionPool(
+            pool_name="amas_pool",
+            pool_size=4,
+            pool_reset_session=True,
+            host=cfg["host"],
+            port=int(cfg.get("port", 3306)),
+            user=cfg["user"],
+            password=cfg["password"],
+            database=cfg["database"],
+            autocommit=False,
+            connection_timeout=5,
+        )
+    except sqlerr.InterfaceError as e:
+        st.error(f"❌ Cannot reach MySQL: {e.msg}")
+        return None
+
+
+def _safe_conn(retries: int = 2):
+    """Grab a connector-style connection or raise after quick retries."""
+    pool = _get_pool()
+    if pool is None:
+        raise RuntimeError("Database unreachable")
+    last: Exception | None = None
+    for back in range(retries + 1):
+        try:
+            return pool.get_connection()
+        except sqlerr.InterfaceError as err:
+            last = err
+            time.sleep(back)  # linear back-off: 0 s → 1 s
+    raise last or RuntimeError("Unknown DB error")
+
+
+# ╭────────────────────────────────────────────────────────────╮
+# │ 1.  Thin wrapper                                           │
+# ╰────────────────────────────────────────────────────────────╯
+class DatabaseManager:
+    # ---------- READ ----------
+    def fetch_data(
+        self, sql: str, params: Sequence[Any] | None = None
+    ) -> pd.DataFrame:
+        """Return a DataFrame using SQLAlchemy (no read_sql warnings)."""
+        try:
+            return pd.read_sql_query(sql, _get_engine(), params=params)
+        except (SQLAlchemyError, ValueError) as err:
+            st.error(f"❌ DB read failed: {err}")
+            return pd.DataFrame()
+
+    # ---------- WRITE ----------
+    def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
+        """Execute mutation queries with mysql-connector (fast autocommit)."""
+        conn = _safe_conn()
+        try:
+            with closing(conn.cursor()) as cur:
+                cur.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ╭────────────────────────────────────────────────────────────╮
+# │ 2.  Shelf-specific helpers                                 │
+# ╰────────────────────────────────────────────────────────────╯
 class ShelfHandler(DatabaseManager):
-    """Shelf-specific helpers built on top of DatabaseManager."""
-
-    # ─────────────────────────────────────────────────────────────
-    # Shelf CRUD
-    # ─────────────────────────────────────────────────────────────
-    def list_shelves(self) -> pd.DataFrame:
-        return self.fetch_data(
+    # ── 2.1 current shelf items ──────────────────────────────
+    @st.cache_data(ttl=10)
+    def get_shelf_items(_self) -> pd.DataFrame:
+        return _self.fetch_data(
             """
-            SELECT s.shelfid,
-                   s.shelfname,
-                   s.capacity,
-                   COALESCE(SUM(si.quantity), 0) AS used_capacity
+            SELECT s.shelfid, s.itemid, i.itemnameenglish AS itemname,
+                   s.quantity, s.expirationdate, s.cost_per_unit,
+                   s.locid, s.lastupdated
             FROM   shelf s
-            LEFT   JOIN shelf_items si USING (shelfid)
-            GROUP  BY s.shelfid, s.shelfname, s.capacity
-            ORDER  BY s.shelfname;
+            JOIN   item  i ON s.itemid = i.itemid
+            ORDER  BY i.itemnameenglish, s.expirationdate
             """
         )
 
-    def add_shelf(self, name: str, capacity: int | None = None) -> None:
-        self.execute_command(
-            "INSERT INTO shelf (shelfname, capacity) VALUES (%s, %s)",
-            (name, capacity),
-        )
-
-    def delete_shelf(self, shelf_id: int) -> None:
-        has_items = self.fetch_data(
-            "SELECT EXISTS(SELECT 1 FROM shelf_items WHERE shelfid = %s)",
-            (shelf_id,),
-        ).iat[0, 0]
-        if has_items:
-            raise ValueError("Cannot delete shelf: items still assigned.")
-        self.execute_command("DELETE FROM shelf WHERE shelfid = %s", (shelf_id,))
-
-    # ─────────────────────────────────────────────────────────────
-    # Item queries
-    # ─────────────────────────────────────────────────────────────
-    def get_shelf_items(self) -> pd.DataFrame:
-        """
-        Return every item on every shelf.
-
-        Columns: shelfid, shelfname, itemid, itemname, quantity, uom
-        """
-        return self.fetch_data(
+    # ── 2.2 last locid helper ────────────────────────────────
+    def last_locid(self, itemid: int) -> str | None:
+        df = self.fetch_data(
             """
-            SELECT s.shelfid,
-                   s.shelfname,
-                   i.itemid,
-                   i.itemname,
-                   si.quantity,
-                   i.uom
-            FROM   shelf_items si
-            JOIN   shelf       s  USING (shelfid)
-            JOIN   item        i  USING (itemid)
-            ORDER  BY s.shelfname, i.itemname;
-            """
-        )
-
-    def get_items_in_shelf(self, shelf_id: int) -> pd.DataFrame:
-        return self.fetch_data(
-            """
-            SELECT i.itemid,
-                   i.itemname,
-                   si.quantity,
-                   i.uom
-            FROM   shelf_items si
-            JOIN   item        i USING (itemid)
-            WHERE  si.shelfid = %s
-            ORDER  BY i.itemname;
+            SELECT locid
+            FROM   shelfentries
+            WHERE  itemid = %s
+              AND  locid IS NOT NULL
+            ORDER  BY entrydate DESC
+            LIMIT 1
             """,
-            (shelf_id,),
+            (itemid,),
         )
+        return None if df.empty else str(df.iloc[0, 0])
 
-    def search_items(self, term: str) -> pd.DataFrame:
-        like = f"%{term}%"
-        return self.fetch_data(
-            """
-            SELECT i.itemid,
-                   i.itemname,
-                   s.shelfname,
-                   si.quantity
-            FROM   item i
-            JOIN   shelf_items si USING (itemid)
-            JOIN   shelf       s  USING (shelfid)
-            WHERE  i.itemname LIKE %s
-            ORDER  BY i.itemname;
-            """,
-            (like,),
-        )
-
-    # ─────────────────────────────────────────────────────────────
-    # Transfers
-    # ─────────────────────────────────────────────────────────────
-    def move_item(
+    # ── 2.3 add / increment shelf + log + inventory subtract ─
+    def add_to_shelf(
         self,
-        item_id: int,
-        from_shelf: int,
-        to_shelf: int,
-        qty: int,
-        user_email: str | None = None,
+        *,
+        itemid: int,
+        expirationdate,
+        quantity: int,
+        created_by: str,
+        cost_per_unit: float,
+        locid: str,
     ) -> None:
-        if qty <= 0:
-            raise ValueError("Quantity must be positive")
+        conn = _safe_conn()
+        try:
+            with closing(conn.cursor()) as cur:
+                # ① shelf upsert
+                cur.execute(
+                    """
+                    INSERT INTO shelf (itemid, expirationdate, quantity,
+                                       cost_per_unit, locid)
+                    VALUES (%s,%s,%s,%s,%s) AS new
+                    ON DUPLICATE KEY UPDATE
+                        quantity      = shelf.quantity + new.quantity,
+                        cost_per_unit = new.cost_per_unit,
+                        locid         = new.locid,
+                        lastupdated   = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        itemid,
+                        expirationdate,
+                        int(quantity),
+                        float(cost_per_unit),
+                        locid,
+                    ),
+                )
 
-        # Decrease source
-        self.execute_command(
-            """
-            UPDATE shelf_items
-            SET    quantity = quantity - %s
-            WHERE  itemid   = %s
-              AND  shelfid  = %s
-            """,
-            (qty, item_id, from_shelf),
-        )
+                # ② movement log
+                cur.execute(
+                    """
+                    INSERT INTO shelfentries
+                           (itemid, expirationdate, quantity,
+                            cost_per_unit, createdby, locid)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        itemid,
+                        expirationdate,
+                        int(quantity),
+                        float(cost_per_unit),
+                        created_by,
+                        locid,
+                    ),
+                )
 
-        # Increase / insert destination
-        self.execute_command(
-            """
-            INSERT INTO shelf_items (shelfid, itemid, quantity)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                  quantity = quantity + VALUES(quantity)
-            """,
-            (to_shelf, item_id, qty),
-        )
+                # ③ inventory decrement
+                cur.execute(
+                    """
+                    UPDATE inventory
+                    SET quantity = quantity - %s
+                    WHERE itemid=%s
+                      AND expirationdate=%s
+                      AND cost_per_unit = %s
+                    """,
+                    (
+                        int(quantity),
+                        itemid,
+                        expirationdate,
+                        float(cost_per_unit),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
-        # Audit log
-        self.execute_command(
-            """
-            INSERT INTO shelf_transfers
-            (itemid, from_shelf, to_shelf, quantity, moved_by)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (item_id, from_shelf, to_shelf, qty, user_email),
-        )
-
-    # ─────────────────────────────────────────────────────────────
-    # Alerts
-    # ─────────────────────────────────────────────────────────────
-    def low_stock_alerts(self, threshold: int = 5) -> pd.DataFrame:
+    # ── 2.4 inventory lookup ─────────────────────────────────
+    def get_inventory_by_barcode(self, barcode: str) -> pd.DataFrame:
         return self.fetch_data(
             """
-            SELECT i.itemid,
-                   i.itemname,
-                   SUM(si.quantity) AS total_qty
-            FROM   shelf_items si
-            JOIN   item        i USING (itemid)
-            GROUP  BY i.itemid, i.itemname
-            HAVING SUM(si.quantity) < %s
-            ORDER  BY total_qty;
+            SELECT inv.itemid, i.itemnameenglish AS itemname,
+                   inv.quantity, inv.expirationdate, inv.cost_per_unit
+            FROM   inventory inv
+            JOIN   item i ON inv.itemid = i.itemid
+            WHERE  i.barcode = %s
+              AND  inv.quantity > 0
+            ORDER  BY inv.expirationdate
+            """,
+            (barcode,),
+        )
+
+    # ── 2.5 shortage resolver (unchanged logic) ──────────────
+    def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
+        remaining = qty_need
+        conn = _safe_conn()
+        try:
+            with closing(conn.cursor(dictionary=True)) as cur:
+                cur.execute(
+                    """
+                    SELECT shortageid, shortage_qty
+                    FROM   shelf_shortage
+                    WHERE  itemid = %s
+                      AND  resolved = FALSE
+                    ORDER  BY logged_at
+                    FOR UPDATE
+                    """,
+                    (itemid,),
+                )
+                for row in cur.fetchall():
+                    if remaining == 0:
+                        break
+                    take = min(remaining, int(row["shortage_qty"]))
+                    cur.execute(
+                        """
+                        UPDATE shelf_shortage
+                        SET shortage_qty = shortage_qty - %s,
+                            resolved      = (shortage_qty - %s = 0),
+                            resolved_qty  = COALESCE(resolved_qty,0) + %s,
+                            resolved_at   = CASE
+                                             WHEN shortage_qty - %s = 0
+                                             THEN CURRENT_TIMESTAMP END,
+                            resolved_by   = %s
+                        WHERE shortageid = %s
+                        """,
+                        (take, take, take, take, user, row["shortageid"]),
+                    )
+                    remaining -= take
+                cur.execute("DELETE FROM shelf_shortage WHERE shortage_qty = 0")
+            conn.commit()
+        finally:
+            conn.close()
+        return remaining
+
+    # ── 2.6 quick low stock ──────────────────────────────────
+    @st.cache_data(ttl=10)
+    def get_low_shelf_stock(_self, threshold: int = 10) -> pd.DataFrame:
+        return _self.fetch_data(
+            """
+            SELECT s.itemid, i.itemnameenglish AS itemname,
+                   s.quantity, s.expirationdate
+            FROM   shelf s
+            JOIN   item i ON s.itemid = i.itemid
+            WHERE  s.quantity <= %s
+            ORDER  BY s.quantity
             """,
             (threshold,),
         )
+
+    # ── 2.7 item master list ─────────────────────────────────
+    @st.cache_data(ttl=30)
+    def get_all_items(_self) -> pd.DataFrame:
+        df = _self.fetch_data(
+            """
+            SELECT itemid,
+                   itemnameenglish AS itemname,
+                   shelfthreshold,
+                   shelfaverage
+            FROM   item
+            ORDER  BY itemnameenglish
+            """
+        )
+        if not df.empty:
+            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
+            df["shelfaverage"] = df["shelfaverage"].astype("Int64")
+        return df
+
+    def update_shelf_settings(self, itemid: int, thr: int, avg: int) -> None:
+        self.execute(
+            """
+            UPDATE item
+            SET shelfthreshold = %s,
+                shelfaverage   = %s
+            WHERE itemid = %s
+            """,
+            (int(thr), int(avg), int(itemid)),
+        )
+
+    # ── 2.8 quantity by item ─────────────────────────────────
+    @st.cache_data(ttl=10)
+    def get_shelf_quantity_by_item(_self) -> pd.DataFrame:
+        df = _self.fetch_data(
+            """
+            SELECT i.itemid,
+                   i.itemnameenglish AS itemname,
+                   COALESCE(SUM(s.quantity),0) AS totalquantity,
+                   i.shelfthreshold,
+                   i.shelfaverage
+            FROM   item i
+            LEFT JOIN shelf s ON i.itemid = s.itemid
+            GROUP  BY i.itemid, i.itemnameenglish,
+                      i.shelfthreshold, i.shelfaverage
+            ORDER  BY i.itemnameenglish
+            """
+        )
+        if not df.empty:
+            df["totalquantity"] = df["totalquantity"].astype(int)
+            df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
+            df["shelfaverage"] = df["shelfaverage"].astype("Int64")
+        return df
