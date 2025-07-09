@@ -1,5 +1,5 @@
 """
-db_handler.py  – MySQL edition, PyMySQL driver (no native crashes)
+db_handler.py – MySQL edition, PyMySQL driver (no native crashes)
 
 Why the rewrite?
 ────────────────
@@ -12,6 +12,8 @@ Key points
 • One cached PyMySQL connection per Streamlit session (`st.cache_resource`).
 • Automatic keep-alive: `conn.ping(reconnect=True)` before each query avoids
   the “MySQL server has gone away” error.
+• Any connection-level failure (OperationalError, InterfaceError, InternalError)
+  triggers a one-time reconnect + retry.
 • Public API identical to the old version (`fetch_data`, `execute_command`,
   `execute_command_returning`, etc.).
 """
@@ -23,7 +25,7 @@ from typing import Any, Sequence, List
 
 import pandas as pd
 import pymysql
-from pymysql.err import OperationalError, InterfaceError
+from pymysql.err import OperationalError, InterfaceError, InternalError  # NEW
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────
@@ -46,14 +48,18 @@ def _get_conn(params: dict, cache_key: str):
         pass
     return conn
 
+
 # ─────────────────────────────────────────────────────────────
 # 2. DatabaseManager
 # ─────────────────────────────────────────────────────────────
 class DatabaseManager:
     """Lightweight DB helper using a cached PyMySQL connection."""
 
+    # ---------------------------------------------------------
+    # constructor
+    # ---------------------------------------------------------
     def __init__(self):
-        # ---- read secrets ---------------------------------------------------
+        # ---- read secrets -----------------------------------
         secrets = st.secrets
         if "mysql" in secrets:           # sectioned secrets.toml
             secrets = secrets["mysql"]
@@ -71,21 +77,23 @@ class DatabaseManager:
             return default
 
         self._params: dict[str, Any] = dict(
-            host            = pick("DB_HOST", "host"),
-            port            = int(pick("DB_PORT", "port", default=3306)),
-            user            = pick("DB_USER", "user"),
-            password        = pick("DB_PASS", "password"),
-            database        = pick("DB_NAME", "database"),
-            charset         = "utf8mb4",
-            autocommit      = True,
-            cursorclass     = pymysql.cursors.Cursor,  # plain tuples
+            host        = pick("DB_HOST", "host"),
+            port        = int(pick("DB_PORT", "port", default=3306)),
+            user        = pick("DB_USER", "user"),
+            password    = pick("DB_PASS", "password"),
+            database    = pick("DB_NAME", "database"),
+            charset     = "utf8mb4",
+            autocommit  = True,
+            cursorclass = pymysql.cursors.Cursor,  # plain tuples; use DictCursor if preferred
         )
 
         self._cache_key = _session_key()
         self.conn       = _get_conn(self._params, self._cache_key)
 
-    # ---------- internal util ----------------------------------------------
-    def _ensure_live(self):
+    # ---------------------------------------------------------
+    # internal utilities
+    # ---------------------------------------------------------
+    def _ensure_live(self) -> None:
         """Ping connection; reconnect if server closed it."""
         try:
             self.conn.ping(reconnect=True)
@@ -93,40 +101,58 @@ class DatabaseManager:
             _get_conn.clear()
             self.conn = _get_conn(self._params, self._cache_key)
 
+    def _retryable(self, fn, *args, **kwargs):
+        """
+        Execute *fn* once; on connection-level failures (OperationalError,
+        InterfaceError, InternalError) clear cache, reconnect and retry once.
+        """
+        try:
+            return fn(*args, **kwargs)
+        except (OperationalError, InterfaceError, InternalError):
+            _get_conn.clear()
+            self.conn = _get_conn(self._params, self._cache_key)
+            return fn(*args, **kwargs)
+
+    # ---------------------------------------------------------
+    # low-level query helpers
+    # ---------------------------------------------------------
     def _fetch_df(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
-        self._ensure_live()
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                rows = cur.fetchall()
-                cols = [c[0] for c in cur.description]
-            return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
-        except (OperationalError, InterfaceError):
-            # retry once after reconnect
-            _get_conn.clear()
-            self.conn = _get_conn(self._params, self._cache_key)
+        def _run() -> pd.DataFrame:
+            self._ensure_live()
             with self.conn.cursor() as cur:
                 cur.execute(sql, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
             return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
 
-    def _execute(self, sql: str, params: Sequence[Any] | None = None, *, returning=False):
-        self._ensure_live()
-        try:
+        return self._retryable(_run)
+
+    def _execute(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+        *,
+        returning: bool = False,
+    ):
+        def _run():
+            self._ensure_live()
             with self.conn.cursor() as cur:
                 cur.execute(sql, params or ())
                 result = cur.fetchone() if returning else None
-            return result
-        except (OperationalError, InterfaceError):
-            _get_conn.clear()
-            self.conn = _get_conn(self._params, self._cache_key)
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                result = cur.fetchone() if returning else None
+
+                # Ensure remaining result set is consumed so the connection
+                # is clean for the next command.  This is cheap because the
+                # result set is already buffered client-side.
+                if returning:
+                    cur.fetchall()
+
             return result
 
-    # ---------- public API --------------------------------------------------
+        return self._retryable(_run)
+
+    # ---------------------------------------------------------
+    # public API
+    # ---------------------------------------------------------
     def fetch_data(self, query: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
         return self._fetch_df(query, params)
 
@@ -134,36 +160,49 @@ class DatabaseManager:
         self._execute(query, params)
 
     def execute_command_returning(
-        self, query: str, params: Sequence[Any] | None = None
+        self,
+        query: str,
+        params: Sequence[Any] | None = None,
     ):
         return self._execute(query, params, returning=True)
 
-    # ---------- Dropdown helpers -------------------------------------------
+    # ---------------------------------------------------------
+    # dropdown helpers
+    # ---------------------------------------------------------
     def get_all_sections(self) -> List[str]:
         df = self.fetch_data("SELECT DISTINCT section FROM dropdowns")
         return df["section"].tolist()
 
     def get_dropdown_values(self, section: str) -> List[str]:
-        df = self.fetch_data("SELECT value FROM dropdowns WHERE section = %s", (section,))
+        df = self.fetch_data(
+            "SELECT value FROM dropdowns WHERE section = %s",
+            (section,),
+        )
         return df["value"].tolist()
 
-    # ---------- Supplier helpers -------------------------------------------
+    # ---------------------------------------------------------
+    # supplier helpers
+    # ---------------------------------------------------------
     def get_suppliers(self) -> pd.DataFrame:
         return self.fetch_data("SELECT supplierid, suppliername FROM supplier")
 
-    # ---------- Inventory helpers ------------------------------------------
+    # ---------------------------------------------------------
+    # inventory helpers
+    # ---------------------------------------------------------
     def add_inventory(self, data: dict[str, Any]) -> None:
         cols = ", ".join(data.keys())
         ph   = ", ".join(["%s"] * len(data))
-        q = f"INSERT INTO inventory ({cols}) VALUES ({ph})"
+        q    = f"INSERT INTO inventory ({cols}) VALUES ({ph})"
         self.execute_command(q, list(data.values()))
 
-    # ---------- FK safety helper -------------------------------------------
+    # ---------------------------------------------------------
+    # FK safety helper
+    # ---------------------------------------------------------
     def check_foreign_key_references(
         self,
         referenced_table: str,
         referenced_column: str,
-        value: Any
+        value: Any,
     ) -> List[str]:
         fk_sql = """
             SELECT tc.table_schema, tc.table_name
