@@ -1,115 +1,94 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-• Uses SQLAlchemy engine for all pandas reads (silences read_sql warnings)
-• Keeps mysql-connector pool for fast transactional writes
-• FIX: removed `cost_per_unit` from INSERT INTO shelfentries
-  (table does not have that column → ProgrammingError 1054)
+Streamlined helper for the Selling-Area pages.
+
+Key points
+──────────
+1. Single SQLAlchemy engine (mysql+mysqlconnector) for *all* queries.
+   • pool_pre_ping=True   → stale connections auto-revalidated
+   • pool_recycle=3600    → long-running app safety
+2. No mysql-connector pool – fewer moving parts, fewer SSL issues.
+3. All write methods run inside `engine.begin()` (single transaction)
+   and retry once on transient Operational/Interface errors.
+4. INSERT into `shelfentries` no longer includes the non-existent
+   `cost_per_unit` column (fixed earlier).
 """
 
 from __future__ import annotations
 
 import time
-from contextlib import closing
-from typing import Any, Sequence
+from typing import Any, Sequence, Callable, TypeVar
 
 import pandas as pd
 import streamlit as st
-import mysql.connector
-import mysql.connector.pooling
-from mysql.connector import errors as sqlerr
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, InterfaceError, SQLAlchemyError
 
-
-# ╭────────────────────────────────────────────────────────────╮
-# │ 0.  Connection helpers                                     │
-# ╰────────────────────────────────────────────────────────────╯
+# ── Engine setup ────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _get_engine() -> Engine:
-    """Small SQLAlchemy pool for read-only queries."""
     cfg = st.secrets["mysql"]
     uri = (
         "mysql+mysqlconnector://"
         f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port',3306)}/"
         f"{cfg['database']}"
+        "?charset=utf8mb4"
     )
+    # pool_pre_ping=True → transparently reconnect dropped links
     return create_engine(
         uri,
-        pool_size=4,
-        pool_recycle=3_600,
-        pool_pre_ping=True,  # auto-reconnect
+        pool_size=6,
+        pool_recycle=3_600,  # recycle after 1 h just in case
+        pool_pre_ping=True,
     )
 
+engine: Engine = _get_engine()
 
-@st.cache_resource(show_spinner=False)
-def _get_pool() -> mysql.connector.pooling.MySQLConnectionPool | None:
-    """mysql-connector pool for transactional statements."""
-    cfg = st.secrets["mysql"]
-    try:
-        return mysql.connector.pooling.MySQLConnectionPool(
-            pool_name="amas_pool",
-            pool_size=4,
-            pool_reset_session=True,
-            host=cfg["host"],
-            port=int(cfg.get("port", 3306)),
-            user=cfg["user"],
-            password=cfg["password"],
-            database=cfg["database"],
-            autocommit=False,
-            connection_timeout=5,
-        )
-    except sqlerr.InterfaceError as e:
-        st.error(f"❌ Cannot reach MySQL: {e.msg}")
-        return None
+T = TypeVar("T")
 
 
-def _safe_conn(retries: int = 2):
-    """Get a connector connection or raise after quick retries."""
-    pool = _get_pool()
-    if pool is None:
-        raise RuntimeError("Database unreachable")
-    last: Exception | None = None
-    for back in range(retries + 1):
+def _with_retry(func: Callable[..., T], /, *args, **kwargs) -> T:
+    """
+    Execute `func` once; on OperationalError/InterfaceError retry once
+    after a brief pause. Propagate on second failure.
+    """
+    for attempt in (1, 2):
         try:
-            return pool.get_connection()
-        except sqlerr.InterfaceError as err:
-            last = err
-            time.sleep(back)  # 0 s → 1 s
-    raise last or RuntimeError("Unknown DB error")
+            return func(*args, **kwargs)
+        except (OperationalError, InterfaceError) as err:
+            if attempt == 2:
+                raise
+            time.sleep(0.5)  # quick back-off then retry
+            # dispose the whole pool so next get() forces new socket
+            engine.dispose()
 
 
-# ╭────────────────────────────────────────────────────────────╮
-# │ 1.  Base DB wrapper                                        │
-# ╰────────────────────────────────────────────────────────────╯
+# ── Base wrapper ────────────────────────────────────────────
 class DatabaseManager:
     # ---------- READ ----------
-    def fetch_data(
-        self, sql: str, params: Sequence[Any] | None = None
-    ) -> pd.DataFrame:
+    def fetch_data(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
+        def _read():
+            return pd.read_sql_query(text(sql), engine, params=params)
+
         try:
-            return pd.read_sql_query(sql, _get_engine(), params=params)
-        except (SQLAlchemyError, ValueError) as err:
+            return _with_retry(_read)
+        except SQLAlchemyError as err:
             st.error(f"❌ DB read failed: {err}")
             return pd.DataFrame()
 
     # ---------- WRITE ----------
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
-        conn = _safe_conn()
-        try:
-            with closing(conn.cursor()) as cur:
-                cur.execute(sql, params)
-            conn.commit()
-        finally:
-            conn.close()
+        def _write():
+            with engine.begin() as conn:
+                conn.execute(text(sql), params or {})
+        _with_retry(_write)
 
 
-# ╭────────────────────────────────────────────────────────────╮
-# │ 2.  Shelf-specific helpers                                 │
-# ╰────────────────────────────────────────────────────────────╯
+# ── Shelf-specific helpers ──────────────────────────────────
 class ShelfHandler(DatabaseManager):
-    # ── 2.1 current shelf items ──────────────────────────────
+    # 2.1 current shelf items
     @st.cache_data(ttl=10)
     def get_shelf_items(_self) -> pd.DataFrame:
         return _self.fetch_data(
@@ -123,22 +102,21 @@ class ShelfHandler(DatabaseManager):
             """
         )
 
-    # ── 2.2 last locid helper ────────────────────────────────
+    # 2.2 last locid helper
     def last_locid(self, itemid: int) -> str | None:
         df = self.fetch_data(
             """
             SELECT locid
             FROM   shelfentries
-            WHERE  itemid = %s
-              AND  locid IS NOT NULL
+            WHERE  itemid = :itemid AND locid IS NOT NULL
             ORDER  BY entrydate DESC
             LIMIT 1
             """,
-            (itemid,),
+            {"itemid": itemid},
         )
         return None if df.empty else str(df.iloc[0, 0])
 
-    # ── 2.3 add / increment shelf + log + inventory subtract ─
+    # 2.3 add / increment shelf + log + inventory subtract
     def add_to_shelf(
         self,
         *,
@@ -149,68 +127,72 @@ class ShelfHandler(DatabaseManager):
         cost_per_unit: float,
         locid: str,
     ) -> None:
-        conn = _safe_conn()
-        try:
-            with closing(conn.cursor()) as cur:
+        def _tx():
+            with engine.begin() as conn:
                 # ① shelf upsert
-                cur.execute(
-                    """
-                    INSERT INTO shelf (itemid, expirationdate, quantity,
-                                       cost_per_unit, locid)
-                    VALUES (%s,%s,%s,%s,%s) AS new
-                    ON DUPLICATE KEY UPDATE
-                        quantity      = shelf.quantity + new.quantity,
-                        cost_per_unit = new.cost_per_unit,
-                        locid         = new.locid,
-                        lastupdated   = CURRENT_TIMESTAMP
-                    """,
-                    (
-                        itemid,
-                        expirationdate,
-                        int(quantity),
-                        float(cost_per_unit),
-                        locid,
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO shelf (itemid, expirationdate, quantity,
+                                           cost_per_unit, locid)
+                        VALUES (:itemid,:exp,:qty,:cpu,:loc) AS new
+                        ON DUPLICATE KEY UPDATE
+                            quantity      = shelf.quantity + new.quantity,
+                            cost_per_unit = new.cost_per_unit,
+                            locid         = new.locid,
+                            lastupdated   = CURRENT_TIMESTAMP
+                        """
+                    ),
+                    dict(
+                        itemid=itemid,
+                        exp=expirationdate,
+                        qty=int(quantity),
+                        cpu=float(cost_per_unit),
+                        loc=locid,
                     ),
                 )
 
-                # ② movement log  (cost_per_unit removed – table lacks it)
-                cur.execute(
-                    """
-                    INSERT INTO shelfentries
-                           (itemid, expirationdate, quantity,
-                            createdby, locid)
-                    VALUES (%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        itemid,
-                        expirationdate,
-                        int(quantity),
-                        created_by,
-                        locid,
+                # ② movement log  (no cost_per_unit column)
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO shelfentries
+                               (itemid, expirationdate, quantity,
+                                createdby, locid)
+                        VALUES (:itemid,:exp,:qty,:user,:loc)
+                        """
+                    ),
+                    dict(
+                        itemid=itemid,
+                        exp=expirationdate,
+                        qty=int(quantity),
+                        user=created_by,
+                        loc=locid,
                     ),
                 )
 
-                # ③ inventory decrement (keeps cost_per_unit filter)
-                cur.execute(
-                    """
-                    UPDATE inventory
-                    SET quantity = quantity - %s
-                    WHERE itemid          = %s
-                      AND expirationdate  = %s
-                      AND cost_per_unit   = %s
-                    """,
-                    (
-                        int(quantity),
-                        itemid,
-                        expirationdate,
-                        float(cost_per_unit),
+                # ③ inventory decrement
+                conn.execute(
+                    text(
+                        """
+                        UPDATE inventory
+                        SET quantity = quantity - :qty
+                        WHERE itemid = :itemid
+                          AND expirationdate = :exp
+                          AND cost_per_unit  = :cpu
+                        """
+                    ),
+                    dict(
+                        qty=int(quantity),
+                        itemid=itemid,
+                        exp=expirationdate,
+                        cpu=float(cost_per_unit),
                     ),
                 )
-            conn.commit()
-        finally:
-            conn.close()
 
-    # ── 2.4 inventory lookup ─────────────────────────────────
+        _with_retry(_tx)
+
+    # 2.4 inventory lookup
     def get_inventory_by_barcode(self, barcode: str) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -218,56 +200,61 @@ class ShelfHandler(DatabaseManager):
                    inv.quantity, inv.expirationdate, inv.cost_per_unit
             FROM   inventory inv
             JOIN   item i ON inv.itemid = i.itemid
-            WHERE  i.barcode = %s
-              AND  inv.quantity > 0
+            WHERE  i.barcode = :bc AND inv.quantity > 0
             ORDER  BY inv.expirationdate
             """,
-            (barcode,),
+            {"bc": barcode},
         )
 
-    # ── 2.5 shortage resolver (unchanged logic) ──────────────
+    # 2.5 shortage resolver
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         remaining = qty_need
-        conn = _safe_conn()
-        try:
-            with closing(conn.cursor(dictionary=True)) as cur:
-                cur.execute(
-                    """
-                    SELECT shortageid, shortage_qty
-                    FROM   shelf_shortage
-                    WHERE  itemid = %s
-                      AND  resolved = FALSE
-                    ORDER  BY logged_at
-                    FOR UPDATE
-                    """,
-                    (itemid,),
-                )
-                for row in cur.fetchall():
+
+        def _tx() -> int:
+            nonlocal remaining
+            with engine.begin() as conn:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT shortageid, shortage_qty
+                        FROM   shelf_shortage
+                        WHERE  itemid = :itemid
+                          AND  resolved = FALSE
+                        ORDER  BY logged_at
+                        FOR UPDATE
+                        """
+                    ),
+                    {"itemid": itemid},
+                ).mappings()
+
+                for row in rows:
                     if remaining == 0:
                         break
                     take = min(remaining, int(row["shortage_qty"]))
-                    cur.execute(
-                        """
-                        UPDATE shelf_shortage
-                        SET shortage_qty = shortage_qty - %s,
-                            resolved      = (shortage_qty - %s = 0),
-                            resolved_qty  = COALESCE(resolved_qty,0) + %s,
-                            resolved_at   = CASE
-                                             WHEN shortage_qty - %s = 0
-                                             THEN CURRENT_TIMESTAMP END,
-                            resolved_by   = %s
-                        WHERE shortageid = %s
-                        """,
-                        (take, take, take, take, user, row["shortageid"]),
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE shelf_shortage
+                            SET shortage_qty = shortage_qty - :take,
+                                resolved      = (shortage_qty - :take = 0),
+                                resolved_qty  = COALESCE(resolved_qty,0)+:take,
+                                resolved_at   = CASE
+                                                 WHEN shortage_qty - :take = 0
+                                                 THEN CURRENT_TIMESTAMP END,
+                                resolved_by   = :user
+                            WHERE shortageid = :sid
+                            """
+                        ),
+                        {"take": take, "user": user, "sid": row["shortageid"]},
                     )
                     remaining -= take
-                cur.execute("DELETE FROM shelf_shortage WHERE shortage_qty = 0")
-            conn.commit()
-        finally:
-            conn.close()
-        return remaining
 
-    # ── 2.6 quick low stock ──────────────────────────────────
+                conn.execute(text("DELETE FROM shelf_shortage WHERE shortage_qty = 0"))
+            return remaining
+
+        return _with_retry(_tx)
+
+    # 2.6 quick low stock
     @st.cache_data(ttl=10)
     def get_low_shelf_stock(_self, threshold: int = 10) -> pd.DataFrame:
         return _self.fetch_data(
@@ -276,13 +263,13 @@ class ShelfHandler(DatabaseManager):
                    s.quantity, s.expirationdate
             FROM   shelf s
             JOIN   item i ON s.itemid = i.itemid
-            WHERE  s.quantity <= %s
+            WHERE  s.quantity <= :thr
             ORDER  BY s.quantity
             """,
-            (threshold,),
+            {"thr": threshold},
         )
 
-    # ── 2.7 item master list ─────────────────────────────────
+    # 2.7 item master list
     @st.cache_data(ttl=30)
     def get_all_items(_self) -> pd.DataFrame:
         df = _self.fetch_data(
@@ -300,18 +287,19 @@ class ShelfHandler(DatabaseManager):
             df["shelfaverage"] = df["shelfaverage"].astype("Int64")
         return df
 
+    # 2.7b update shelf settings
     def update_shelf_settings(self, itemid: int, thr: int, avg: int) -> None:
         self.execute(
             """
             UPDATE item
-            SET shelfthreshold = %s,
-                shelfaverage   = %s
-            WHERE itemid = %s
+            SET shelfthreshold = :thr,
+                shelfaverage   = :avg
+            WHERE itemid = :id
             """,
-            (int(thr), int(avg), int(itemid)),
+            {"thr": int(thr), "avg": int(avg), "id": int(itemid)},
         )
 
-    # ── 2.8 quantity by item ─────────────────────────────────
+    # 2.8 quantity by item
     @st.cache_data(ttl=10)
     def get_shelf_quantity_by_item(_self) -> pd.DataFrame:
         df = _self.fetch_data(
