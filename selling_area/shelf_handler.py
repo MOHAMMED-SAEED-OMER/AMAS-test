@@ -1,196 +1,176 @@
+# selling_area/shelf_handler.py
 """
-db_handler.py  – PostgreSQL/Neon edition (psycopg 3 driver, no native crashes)
+ShelfHandler – helper class for the Selling-Area module
+=======================================================
 
-Compared with the old MySQL-based version
-──────────────────────────────────────────
-• Uses **psycopg 3** (pure-Python) – lighter than psycopg2 and fully async-ready.
-• One cached connection per Streamlit session (`st.cache_resource`).
-• Automatic keep-alive: a cheap `SELECT 1` (or reconnect) before every query
-  prevents “connection closed” errors when Neon pauses an idle session.
-• Public API and helper names are **unchanged**, so the rest of your codebase
-  (e.g. `ShelfHandler`, Supplier pages, etc.) can stay as-is.
+A thin wrapper around **DatabaseManager** (which uses PyMySQL) that provides
+shelf-specific database helpers for your Streamlit pages.
+
+Functions included
+------------------
+list_shelves()              → all shelves with capacity & usage
+add_shelf(name, capacity)   → create a new shelf
+delete_shelf(id)            → safe delete (only when empty)
+get_items_in_shelf(id)      → items & quantities on a shelf
+search_items(term)          → fuzzy search across shelves
+move_item(...)              → transfer quantity between shelves + audit log
+low_stock_alerts(threshold) → items below a total-stock threshold
 """
 
 from __future__ import annotations
 
-import uuid
-from typing import Any, Sequence, List
+from typing import Any
 
 import pandas as pd
-import psycopg                           # psycopg 3
-from psycopg.rows import dict_row        # rows → dict for painless DF build
 import streamlit as st
 
-# ─────────────────────────────────────────────────────────────
-# 1. Helpers for session-scoped connection
-# ─────────────────────────────────────────────────────────────
-def _session_key() -> str:
-    """Unique key per Streamlit browser session."""
-    if "_session_key" not in st.session_state:
-        st.session_state["_session_key"] = uuid.uuid4().hex
-    return st.session_state["_session_key"]
+from db_handler import DatabaseManager
 
 
-@st.cache_resource(show_spinner=False)
-def _get_conn(params: dict, cache_key: str) -> psycopg.Connection:
-    """Create a psycopg 3 connection once per Streamlit session."""
-    conn = psycopg.connect(**params, row_factory=dict_row, autocommit=True)
-    try:
-        st.on_session_end(conn.close)    # tidy shutdown in the browser tab
-    except Exception:                    # running in a non-interactive context
-        pass
-    return conn
+class ShelfHandler(DatabaseManager):
+    """Shelf-level data helpers built on top of DatabaseManager."""
 
-
-# ─────────────────────────────────────────────────────────────
-# 2. DatabaseManager
-# ─────────────────────────────────────────────────────────────
-class DatabaseManager:
-    """Lightweight DB helper using a cached psycopg 3 connection."""
-
-    def __init__(self) -> None:
-        # ---- read secrets ---------------------------------------------------
-        secrets = st.secrets
-        if "postgres" in secrets:                 # allow sectioned [postgres]
-            secrets = secrets["postgres"]
-
-        def pick(*keys: str, default: Any = None):
-            """Return first present secret key (case-insensitive)."""
-            for k in keys:
-                for variant in (k, k.lower()):
-                    if variant in secrets:
-                        return secrets[variant]
-            return default
-
-        self._params: dict[str, Any] = dict(
-            host       = pick("DB_HOST",  "host"),
-            port       = int(pick("DB_PORT", "port", default=5432)),
-            dbname     = pick("DB_NAME",  "database"),
-            user       = pick("DB_USER",  "user"),
-            password   = pick("DB_PASS",  "password"),
-            sslmode    = pick("DB_SSLMODE", "sslmode", default="require"),
-            # Neon expects SSL; `require` is safest.
-        )
-
-        self._cache_key = _session_key()
-        self.conn       = _get_conn(self._params, self._cache_key)
-
-    # ---------- internal util ----------------------------------------------
-    def _ensure_live(self) -> None:
-        """Make sure the connection is open; reconnect if Neon suspended it."""
-        try:
-            if self.conn.closed:                       # type: ignore[attr-defined]
-                raise psycopg.OperationalError
-            with self.conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-        except Exception:
-            _get_conn.clear()                          # bust Streamlit cache
-            self.conn = _get_conn(self._params, self._cache_key)
-
-    def _fetch_df(
-        self,
-        sql: str,
-        params: Sequence[Any] | None = None
-    ) -> pd.DataFrame:
-        self._ensure_live()
-        with self.conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            rows = cur.fetchall()
-            if not rows:               # empty result → empty DF with 0 columns
-                return pd.DataFrame()
-            return pd.DataFrame(rows)  # dict_row → keys become columns
-
-    def _execute(
-        self,
-        sql: str,
-        params: Sequence[Any] | None = None,
-        *,
-        returning: bool = False
-    ):
-        self._ensure_live()
-        with self.conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            return cur.fetchone() if returning else None
-
-    # ---------- public API --------------------------------------------------
-    def fetch_data(
-        self,
-        query: str,
-        params: Sequence[Any] | None = None
-    ) -> pd.DataFrame:
-        return self._fetch_df(query, params)
-
-    def execute_command(
-        self,
-        query: str,
-        params: Sequence[Any] | None = None
-    ) -> None:
-        self._execute(query, params)
-
-    def execute_command_returning(
-        self,
-        query: str,
-        params: Sequence[Any] | None = None,
-    ):
-        return self._execute(query, params, returning=True)
-
-    # ---------- Dropdown helpers -------------------------------------------
-    def get_all_sections(self) -> List[str]:
-        df = self.fetch_data("SELECT DISTINCT section FROM dropdowns;")
-        return df["section"].tolist()
-
-    def get_dropdown_values(self, section: str) -> List[str]:
-        df = self.fetch_data(
-            "SELECT value FROM dropdowns WHERE section = %s;", (section,)
-        )
-        return df["value"].tolist()
-
-    # ---------- Supplier helpers -------------------------------------------
-    def get_suppliers(self) -> pd.DataFrame:
+    # ─────────────────────────────────────────────────────────────
+    # Shelf CRUD
+    # ─────────────────────────────────────────────────────────────
+    def list_shelves(self) -> pd.DataFrame:
+        """Return all shelves with capacity and current utilisation."""
         return self.fetch_data(
-            "SELECT supplierid, suppliername FROM supplier;"
+            """
+            SELECT shelfid,
+                   shelfname,
+                   capacity,
+                   (
+                     SELECT COALESCE(SUM(quantity),0)
+                     FROM   shelf_items si
+                     WHERE  si.shelfid = s.shelfid
+                   ) AS used_capacity
+            FROM   shelf AS s
+            ORDER  BY shelfname;
+            """
         )
 
-    # ---------- Inventory helpers ------------------------------------------
-    def add_inventory(self, data: dict[str, Any]) -> None:
-        cols = ", ".join(data.keys())
-        ph   = ", ".join(["%s"] * len(data))
-        q    = f"INSERT INTO inventory ({cols}) VALUES ({ph});"
-        self.execute_command(q, list(data.values()))
+    def add_shelf(self, name: str, capacity: int | None = None) -> None:
+        """Insert a new shelf row."""
+        self.execute_command(
+            "INSERT INTO shelf (shelfname, capacity) VALUES (%s, %s)",
+            (name, capacity),
+        )
 
-    # ---------- FK safety helper -------------------------------------------
-    def check_foreign_key_references(
-        self,
-        referenced_table: str,
-        referenced_column: str,
-        value: Any
-    ) -> List[str]:
-        fk_sql = """
-            SELECT tc.table_schema, tc.table_name
-            FROM   information_schema.table_constraints AS tc
-            JOIN   information_schema.key_column_usage AS kcu
-                   ON tc.constraint_name = kcu.constraint_name
-            JOIN   information_schema.constraint_column_usage AS ccu
-                   ON ccu.constraint_name = tc.constraint_name
-            WHERE  tc.constraint_type = 'FOREIGN KEY'
-              AND  ccu.table_name      = %s
-              AND  ccu.column_name     = %s;
+    def delete_shelf(self, shelf_id: int) -> None:
         """
-        fks = self.fetch_data(fk_sql, (referenced_table, referenced_column))
+        Delete a shelf only if it is empty.
+        Raises ValueError if items are still present.
+        """
+        has_items = self.fetch_data(
+            "SELECT EXISTS(SELECT 1 FROM shelf_items WHERE shelfid = %s)",
+            (shelf_id,),
+        ).iat[0, 0]
+        if has_items:
+            raise ValueError("Cannot delete shelf: items still assigned.")
+        self.execute_command("DELETE FROM shelf WHERE shelfid = %s", (shelf_id,))
 
-        conflicts: List[str] = []
-        for _, row in fks.iterrows():
-            schema = row["table_schema"]
-            table  = row["table_name"]
-            exists_sql = f"""
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM   {schema}.{table}
-                    WHERE  {referenced_column} = %s
-                );
+    # ─────────────────────────────────────────────────────────────
+    # Item queries
+    # ─────────────────────────────────────────────────────────────
+    def get_items_in_shelf(self, shelf_id: int) -> pd.DataFrame:
+        """Return items and quantities stored on one shelf."""
+        return self.fetch_data(
             """
-            exists = self.fetch_data(exists_sql, (value,)).iat[0, 0]
-            if exists:
-                conflicts.append(f"{schema}.{table}")
+            SELECT i.itemid,
+                   i.itemname,
+                   si.quantity,
+                   i.uom
+            FROM   shelf_items si
+            JOIN   item        i USING (itemid)
+            WHERE  si.shelfid = %s
+            ORDER  BY i.itemname;
+            """,
+            (shelf_id,),
+        )
 
-        return sorted(set(conflicts))
+    def search_items(self, term: str) -> pd.DataFrame:
+        """Case-insensitive search across item names."""
+        like = f"%{term}%"
+        return self.fetch_data(
+            """
+            SELECT i.itemid,
+                   i.itemname,
+                   s.shelfname,
+                   si.quantity
+            FROM   item i
+            JOIN   shelf_items si USING (itemid)
+            JOIN   shelf       s  USING (shelfid)
+            WHERE  i.itemname LIKE %s
+            ORDER  BY i.itemname;
+            """,
+            (like,),
+        )
+
+    # ─────────────────────────────────────────────────────────────
+    # Transfers
+    # ─────────────────────────────────────────────────────────────
+    def move_item(
+        self,
+        item_id: int,
+        from_shelf: int,
+        to_shelf: int,
+        qty: int,
+        user_email: str | None = None,
+    ) -> None:
+        """
+        Move `qty` of `item_id` from `from_shelf` to `to_shelf`
+        and log the transfer.
+        """
+        if qty <= 0:
+            raise ValueError("Quantity must be positive")
+
+        # Decrease on source
+        self.execute_command(
+            """
+            UPDATE shelf_items
+            SET    quantity = quantity - %s
+            WHERE  itemid   = %s
+              AND  shelfid  = %s
+            """,
+            (qty, item_id, from_shelf),
+        )
+
+        # Increase on destination (insert row if new)
+        self.execute_command(
+            """
+            INSERT INTO shelf_items (shelfid, itemid, quantity)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)
+            """,
+            (to_shelf, item_id, qty),
+        )
+
+        # Audit trail
+        self.execute_command(
+            """
+            INSERT INTO shelf_transfers
+            (itemid, from_shelf, to_shelf, quantity, moved_by)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (item_id, from_shelf, to_shelf, qty, user_email),
+        )
+
+    # ─────────────────────────────────────────────────────────────
+    # Alerts
+    # ─────────────────────────────────────────────────────────────
+    def low_stock_alerts(self, threshold: int = 5) -> pd.DataFrame:
+        """Return items whose total quantity is below `threshold`."""
+        return self.fetch_data(
+            """
+            SELECT i.itemid,
+                   i.itemname,
+                   SUM(si.quantity) AS total_qty
+            FROM   shelf_items si
+            JOIN   item        i USING (itemid)
+            GROUP  BY i.itemid, i.itemname
+            HAVING SUM(si.quantity) < %s
+            ORDER  BY total_qty;
+            """,
+            (threshold,),
+        )
