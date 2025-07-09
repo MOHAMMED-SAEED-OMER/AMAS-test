@@ -1,16 +1,10 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-• Tries to use the pure-Python PyMySQL driver (no seg-faults).
-• If PyMySQL isn’t installed, silently falls back to mysql-connector.
-• One resilient SQLAlchemy engine, auto-ping, pool_recycle=3600.
-• Relies on DB defaults for entryid (AUTO_INCREMENT) & entrydate
-  (DEFAULT CURRENT_TIMESTAMP).  Make sure the table is:
-
-    ALTER TABLE shelfentries
-      MODIFY entryid  INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-      MODIFY entrydate DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP;
-
+• Pure-Python PyMySQL driver if present; else fallback to mysql-connector.
+• Resilient SQLAlchemy engine (pool_pre_ping, pool_recycle=3600) with 1-retry.
+• DB auto-generates entryid (AUTO_INCREMENT) + entrydate (DEFAULT CURRENT_TIMESTAMP).
+• Public method names now include *get_shelf_items()* expected by the UI.
 """
 
 from __future__ import annotations
@@ -25,32 +19,35 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, InterfaceError, SQLAlchemyError
 
-# ── choose driver ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# 0. Pick driver URI (PyMySQL preferred)                       |
+# ─────────────────────────────────────────────────────────────
 def _driver_uri() -> str:
     cfg = st.secrets["mysql"]
-    # Try PyMySQL first (safe), else fallback to mysql-connector.
     if importlib.util.find_spec("pymysql") is not None:
         driver = "mysql+pymysql://"
     else:
-        st.warning("⚠️  PyMySQL not found; falling back to mysql-connector "
-                   "(may seg-fault on some images). "
-                   "Add 'pymysql>=1.1' to requirements.txt to avoid this.")
+        st.warning(
+            "⚠️  PyMySQL not found; falling back to mysql-connector. "
+            "Add `pymysql>=1.1` to requirements.txt to avoid potential "
+            "native-driver crashes."
+        )
         driver = "mysql+mysqlconnector://"
-
     return (
         f"{driver}{cfg['user']}:{cfg['password']}@"
-        f"{cfg['host']}:{cfg.get('port',3306)}/{cfg['database']}"
-        "?charset=utf8mb4"
+        f"{cfg['host']}:{cfg.get('port',3306)}/{cfg['database']}?charset=utf8mb4"
     )
 
-# ── engine -------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# 1. Engine + retry helper                                     |
+# ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _get_engine() -> Engine:
     return create_engine(
         _driver_uri(),
         pool_size=6,
-        pool_pre_ping=True,   # ping before checkout
-        pool_recycle=3_600,   # recycle sockets after 1 h
+        pool_pre_ping=True,
+        pool_recycle=3_600,  # 1-hour recycle
         future=True,
     )
 
@@ -58,20 +55,21 @@ engine: Engine = _get_engine()
 T = TypeVar("T")
 
 
-def _retry(func: Callable[..., T], *a, **kw) -> T:
-    """Run func; dispose pool + retry once on transient Operational/Interface."""
+def _retry(fn: Callable[..., T], *a, **kw) -> T:
+    """Run DB function, dispose pool + retry once on transient errors."""
     for attempt in (1, 2):
         try:
-            return func(*a, **kw)
+            return fn(*a, **kw)
         except (OperationalError, InterfaceError):
             if attempt == 2:
                 raise
             engine.dispose()
             time.sleep(0.5)
 
-# ── thin wrapper -------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# 2. Thin DB wrapper                                           |
+# ─────────────────────────────────────────────────────────────
 class DB:
-    # read --------------------------------------------------------------------
     def df(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
         def _read():
             return pd.read_sql_query(text(sql), engine, params=params)
@@ -81,16 +79,17 @@ class DB:
             st.error(f"❌ DB read failed: {e}")
             return pd.DataFrame()
 
-    # write -------------------------------------------------------------------
     def exec(self, sql: str, params: Sequence[Any] | None = None) -> None:
         def _write():
             with engine.begin() as c:
                 c.execute(text(sql), params or {})
         _retry(_write)
 
-# ── shelf helpers ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# 3. Shelf-related helpers                                     |
+# ─────────────────────────────────────────────────────────────
 class ShelfHandler(DB):
-    # 1. grid -----------------------------------------------------------------
+    # --- READ current shelf grid ----------------------------
     @st.cache_data(ttl=10)
     def shelf_grid(_s) -> pd.DataFrame:
         return _s.df(
@@ -98,25 +97,30 @@ class ShelfHandler(DB):
             SELECT s.shelfid, s.itemid, i.itemnameenglish AS itemname,
                    s.quantity, s.expirationdate, s.cost_per_unit,
                    s.locid, s.lastupdated
-            FROM shelf s JOIN item i ON s.itemid = i.itemid
-            ORDER BY i.itemnameenglish, s.expirationdate
+            FROM   shelf s
+            JOIN   item i ON s.itemid = i.itemid
+            ORDER  BY i.itemnameenglish, s.expirationdate
             """
         )
 
-    # 2. last location --------------------------------------------------------
+    # alias expected by UI
+    def get_shelf_items(self) -> pd.DataFrame:  # noqa: N802 (keep UI name)
+        return self.shelf_grid()
+
+    # --- READ last locid ------------------------------------
     def last_locid(self, itemid: int) -> str | None:
         df = self.df(
             """
             SELECT locid
-            FROM shelfentries
-            WHERE itemid = :itemid AND locid IS NOT NULL
-            ORDER BY entrydate DESC LIMIT 1
+            FROM   shelfentries
+            WHERE  itemid = :itemid AND locid IS NOT NULL
+            ORDER  BY entrydate DESC LIMIT 1
             """,
             {"itemid": itemid},
         )
         return None if df.empty else str(df.loc[0, "locid"])
 
-    # 3. add / move -----------------------------------------------------------
+    # --- WRITE add / move -----------------------------------
     def add_to_shelf(
         self,
         *,
@@ -129,7 +133,7 @@ class ShelfHandler(DB):
     ) -> None:
         def _tx():
             with engine.begin() as c:
-                # shelf upsert
+                # ① Upsert shelf
                 c.execute(
                     text(
                         """
@@ -143,16 +147,16 @@ class ShelfHandler(DB):
                           lastupdated   = CURRENT_TIMESTAMP
                         """
                     ),
-                    {
-                        "item": itemid,
-                        "exp": expirationdate,
-                        "qty": int(quantity),
-                        "cpu": float(cost_per_unit),
-                        "loc": locid,
-                    },
+                    dict(
+                        item=itemid,
+                        exp=expirationdate,
+                        qty=int(quantity),
+                        cpu=float(cost_per_unit),
+                        loc=locid,
+                    ),
                 )
 
-                # movement log - rely on AUTO_INCREMENT & DEFAULT timestamp
+                # ② Movement log (entryid auto, entrydate default)
                 c.execute(
                     text(
                         """
@@ -162,16 +166,16 @@ class ShelfHandler(DB):
                         VALUES (:item,:qty,:exp,:user,:loc)
                         """
                     ),
-                    {
-                        "item": itemid,
-                        "qty": int(quantity),
-                        "exp": expirationdate,
-                        "user": created_by,
-                        "loc": locid,
-                    },
+                    dict(
+                        item=itemid,
+                        qty=int(quantity),
+                        exp=expirationdate,
+                        user=created_by,
+                        loc=locid,
+                    ),
                 )
 
-                # decrement inventory
+                # ③ Decrement inventory
                 c.execute(
                     text(
                         """
@@ -182,31 +186,31 @@ class ShelfHandler(DB):
                           AND cost_per_unit  = :cpu
                         """
                     ),
-                    {
-                        "qty": int(quantity),
-                        "item": itemid,
-                        "exp": expirationdate,
-                        "cpu": float(cost_per_unit),
-                    },
+                    dict(
+                        qty=int(quantity),
+                        item=itemid,
+                        exp=expirationdate,
+                        cpu=float(cost_per_unit),
+                    ),
                 )
 
         _retry(_tx)
 
-    # 4. barcode lookup -------------------------------------------------------
+    # --- READ by barcode ------------------------------------
     def inv_by_barcode(self, barcode: str) -> pd.DataFrame:
         return self.df(
             """
             SELECT inv.itemid, i.itemnameenglish AS itemname,
                    inv.quantity, inv.expirationdate, inv.cost_per_unit
-            FROM inventory inv
-            JOIN item i ON inv.itemid = i.itemid
-            WHERE i.barcode = :bc AND inv.quantity > 0
-            ORDER BY inv.expirationdate
+            FROM   inventory inv
+            JOIN   item i ON inv.itemid = i.itemid
+            WHERE  i.barcode = :bc AND inv.quantity > 0
+            ORDER  BY inv.expirationdate
             """,
             {"bc": barcode},
         )
 
-    # 5. shortages ------------------------------------------------------------
+    # --- shortage resolution --------------------------------
     def resolve_shortages(self, itemid: int, qty_need: int, user: str) -> int:
         remaining = qty_need
 
@@ -217,9 +221,9 @@ class ShelfHandler(DB):
                     text(
                         """
                         SELECT shortageid, shortage_qty
-                        FROM shelf_shortage
-                        WHERE itemid = :item AND resolved = FALSE
-                        ORDER BY logged_at FOR UPDATE
+                        FROM   shelf_shortage
+                        WHERE  itemid = :item AND resolved = FALSE
+                        ORDER  BY logged_at FOR UPDATE
                         """
                     ),
                     {"item": itemid},
@@ -251,29 +255,30 @@ class ShelfHandler(DB):
 
         return _retry(_tx)
 
-    # 6. low stock ------------------------------------------------------------
+    # --- READ low stock -------------------------------------
     @st.cache_data(ttl=10)
     def low_stock(_s, threshold: int = 10) -> pd.DataFrame:
         return _s.df(
             """
             SELECT s.itemid, i.itemnameenglish AS itemname,
                    s.quantity, s.expirationdate
-            FROM shelf s
-            JOIN item i ON s.itemid = i.itemid
-            WHERE s.quantity <= :thr
-            ORDER BY s.quantity
+            FROM   shelf s
+            JOIN   item i ON s.itemid = i.itemid
+            WHERE  s.quantity <= :thr
+            ORDER  BY s.quantity
             """,
             {"thr": threshold},
         )
 
-    # 7. item list ------------------------------------------------------------
+    # --- READ master list -----------------------------------
     @st.cache_data(ttl=30)
     def all_items(_s) -> pd.DataFrame:
         df = _s.df(
             """
             SELECT itemid, itemnameenglish AS itemname,
                    shelfthreshold, shelfaverage
-            FROM item ORDER BY itemnameenglish
+            FROM   item
+            ORDER  BY itemnameenglish
             """
         )
         if not df.empty:
@@ -281,7 +286,7 @@ class ShelfHandler(DB):
             df["shelfaverage"] = df["shelfaverage"].astype("Int64")
         return df
 
-    # 8. update thresholds ----------------------------------------------------
+    # --- WRITE thresholds -----------------------------------
     def update_thresholds(self, itemid: int, thr: int, avg: int) -> None:
         self.exec(
             """
@@ -293,7 +298,7 @@ class ShelfHandler(DB):
             {"thr": int(thr), "avg": int(avg), "id": int(itemid)},
         )
 
-    # 9. quantity summary -----------------------------------------------------
+    # --- READ quantity summary ------------------------------
     @st.cache_data(ttl=10)
     def qty_by_item(_s) -> pd.DataFrame:
         df = _s.df(
@@ -301,11 +306,11 @@ class ShelfHandler(DB):
             SELECT i.itemid, i.itemnameenglish AS itemname,
                    COALESCE(SUM(s.quantity),0) AS totalquantity,
                    i.shelfthreshold, i.shelfaverage
-            FROM item i
+            FROM   item i
             LEFT JOIN shelf s ON i.itemid = s.itemid
-            GROUP BY i.itemid, i.itemnameenglish,
-                     i.shelfthreshold, i.shelfaverage
-            ORDER BY i.itemnameenglish
+            GROUP  BY i.itemid, i.itemnameenglish,
+                      i.shelfthreshold, i.shelfaverage
+            ORDER  BY i.itemnameenglish
             """
         )
         if not df.empty:
