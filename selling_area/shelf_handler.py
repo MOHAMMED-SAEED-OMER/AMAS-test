@@ -1,18 +1,6 @@
 """
 selling_area/shelf_handler.py
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Database helpers for the Selling-Area “Shelf” pages (MySQL 8.0).
-
-Key points
-──────────
-• Uses a single `MySQLConnectionPool` cached with `@st.cache_resource`
-  → avoids connection storms when Streamlit reruns rapidly.
-• Each method grabs a short-lived connection (`pool.get_connection()`)
-  and closes it in a `finally:` block (thread-safe, no leaks).
-• All writes are done inside one explicit transaction; partial errors
-  roll back automatically.
-• Frequently-called read queries are memoised with `@st.cache_data`
-  (TTL 10-30 s) to cut latency during UI spam-clicks.
+MySQL 8.0 edition – fixed: cached instance methods use `_self`
 """
 
 from __future__ import annotations
@@ -27,31 +15,27 @@ import mysql.connector.pooling
 
 
 # ────────────────────────────────────────────────────────────────
-# 0   Connection pool (cached across Streamlit reruns)
+# 0   Connection pool
 # ────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _get_pool() -> mysql.connector.pooling.MySQLConnectionPool:
-    """One global pool per worker process (adjust pool_size as needed)."""
     return mysql.connector.pooling.MySQLConnectionPool(
         pool_name="amas_pool",
         pool_size=10,
-        pool_reset_session=True,  # clean session vars & temp tables
-        host=st.secrets["mysql"]["host"],
-        user=st.secrets["mysql"]["user"],
-        password=st.secrets["mysql"]["password"],
-        database=st.secrets["mysql"]["database"],
-        autocommit=False,         # we control commit/rollback
+        pool_reset_session=True,
+        host     = st.secrets["mysql"]["host"],
+        user     = st.secrets["mysql"]["user"],
+        password = st.secrets["mysql"]["password"],
+        database = st.secrets["mysql"]["database"],
+        autocommit=False,
         connection_timeout=30,
     )
 
 
 # ────────────────────────────────────────────────────────────────
-# 1   Thin wrapper for Pandas-friendly I/O
+# 1   Tiny wrapper
 # ────────────────────────────────────────────────────────────────
 class DatabaseManager:
-    """Helpers around mysql-connector with clean close/commit semantics."""
-
-    # ---------- READS ---------- #
     def fetch_data(
         self, sql: str, params: Sequence[Any] | None = None
     ) -> pd.DataFrame:
@@ -62,7 +46,6 @@ class DatabaseManager:
             conn.close()
         return df
 
-    # ---------- WRITES ---------- #
     def execute_command(
         self, sql: str, params: Sequence[Any] | None = None
     ) -> None:
@@ -76,17 +59,13 @@ class DatabaseManager:
 
 
 # ────────────────────────────────────────────────────────────────
-# 2   Shelf-specific helpers  (MySQL syntax)
+# 2   Shelf helpers
 # ────────────────────────────────────────────────────────────────
 class ShelfHandler(DatabaseManager):
-    """All DB helpers used by the Selling-Area shelf workflow."""
-
-    # ────────────────────────────────────────────────────────────
-    # 2.1  Current shelf contents
-    # ────────────────────────────────────────────────────────────
+    # 2.1 current shelf contents -------------------------------
     @st.cache_data(ttl=10)
-    def get_shelf_items(self) -> pd.DataFrame:
-        return self.fetch_data(
+    def get_shelf_items(_self) -> pd.DataFrame:           # ← underscore!
+        return _self.fetch_data(
             """
             SELECT s.shelfid,
                    s.itemid,
@@ -102,9 +81,7 @@ class ShelfHandler(DatabaseManager):
             """
         )
 
-    # ────────────────────────────────────────────────────────────
-    # 2.2  Last used shelf location
-    # ────────────────────────────────────────────────────────────
+    # 2.2 last used shelf location ----------------------------
     def last_locid(self, itemid: int) -> str | None:
         df = self.fetch_data(
             """
@@ -119,9 +96,7 @@ class ShelfHandler(DatabaseManager):
         )
         return None if df.empty else str(df.iloc[0, 0])
 
-    # ────────────────────────────────────────────────────────────
-    # 2.3  Upsert shelf row + movement log (transactional)
-    # ────────────────────────────────────────────────────────────
+    # 2.3 upsert shelf row + movement log ---------------------
     def add_to_shelf(
         self,
         *,
@@ -135,7 +110,6 @@ class ShelfHandler(DatabaseManager):
         conn = _get_pool().get_connection()
         try:
             with closing(conn.cursor()) as cur:
-                # 1️⃣  Upsert / increment existing shelf row
                 cur.execute(
                     """
                     INSERT INTO shelf (itemid, expirationdate, quantity,
@@ -155,8 +129,6 @@ class ShelfHandler(DatabaseManager):
                         locid,
                     ),
                 )
-
-                # 2️⃣  Movement log (always append)
                 cur.execute(
                     """
                     INSERT INTO shelfentries
@@ -177,9 +149,7 @@ class ShelfHandler(DatabaseManager):
         finally:
             conn.close()
 
-    # ────────────────────────────────────────────────────────────
-    # 2.4  Inventory helper (barcode → layers)
-    # ────────────────────────────────────────────────────────────
+    # 2.4 inventory helper ------------------------------------
     def get_inventory_by_barcode(self, barcode: str) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -197,21 +167,14 @@ class ShelfHandler(DatabaseManager):
             (barcode,),
         )
 
-    # ────────────────────────────────────────────────────────────
-    # 2.5  Shortage resolver
-    # ────────────────────────────────────────────────────────────
+    # 2.5 shortage resolver -----------------------------------
     def resolve_shortages(
         self, *, itemid: int, qty_need: int, user: str
     ) -> int:
-        """
-        Consume open shortages for *itemid* (oldest first) up to *qty_need*.
-        Returns remaining units that still need to be placed on shelf.
-        """
         remaining = qty_need
         conn = _get_pool().get_connection()
         try:
             with closing(conn.cursor(dictionary=True)) as cur:
-                # Lock rows so concurrent transfers don’t step on each other
                 cur.execute(
                     """
                     SELECT shortageid, shortage_qty
@@ -223,13 +186,10 @@ class ShelfHandler(DatabaseManager):
                     """,
                     (itemid,),
                 )
-                rows: List[Dict[str, Any]] = cur.fetchall()
-
-                for row in rows:
+                for row in cur.fetchall():
                     if remaining == 0:
                         break
                     take = min(remaining, int(row["shortage_qty"]))
-
                     cur.execute(
                         """
                         UPDATE shelf_shortage
@@ -253,21 +213,16 @@ class ShelfHandler(DatabaseManager):
                         ),
                     )
                     remaining -= take
-
-                # Tidy any zero-qty rows
                 cur.execute("DELETE FROM shelf_shortage WHERE shortage_qty = 0")
             conn.commit()
         finally:
             conn.close()
-
         return remaining
 
-    # ────────────────────────────────────────────────────────────
-    # 2.6  Quick low-stock query (Alerts tab)
-    # ────────────────────────────────────────────────────────────
+    # 2.6 low-stock alert -------------------------------------
     @st.cache_data(ttl=10)
-    def get_low_shelf_stock(self, threshold: int = 10) -> pd.DataFrame:
-        return self.fetch_data(
+    def get_low_shelf_stock(_self, threshold: int = 10) -> pd.DataFrame:
+        return _self.fetch_data(
             """
             SELECT s.itemid,
                    i.itemnameenglish AS itemname,
@@ -281,12 +236,10 @@ class ShelfHandler(DatabaseManager):
             (threshold,),
         )
 
-    # ────────────────────────────────────────────────────────────
-    # 2.7  Master item list (Manage-Settings tab)
-    # ────────────────────────────────────────────────────────────
+    # 2.7 item master list ------------------------------------
     @st.cache_data(ttl=30)
-    def get_all_items(self) -> pd.DataFrame:
-        df = self.fetch_data(
+    def get_all_items(_self) -> pd.DataFrame:
+        df = _self.fetch_data(
             """
             SELECT itemid,
                    itemnameenglish AS itemname,
@@ -312,12 +265,10 @@ class ShelfHandler(DatabaseManager):
             (int(thr), int(avg), int(itemid)),
         )
 
-    # ────────────────────────────────────────────────────────────
-    # 2.8  Quantity-by-item (Alerts tab)
-    # ────────────────────────────────────────────────────────────
+    # 2.8 quantity by item ------------------------------------
     @st.cache_data(ttl=10)
-    def get_shelf_quantity_by_item(self) -> pd.DataFrame:
-        df = self.fetch_data(
+    def get_shelf_quantity_by_item(_self) -> pd.DataFrame:
+        df = _self.fetch_data(
             """
             SELECT i.itemid,
                    i.itemnameenglish AS itemname,
