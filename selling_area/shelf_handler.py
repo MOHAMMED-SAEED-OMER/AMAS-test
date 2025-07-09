@@ -1,83 +1,96 @@
 """
 selling_area/shelf_handler.py
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Database helper for Selling-Area “Shelf” pages (Streamlit 1.46+).
+Database helpers for the Selling-Area “Shelf” pages (MySQL 8.0).
 
-✅  Postgres / Neon-ready   ✅  Thread-safe   ✅  Connection-pooled
+Key points
+──────────
+• Uses a single `MySQLConnectionPool` cached with `@st.cache_resource`
+  → avoids connection storms when Streamlit reruns rapidly.
+• Each method grabs a short-lived connection (`pool.get_connection()`)
+  and closes it in a `finally:` block (thread-safe, no leaks).
+• All writes are done inside one explicit transaction; partial errors
+  roll back automatically.
+• Frequently-called read queries are memoised with `@st.cache_data`
+  (TTL 10-30 s) to cut latency during UI spam-clicks.
 """
 
 from __future__ import annotations
 
-import datetime as _dt
-from typing import Any, Iterable, Sequence
+from contextlib import closing
+from typing import Any, Sequence, List, Dict
 
 import pandas as pd
-import psycopg_pool
 import streamlit as st
+import mysql.connector
+import mysql.connector.pooling
+
 
 # ────────────────────────────────────────────────────────────────
-# 0.  Connection pool (cached across Streamlit reruns)
+# 0   Connection pool (cached across Streamlit reruns)
 # ────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
-def _get_pool() -> psycopg_pool.ConnectionPool:
-    """
-    One global pool per Streamlit worker process.
-    Adjust min_size / max_size to match your Neon plan.
-    """
-    return psycopg_pool.ConnectionPool(
-        conninfo=st.secrets["postgres_url"],
-        min_size=1,
-        max_size=10,
-        # Clean idle conns quickly so Community Cloud's 1 GB limit is safe
-        max_idle=_dt.timedelta(minutes=5),
-        timeout=_dt.timedelta(seconds=30),
+def _get_pool() -> mysql.connector.pooling.MySQLConnectionPool:
+    """One global pool per worker process (adjust pool_size as needed)."""
+    return mysql.connector.pooling.MySQLConnectionPool(
+        pool_name="amas_pool",
+        pool_size=10,
+        pool_reset_session=True,  # clean session vars & temp tables
+        host=st.secrets["mysql"]["host"],
+        user=st.secrets["mysql"]["user"],
+        password=st.secrets["mysql"]["password"],
+        database=st.secrets["mysql"]["database"],
+        autocommit=False,         # we control commit/rollback
+        connection_timeout=30,
     )
 
 
 # ────────────────────────────────────────────────────────────────
-# 1.  Lightweight DB wrapper
+# 1   Thin wrapper for Pandas-friendly I/O
 # ────────────────────────────────────────────────────────────────
 class DatabaseManager:
-    """Tiny helper around psycopg-pool for Pandas-friendly I/O."""
+    """Helpers around mysql-connector with clean close/commit semantics."""
 
-    # Helpers -----------------------------------------------------
-    def _conn(self):
-        """Short-lived dedicated connection for the current thread."""
-        return _get_pool().connection()
-
-    # high-volume reads ------------------------------------------
+    # ---------- READS ---------- #
     def fetch_data(
         self, sql: str, params: Sequence[Any] | None = None
-    ) -> pd.DataFrame:  # noqa: D401
-        with self._conn() as conn:  # auto-commit OFF inside context
+    ) -> pd.DataFrame:
+        conn = _get_pool().get_connection()
+        try:
             df = pd.read_sql(sql, conn, params=params)
+        finally:
+            conn.close()
         return df
 
-    # low-volume writes / DDL ------------------------------------
+    # ---------- WRITES ---------- #
     def execute_command(
         self, sql: str, params: Sequence[Any] | None = None
     ) -> None:
-        with self._conn() as conn:
-            with conn.cursor() as cur:
+        conn = _get_pool().get_connection()
+        try:
+            with closing(conn.cursor()) as cur:
                 cur.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
 
 
 # ────────────────────────────────────────────────────────────────
-# 2.  Shelf-specific helpers
+# 2   Shelf-specific helpers  (MySQL syntax)
 # ────────────────────────────────────────────────────────────────
 class ShelfHandler(DatabaseManager):
-    """All database helpers for the Selling-Area shelf."""
+    """All DB helpers used by the Selling-Area shelf workflow."""
 
     # ────────────────────────────────────────────────────────────
     # 2.1  Current shelf contents
     # ────────────────────────────────────────────────────────────
-    @st.cache_data(ttl=10)  # refresh at most once every 10 s
+    @st.cache_data(ttl=10)
     def get_shelf_items(self) -> pd.DataFrame:
         return self.fetch_data(
             """
             SELECT s.shelfid,
                    s.itemid,
-                   i.itemnameenglish        AS itemname,
+                   i.itemnameenglish AS itemname,
                    s.quantity,
                    s.expirationdate,
                    s.cost_per_unit,
@@ -98,7 +111,7 @@ class ShelfHandler(DatabaseManager):
             SELECT locid
             FROM   shelfentries
             WHERE  itemid = %s
-              AND  locid IS NOT NULL
+              AND  locid  IS NOT NULL
             ORDER  BY entrydate DESC
             LIMIT 1
             """,
@@ -107,36 +120,32 @@ class ShelfHandler(DatabaseManager):
         return None if df.empty else str(df.iloc[0, 0])
 
     # ────────────────────────────────────────────────────────────
-    # 2.3  Insert / increment shelf row  +  movement log
+    # 2.3  Upsert shelf row + movement log (transactional)
     # ────────────────────────────────────────────────────────────
     def add_to_shelf(
         self,
         *,
         itemid: int,
-        expirationdate,  # date or ISO str; psycopg will adapt
+        expirationdate,
         quantity: int,
         created_by: str,
         cost_per_unit: float,
         locid: str,
     ) -> None:
-        """
-        Upsert a shelf row (unique on item+expiry+cost) **and**
-        write to `shelfentries`. All wrapped in one transaction.
-        """
-        with self._conn() as conn:
-            with conn.cursor() as cur:
-                # 1️⃣  Upsert shelf row
+        conn = _get_pool().get_connection()
+        try:
+            with closing(conn.cursor()) as cur:
+                # 1️⃣  Upsert / increment existing shelf row
                 cur.execute(
                     """
                     INSERT INTO shelf (itemid, expirationdate, quantity,
                                        cost_per_unit, locid)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (itemid, expirationdate, cost_per_unit)
-                    DO UPDATE
-                      SET quantity      = shelf.quantity + EXCLUDED.quantity,
-                          cost_per_unit = EXCLUDED.cost_per_unit,
-                          locid         = EXCLUDED.locid,
-                          lastupdated   = CURRENT_TIMESTAMP
+                    VALUES (%s, %s, %s, %s, %s) AS new
+                    ON DUPLICATE KEY UPDATE
+                        quantity      = shelf.quantity + new.quantity,
+                        cost_per_unit = new.cost_per_unit,
+                        locid         = new.locid,
+                        lastupdated   = CURRENT_TIMESTAMP
                     """,
                     (
                         itemid,
@@ -147,7 +156,7 @@ class ShelfHandler(DatabaseManager):
                     ),
                 )
 
-                # 2️⃣  Movement log
+                # 2️⃣  Movement log (always append)
                 cur.execute(
                     """
                     INSERT INTO shelfentries
@@ -164,10 +173,12 @@ class ShelfHandler(DatabaseManager):
                         locid,
                     ),
                 )
-            # leaving the `with conn:` block commits the transaction
+            conn.commit()
+        finally:
+            conn.close()
 
     # ────────────────────────────────────────────────────────────
-    # 2.4  Inventory helper (barcode lookup)
+    # 2.4  Inventory helper (barcode → layers)
     # ────────────────────────────────────────────────────────────
     def get_inventory_by_barcode(self, barcode: str) -> pd.DataFrame:
         return self.fetch_data(
@@ -193,30 +204,31 @@ class ShelfHandler(DatabaseManager):
         self, *, itemid: int, qty_need: int, user: str
     ) -> int:
         """
-        Consume the oldest open shortages for *itemid* up to *qty_need*.
-        Returns how many units still need to be placed on shelf afterwards.
+        Consume open shortages for *itemid* (oldest first) up to *qty_need*.
+        Returns remaining units that still need to be placed on shelf.
         """
         remaining = qty_need
-
-        with self._conn() as conn:
-            with conn.cursor() as cur:
+        conn = _get_pool().get_connection()
+        try:
+            with closing(conn.cursor(dictionary=True)) as cur:
+                # Lock rows so concurrent transfers don’t step on each other
                 cur.execute(
                     """
                     SELECT shortageid, shortage_qty
                     FROM   shelf_shortage
-                    WHERE  itemid = %s
+                    WHERE  itemid   = %s
                       AND  resolved = FALSE
                     ORDER  BY logged_at
                     FOR UPDATE
                     """,
                     (itemid,),
                 )
-                rows = cur.fetchall()
+                rows: List[Dict[str, Any]] = cur.fetchall()
 
-                for shortageid, shortage_qty in rows:
+                for row in rows:
                     if remaining == 0:
                         break
-                    take = min(remaining, shortage_qty)
+                    take = min(remaining, int(row["shortage_qty"]))
 
                     cur.execute(
                         """
@@ -231,19 +243,27 @@ class ShelfHandler(DatabaseManager):
                             resolved_by   = %s
                         WHERE shortageid = %s
                         """,
-                        (take, take, take, take, user, shortageid),
+                        (
+                            take,
+                            take,
+                            take,
+                            take,
+                            user,
+                            row["shortageid"],
+                        ),
                     )
                     remaining -= take
 
-                # tidy up zero-quantity rows
-                cur.execute(
-                    "DELETE FROM shelf_shortage WHERE shortage_qty = 0"
-                )
+                # Tidy any zero-qty rows
+                cur.execute("DELETE FROM shelf_shortage WHERE shortage_qty = 0")
+            conn.commit()
+        finally:
+            conn.close()
 
         return remaining
 
     # ────────────────────────────────────────────────────────────
-    # 2.6  Quick low-stock query
+    # 2.6  Quick low-stock query (Alerts tab)
     # ────────────────────────────────────────────────────────────
     @st.cache_data(ttl=10)
     def get_low_shelf_stock(self, threshold: int = 10) -> pd.DataFrame:
@@ -278,7 +298,7 @@ class ShelfHandler(DatabaseManager):
         )
         if not df.empty:
             df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
-            df["shelfaverage"] = df["shelfaverage"].astype("Int64")
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
         return df
 
     def update_shelf_settings(self, itemid: int, thr: int, avg: int) -> None:
@@ -312,7 +332,7 @@ class ShelfHandler(DatabaseManager):
             """
         )
         if not df.empty:
-            df["totalquantity"] = df["totalquantity"].astype(int)
+            df["totalquantity"]  = df["totalquantity"].astype(int)
             df["shelfthreshold"] = df["shelfthreshold"].astype("Int64")
-            df["shelfaverage"] = df["shelfaverage"].astype("Int64")
+            df["shelfaverage"]   = df["shelfaverage"].astype("Int64")
         return df
