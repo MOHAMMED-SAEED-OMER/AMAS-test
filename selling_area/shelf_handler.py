@@ -1,16 +1,21 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-• Pure-Python MySQL driver (PyMySQL) – no native seg-faults
-• Single resilient SQLAlchemy engine (pool_pre_ping=True, pool_recycle=3600)
-• DB handles `entryid` (AUTO_INCREMENT) & `entrydate` (DEFAULT CURRENT_TIMESTAMP)
-  ▸ run once:  ALTER TABLE shelfentries
-                   MODIFY entryid  INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                   MODIFY entrydate DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP;
+• Tries to use the pure-Python PyMySQL driver (no seg-faults).
+• If PyMySQL isn’t installed, silently falls back to mysql-connector.
+• One resilient SQLAlchemy engine, auto-ping, pool_recycle=3600.
+• Relies on DB defaults for entryid (AUTO_INCREMENT) & entrydate
+  (DEFAULT CURRENT_TIMESTAMP).  Make sure the table is:
+
+    ALTER TABLE shelfentries
+      MODIFY entryid  INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      MODIFY entrydate DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
 """
 
 from __future__ import annotations
 
+import importlib
 import time
 from typing import Any, Sequence, Callable, TypeVar
 
@@ -20,30 +25,41 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, InterfaceError, SQLAlchemyError
 
-# ── connection ---------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def _get_engine() -> Engine:
+# ── choose driver ------------------------------------------------------------
+def _driver_uri() -> str:
     cfg = st.secrets["mysql"]
-    uri = (
-        "mysql+pymysql://"
-        f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port',3306)}/"
-        f"{cfg['database']}?charset=utf8mb4"
-    )
-    return create_engine(
-        uri,
-        pool_size=6,
-        pool_pre_ping=True,   # ping before checkout
-        pool_recycle=3_600,   # recycle after 1 h
-        future=True,
+    # Try PyMySQL first (safe), else fallback to mysql-connector.
+    if importlib.util.find_spec("pymysql") is not None:
+        driver = "mysql+pymysql://"
+    else:
+        st.warning("⚠️  PyMySQL not found; falling back to mysql-connector "
+                   "(may seg-fault on some images). "
+                   "Add 'pymysql>=1.1' to requirements.txt to avoid this.")
+        driver = "mysql+mysqlconnector://"
+
+    return (
+        f"{driver}{cfg['user']}:{cfg['password']}@"
+        f"{cfg['host']}:{cfg.get('port',3306)}/{cfg['database']}"
+        "?charset=utf8mb4"
     )
 
+# ── engine -------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def _get_engine() -> Engine:
+    return create_engine(
+        _driver_uri(),
+        pool_size=6,
+        pool_pre_ping=True,   # ping before checkout
+        pool_recycle=3_600,   # recycle sockets after 1 h
+        future=True,
+    )
 
 engine: Engine = _get_engine()
 T = TypeVar("T")
 
 
 def _retry(func: Callable[..., T], *a, **kw) -> T:
-    """run func; on transient Operational/Interface error dispose + retry once."""
+    """Run func; dispose pool + retry once on transient Operational/Interface."""
     for attempt in (1, 2):
         try:
             return func(*a, **kw)
@@ -53,10 +69,9 @@ def _retry(func: Callable[..., T], *a, **kw) -> T:
             engine.dispose()
             time.sleep(0.5)
 
-
 # ── thin wrapper -------------------------------------------------------------
 class DB:
-    # reads -------------------------------------------------------------------
+    # read --------------------------------------------------------------------
     def df(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
         def _read():
             return pd.read_sql_query(text(sql), engine, params=params)
@@ -66,17 +81,16 @@ class DB:
             st.error(f"❌ DB read failed: {e}")
             return pd.DataFrame()
 
-    # writes ------------------------------------------------------------------
+    # write -------------------------------------------------------------------
     def exec(self, sql: str, params: Sequence[Any] | None = None) -> None:
         def _write():
             with engine.begin() as c:
                 c.execute(text(sql), params or {})
         _retry(_write)
 
-
-# ── Shelf-specific helpers ---------------------------------------------------
+# ── shelf helpers ------------------------------------------------------------
 class ShelfHandler(DB):
-    # 1. shelf grid -----------------------------------------------------------
+    # 1. grid -----------------------------------------------------------------
     @st.cache_data(ttl=10)
     def shelf_grid(_s) -> pd.DataFrame:
         return _s.df(
@@ -84,13 +98,12 @@ class ShelfHandler(DB):
             SELECT s.shelfid, s.itemid, i.itemnameenglish AS itemname,
                    s.quantity, s.expirationdate, s.cost_per_unit,
                    s.locid, s.lastupdated
-            FROM shelf s
-            JOIN item i ON s.itemid = i.itemid
+            FROM shelf s JOIN item i ON s.itemid = i.itemid
             ORDER BY i.itemnameenglish, s.expirationdate
             """
         )
 
-    # 2. last location id -----------------------------------------------------
+    # 2. last location --------------------------------------------------------
     def last_locid(self, itemid: int) -> str | None:
         df = self.df(
             """
@@ -103,7 +116,7 @@ class ShelfHandler(DB):
         )
         return None if df.empty else str(df.loc[0, "locid"])
 
-    # 3. add / move items -----------------------------------------------------
+    # 3. add / move -----------------------------------------------------------
     def add_to_shelf(
         self,
         *,
@@ -114,9 +127,9 @@ class ShelfHandler(DB):
         locid: str,
         created_by: str,
     ) -> None:
-        def _tx() -> None:
+        def _tx():
             with engine.begin() as c:
-                # upsert shelf
+                # shelf upsert
                 c.execute(
                     text(
                         """
@@ -139,7 +152,7 @@ class ShelfHandler(DB):
                     },
                 )
 
-                # movement log (entryid & entrydate auto)
+                # movement log - rely on AUTO_INCREMENT & DEFAULT timestamp
                 c.execute(
                     text(
                         """
@@ -193,7 +206,7 @@ class ShelfHandler(DB):
             {"bc": barcode},
         )
 
-    # 5. resolve shortages ----------------------------------------------------
+    # 5. shortages ------------------------------------------------------------
     def resolve_shortages(self, itemid: int, qty_need: int, user: str) -> int:
         remaining = qty_need
 
@@ -253,7 +266,7 @@ class ShelfHandler(DB):
             {"thr": threshold},
         )
 
-    # 7. item master list -----------------------------------------------------
+    # 7. item list ------------------------------------------------------------
     @st.cache_data(ttl=30)
     def all_items(_s) -> pd.DataFrame:
         df = _s.df(
