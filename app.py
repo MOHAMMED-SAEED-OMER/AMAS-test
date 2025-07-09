@@ -1,8 +1,11 @@
 """
 app.py – Inventory Management System
-Re-ordered so st.set_page_config() is the first Streamlit call.
-Added “run-reason” audit logging.  (Last update 2025-07-09)
+• st.set_page_config() first (avoids config error)
+• Run-reason audit with graceful fallback if st.modal is absent
+Last update: 2025-07-09
 """
+
+from __future__ import annotations
 
 import os
 import uuid
@@ -10,12 +13,12 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
-# ── page-wide config – must be FIRST Streamlit command ───────
+# ── MUST be the first Streamlit call ─────────────────────────
 st.set_page_config(page_title="Inventory Management System", layout="wide")
 
-import psycopg2  # noqa: E402  (import after page_config is fine)
+import psycopg2  # noqa: E402
 
-# ── Page modules (these may contain Streamlit calls) ──────────
+# ── Page modules ─────────────────────────────────────────────
 import home  # noqa: E402
 from item                       import mainitem  # noqa: E402
 import PO.mainpo                as mainpo        # noqa: E402
@@ -32,17 +35,17 @@ from shelf_map.main_map          import main as shelf_map_page  # noqa: E402
 from sidebar    import sidebar       # noqa: E402
 from inv_signin import authenticate  # noqa: E402
 
-# NEW: unified user management tabs
+# unified admin tabs
 from admin.user_admin_tabs import show_user_admin  # noqa: E402
 
-# ── DB helpers ────────────────────────────────────────────────
+# ── DB helpers ───────────────────────────────────────────────
 def _get_db_conn():
     """Return a psycopg2 connection using DATABASE_URL env var."""
     return psycopg2.connect(os.environ["DATABASE_URL"], sslmode="require")
 
 
 def _init_run_reason_table():
-    """Create run_reason_log table if it doesn't exist (idempotent)."""
+    """Create run_reason_log if it doesn't exist (idempotent)."""
     create_sql = """
     CREATE TABLE IF NOT EXISTS run_reason_log (
         id            UUID PRIMARY KEY,
@@ -58,18 +61,19 @@ def _init_run_reason_table():
 
 
 def log_run_reason(reason: str) -> None:
-    """Persist the reason the user gave for running the app."""
-    _init_run_reason_table()  # safe to call each time
+    """Insert a run-reason row."""
+    _init_run_reason_table()
     with _get_db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO run_reason_log (id, session_id, user_email, run_reason, logged_at)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO run_reason_log (id, session_id, user_email,
+                                        run_reason, logged_at)
+            VALUES (%s, %s, %s, %s, %s);
             """,
             (
-                uuid.uuid4(),                          # id
-                st.session_state["session_id"],        # session identifier
-                st.session_state["user_email"],        # from authenticate()
+                uuid.uuid4(),
+                st.session_state["session_id"],
+                st.session_state["user_email"],
                 reason.strip(),
                 datetime.now(timezone.utc),
             ),
@@ -77,38 +81,64 @@ def log_run_reason(reason: str) -> None:
         conn.commit()
 
 
-# ── Main entry – includes run-reason capture ─────────────────
-def main() -> None:
-    # ── Auth (sets user_email, permissions, user_role) ────────
-    authenticate()
+# ── Ask for run reason (modal if available, else form) ──────
+def ensure_run_reason_logged() -> None:
+    if st.session_state.get("reason_logged"):
+        return  # already done
 
-    # Generate a per-session UUID once
-    if "session_id" not in st.session_state:
-        st.session_state["session_id"] = uuid.uuid4()
-
-    # ── Ask “Why are you running the app?” (once per session) ─
-    if "reason_logged" not in st.session_state:
+    # 1️⃣ Preferred UX: modal (Streamlit ≥ 1.25)
+    if hasattr(st, "modal"):
         with st.modal("📝 Tell us why you’re running the app"):
             reason = st.text_area(
-                "Please briefly describe the purpose of this session "
+                "Briefly describe this session’s purpose "
                 "(e.g., 'daily inventory check', 'adding new POs', 'audit').",
                 placeholder="Your reason…",
                 height=120,
             )
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                if st.button("Submit", type="primary", disabled=not reason.strip()):
-                    log_run_reason(reason)
-                    st.session_state["reason_logged"] = True
-                    st.success("✅ Reason recorded. Thank you!")
-            with col2:
-                st.markdown("*We record this just once per session for audit and analytics.*")
-            st.stop()  # halt until the reason is provided
+            submitted = st.button("Submit", disabled=not reason.strip())
+            if submitted:
+                log_run_reason(reason)
+                st.session_state["reason_logged"] = True
+                st.success("✅ Reason recorded. Thank you!")
+                st.experimental_rerun()  # reload without modal
+        st.stop()  # block until modal is closed
 
-    # ── Sidebar navigation & routing ──────────────────────────
+    # 2️⃣ Fallback: inline form (works on older versions)
+    st.warning("📝 Please tell us why you’re running the app.")
+    with st.form("run_reason_form", clear_on_submit=False):
+        reason = st.text_area(
+            "Purpose of this session:",
+            placeholder="Your reason…",
+            height=120,
+        )
+        submitted = st.form_submit_button("Submit")
+        if submitted and reason.strip():
+            log_run_reason(reason)
+            st.session_state["reason_logged"] = True
+            st.success("✅ Reason recorded. Thank you!")
+            st.experimental_rerun()
+        elif submitted:
+            st.error("Please enter a reason before submitting.")
+    st.stop()  # halt app until reason supplied
+
+
+# ── Main entry ───────────────────────────────────────────────
+def main() -> None:
+    # Authentication populates user_email, permissions, user_role
+    authenticate()
+
+    # Generate a per-session UUID
+    if "session_id" not in st.session_state:
+        st.session_state["session_id"] = uuid.uuid4()
+
+    # Run-reason capture (blocks until provided)
+    ensure_run_reason_logged()
+
+    # Sidebar navigation
     page  = sidebar()
     perms = st.session_state.get("permissions", {})
 
+    # Routing
     if   page == "Home"            and perms.get("CanAccessHome"):           home.home()
     elif page == "Item"            and perms.get("CanAccessItems"):          mainitem.item_page()
     elif page == "Receive Items"   and perms.get("CanAccessReceive"):        main_receive_page()
