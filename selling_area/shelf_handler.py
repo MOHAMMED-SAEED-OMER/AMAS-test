@@ -1,9 +1,10 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-• Single, resilient SQLAlchemy engine (pool_pre_ping=True)
-• Lightweight retry on Operational / Interface errors
-• Correct audit columns (entryid auto‑increment, entrydate filled)
+• Uses one resilient SQLAlchemy engine (mysql+mysqlconnector).
+• Retries once on transient Operational/Interface errors.
+• Relies on DB defaults for entryid (AUTO_INCREMENT) and
+  entrydate (DEFAULT CURRENT_TIMESTAMP).
 """
 
 from __future__ import annotations
@@ -23,28 +24,27 @@ def _get_engine() -> Engine:
     cfg = st.secrets["mysql"]
     uri = (
         "mysql+mysqlconnector://"
-        f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port', 3306)}/"
+        f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port',3306)}/"
         f"{cfg['database']}?charset=utf8mb4"
     )
     return create_engine(
         uri,
         pool_size=6,
-        pool_recycle=3_600,
-        pool_pre_ping=True,
+        pool_pre_ping=True,   # auto‑ping stale sockets
+        pool_recycle=3_600,   # recycle after 1 h
     )
 
 
 engine: Engine = _get_engine()
-
 T = TypeVar("T")
 
 
 def _with_retry(func: Callable[..., T], /, *args, **kwargs) -> T:
-    """Run a DB block once; dispose pool + retry once on transient errors."""
+    """Run a DB block; dispose pool + retry once on transient errors."""
     for attempt in (1, 2):
         try:
             return func(*args, **kwargs)
-        except (OperationalError, InterfaceError) as err:
+        except (OperationalError, InterfaceError):
             if attempt == 2:
                 raise
             engine.dispose()
@@ -53,18 +53,17 @@ def _with_retry(func: Callable[..., T], /, *args, **kwargs) -> T:
 
 # ── Base wrapper ────────────────────────────────────────────
 class DatabaseManager:
-    # --- READ ---
+    # READ ----------
     def fetch_data(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
         def _read():
             return pd.read_sql_query(text(sql), engine, params=params)
-
         try:
             return _with_retry(_read)
         except SQLAlchemyError as err:
             st.error(f"❌ DB read failed: {err}")
             return pd.DataFrame()
 
-    # --- WRITE ---
+    # WRITE ----------
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
         def _write():
             with engine.begin() as conn:
@@ -72,7 +71,7 @@ class DatabaseManager:
         _with_retry(_write)
 
 
-# ── Shelf-specific helpers ──────────────────────────────────
+# ── Shelf‑specific helpers ──────────────────────────────────
 class ShelfHandler(DatabaseManager):
     # 1. current shelf items
     @st.cache_data(ttl=10)
@@ -95,12 +94,11 @@ class ShelfHandler(DatabaseManager):
             SELECT locid
             FROM   shelfentries
             WHERE  itemid = :itemid AND locid IS NOT NULL
-            ORDER  BY entrydate DESC
-            LIMIT 1
+            ORDER  BY entrydate DESC LIMIT 1
             """,
             {"itemid": itemid},
         )
-        return None if df.empty else str(df.iloc[0, 0])
+        return None if df.empty else str(df.loc[0, "locid"])
 
     # 3. add / increment shelf + log + inventory subtract
     def add_to_shelf(
@@ -115,7 +113,7 @@ class ShelfHandler(DatabaseManager):
     ) -> None:
         def _tx():
             with engine.begin() as conn:
-                # ① shelf upsert
+                # ① Upsert shelf row
                 conn.execute(
                     text(
                         """
@@ -123,10 +121,10 @@ class ShelfHandler(DatabaseManager):
                                            cost_per_unit, locid)
                         VALUES (:itemid, :exp, :qty, :cpu, :loc)
                         ON DUPLICATE KEY UPDATE
-                            quantity      = quantity + VALUES(quantity),
-                            cost_per_unit = VALUES(cost_per_unit),
-                            locid         = VALUES(locid),
-                            lastupdated   = CURRENT_TIMESTAMP
+                          quantity      = quantity + VALUES(quantity),
+                          cost_per_unit = VALUES(cost_per_unit),
+                          locid         = VALUES(locid),
+                          lastupdated   = CURRENT_TIMESTAMP
                         """
                     ),
                     {
@@ -138,26 +136,26 @@ class ShelfHandler(DatabaseManager):
                     },
                 )
 
-                # ② movement log (entryid auto, entrydate explicit)
+                # ② Insert movement log (entryid & entrydate auto)
                 conn.execute(
                     text(
                         """
                         INSERT INTO shelfentries
-                               (itemid, expirationdate, quantity,
-                                createdby, locid, entrydate)
-                        VALUES (:itemid, :exp, :qty, :user, :loc, CURRENT_TIMESTAMP)
+                               (itemid, quantity, expirationdate,
+                                createdby, locid)
+                        VALUES (:itemid, :qty, :exp, :user, :loc)
                         """
                     ),
                     {
                         "itemid": itemid,
-                        "exp": expirationdate,
                         "qty": int(quantity),
+                        "exp": expirationdate,
                         "user": created_by,
                         "loc": locid,
                     },
                 )
 
-                # ③ inventory decrement
+                # ③ Decrement inventory
                 conn.execute(
                     text(
                         """
@@ -192,7 +190,7 @@ class ShelfHandler(DatabaseManager):
             {"bc": barcode},
         )
 
-    # 5. shortage resolver
+    # 5. shortage resolver (unchanged logic)
     def resolve_shortages(self, *, itemid: int, qty_need: int, user: str) -> int:
         remaining = qty_need
 
@@ -206,8 +204,7 @@ class ShelfHandler(DatabaseManager):
                         FROM   shelf_shortage
                         WHERE  itemid = :itemid
                           AND  resolved = FALSE
-                        ORDER  BY logged_at
-                        FOR UPDATE
+                        ORDER  BY logged_at FOR UPDATE
                         """
                     ),
                     {"itemid": itemid},
@@ -260,12 +257,9 @@ class ShelfHandler(DatabaseManager):
     def get_all_items(_self) -> pd.DataFrame:
         df = _self.fetch_data(
             """
-            SELECT itemid,
-                   itemnameenglish AS itemname,
-                   shelfthreshold,
-                   shelfaverage
-            FROM   item
-            ORDER  BY itemnameenglish
+            SELECT itemid, itemnameenglish AS itemname,
+                   shelfthreshold, shelfaverage
+            FROM   item ORDER BY itemnameenglish
             """
         )
         if not df.empty:
@@ -289,11 +283,9 @@ class ShelfHandler(DatabaseManager):
     def get_shelf_quantity_by_item(_self) -> pd.DataFrame:
         df = _self.fetch_data(
             """
-            SELECT i.itemid,
-                   i.itemnameenglish AS itemname,
+            SELECT i.itemid, i.itemnameenglish AS itemname,
                    COALESCE(SUM(s.quantity),0) AS totalquantity,
-                   i.shelfthreshold,
-                   i.shelfaverage
+                   i.shelfthreshold, i.shelfaverage
             FROM   item i
             LEFT JOIN shelf s ON i.itemid = s.itemid
             GROUP  BY i.itemid, i.itemnameenglish,
