@@ -1,20 +1,21 @@
 # selling_area/shelf_handler.py
 """
-ShelfHandler – helper class for the Selling-Area module
-=======================================================
+ShelfHandler – Selling-Area database helpers (MySQL / PyMySQL edition)
+======================================================================
 
-A thin wrapper around **DatabaseManager** (which uses PyMySQL) that provides
-shelf-specific database helpers for your Streamlit pages.
+Depends on db_handler.DatabaseManager, which uses a cached PyMySQL
+connection under Streamlit’s session cache.
 
-Functions included
-------------------
-list_shelves()              → all shelves with capacity & usage
-add_shelf(name, capacity)   → create a new shelf
-delete_shelf(id)            → safe delete (only when empty)
-get_items_in_shelf(id)      → items & quantities on a shelf
-search_items(term)          → fuzzy search across shelves
-move_item(...)              → transfer quantity between shelves + audit log
-low_stock_alerts(threshold) → items below a total-stock threshold
+Public methods
+--------------
+• list_shelves()              → shelves with capacity & used_capacity
+• add_shelf(name, capacity)   → create shelf
+• delete_shelf(id)            → safe delete when empty
+• get_shelf_items()           → all items on all shelves   ← NEW
+• get_items_in_shelf(id)      → items on one shelf
+• search_items(term)          → fuzzy search
+• move_item(...)              → transfer + audit trail
+• low_stock_alerts(threshold) → items below threshold
 """
 
 from __future__ import annotations
@@ -28,40 +29,32 @@ from db_handler import DatabaseManager
 
 
 class ShelfHandler(DatabaseManager):
-    """Shelf-level data helpers built on top of DatabaseManager."""
+    """Shelf-specific helpers built on top of DatabaseManager."""
 
     # ─────────────────────────────────────────────────────────────
     # Shelf CRUD
     # ─────────────────────────────────────────────────────────────
     def list_shelves(self) -> pd.DataFrame:
-        """Return all shelves with capacity and current utilisation."""
         return self.fetch_data(
             """
-            SELECT shelfid,
-                   shelfname,
-                   capacity,
-                   (
-                     SELECT COALESCE(SUM(quantity),0)
-                     FROM   shelf_items si
-                     WHERE  si.shelfid = s.shelfid
-                   ) AS used_capacity
-            FROM   shelf AS s
-            ORDER  BY shelfname;
+            SELECT s.shelfid,
+                   s.shelfname,
+                   s.capacity,
+                   COALESCE(SUM(si.quantity), 0) AS used_capacity
+            FROM   shelf s
+            LEFT   JOIN shelf_items si USING (shelfid)
+            GROUP  BY s.shelfid, s.shelfname, s.capacity
+            ORDER  BY s.shelfname;
             """
         )
 
     def add_shelf(self, name: str, capacity: int | None = None) -> None:
-        """Insert a new shelf row."""
         self.execute_command(
             "INSERT INTO shelf (shelfname, capacity) VALUES (%s, %s)",
             (name, capacity),
         )
 
     def delete_shelf(self, shelf_id: int) -> None:
-        """
-        Delete a shelf only if it is empty.
-        Raises ValueError if items are still present.
-        """
         has_items = self.fetch_data(
             "SELECT EXISTS(SELECT 1 FROM shelf_items WHERE shelfid = %s)",
             (shelf_id,),
@@ -73,8 +66,28 @@ class ShelfHandler(DatabaseManager):
     # ─────────────────────────────────────────────────────────────
     # Item queries
     # ─────────────────────────────────────────────────────────────
+    def get_shelf_items(self) -> pd.DataFrame:
+        """
+        Return every item on every shelf.
+
+        Columns: shelfid, shelfname, itemid, itemname, quantity, uom
+        """
+        return self.fetch_data(
+            """
+            SELECT s.shelfid,
+                   s.shelfname,
+                   i.itemid,
+                   i.itemname,
+                   si.quantity,
+                   i.uom
+            FROM   shelf_items si
+            JOIN   shelf       s  USING (shelfid)
+            JOIN   item        i  USING (itemid)
+            ORDER  BY s.shelfname, i.itemname;
+            """
+        )
+
     def get_items_in_shelf(self, shelf_id: int) -> pd.DataFrame:
-        """Return items and quantities stored on one shelf."""
         return self.fetch_data(
             """
             SELECT i.itemid,
@@ -90,7 +103,6 @@ class ShelfHandler(DatabaseManager):
         )
 
     def search_items(self, term: str) -> pd.DataFrame:
-        """Case-insensitive search across item names."""
         like = f"%{term}%"
         return self.fetch_data(
             """
@@ -118,14 +130,10 @@ class ShelfHandler(DatabaseManager):
         qty: int,
         user_email: str | None = None,
     ) -> None:
-        """
-        Move `qty` of `item_id` from `from_shelf` to `to_shelf`
-        and log the transfer.
-        """
         if qty <= 0:
             raise ValueError("Quantity must be positive")
 
-        # Decrease on source
+        # Decrease source
         self.execute_command(
             """
             UPDATE shelf_items
@@ -136,17 +144,18 @@ class ShelfHandler(DatabaseManager):
             (qty, item_id, from_shelf),
         )
 
-        # Increase on destination (insert row if new)
+        # Increase / insert destination
         self.execute_command(
             """
             INSERT INTO shelf_items (shelfid, itemid, quantity)
             VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)
+            ON DUPLICATE KEY UPDATE
+                  quantity = quantity + VALUES(quantity)
             """,
             (to_shelf, item_id, qty),
         )
 
-        # Audit trail
+        # Audit log
         self.execute_command(
             """
             INSERT INTO shelf_transfers
@@ -160,7 +169,6 @@ class ShelfHandler(DatabaseManager):
     # Alerts
     # ─────────────────────────────────────────────────────────────
     def low_stock_alerts(self, threshold: int = 5) -> pd.DataFrame:
-        """Return items whose total quantity is below `threshold`."""
         return self.fetch_data(
             """
             SELECT i.itemid,
