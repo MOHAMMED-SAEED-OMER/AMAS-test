@@ -1,169 +1,172 @@
-# db_handler.py  – MySQL edition (secrets-key tolerant)
-import streamlit as st
-import mysql.connector
-from mysql.connector import OperationalError, InterfaceError   # reconnect check
-import pandas as pd
-import uuid
+"""
+db_handler.py  – MySQL edition, PyMySQL driver (no native crashes)
 
-# ───────────────────────────────────────────────────────────────
-# 1. One cached connection per user session
-# ───────────────────────────────────────────────────────────────
+Why the rewrite?
+────────────────
+• `mysql-connector-python` links against glibc/openssl and can corrupt the
+  heap on Alpine-based containers → “malloc(): unsorted double linked list
+  corrupted”.  Switching to **PyMySQL** avoids native code entirely.
+
+Key points
+──────────
+• One cached PyMySQL connection per Streamlit session (`st.cache_resource`).
+• Automatic keep-alive: `conn.ping(reconnect=True)` before each query avoids
+  the “MySQL server has gone away” error.
+• Public API identical to the old version (`fetch_data`, `execute_command`,
+  `execute_command_returning`, etc.).
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any, Sequence, List
+
+import pandas as pd
+import pymysql
+from pymysql.err import OperationalError, InterfaceError
+import streamlit as st
+
+# ─────────────────────────────────────────────────────────────
+# 1. Helpers for session-scoped connection
+# ─────────────────────────────────────────────────────────────
 def _session_key() -> str:
-    """Return a unique key for the current user session."""
+    """Unique key per Streamlit browser session."""
     if "_session_key" not in st.session_state:
         st.session_state["_session_key"] = uuid.uuid4().hex
     return st.session_state["_session_key"]
 
 
 @st.cache_resource(show_spinner=False)
-def get_conn(params: dict, key: str):
-    """Create (once per session) and return a MySQL connection."""
-    conn = mysql.connector.connect(**params)
+def _get_conn(params: dict, cache_key: str):
+    """Create a PyMySQL connection once per session."""
+    conn = pymysql.connect(**params)
     try:
         st.on_session_end(conn.close)
-    except Exception:
+    except Exception:  # running outside interactive session
         pass
     return conn
 
-# ───────────────────────────────────────────────────────────────
-# 2. Database manager with auto-reconnect logic
-# ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 2. DatabaseManager
+# ─────────────────────────────────────────────────────────────
 class DatabaseManager:
-    """General DB interactions using a cached connection."""
+    """Lightweight DB helper using a cached PyMySQL connection."""
 
     def __init__(self):
-        # Credentials live in .streamlit/secrets.toml (Cloud UI)
+        # ---- read secrets ---------------------------------------------------
         secrets = st.secrets
-        if "mysql" in secrets:                         # sectioned secrets
+        if "mysql" in secrets:           # sectioned secrets.toml
             secrets = secrets["mysql"]
 
-        # 💡 Accept BOTH upper-case and lower-case keys
-        def pick(*names, default=None):
-            """
-            Return the first secrets entry that exists, ignoring KeyError.
-            Falls back to `default` if none are found.
-            """
-            for n in names:
+        def pick(*keys, default=None):
+            """Return first present secret key (case-insensitive)."""
+            for k in keys:
                 try:
-                    return secrets[n]          # st.secrets[...] may raise
+                    return secrets[k]
                 except KeyError:
-                    continue
+                    try:
+                        return secrets[k.lower()]  # allow lower-case
+                    except KeyError:
+                        continue
             return default
 
-
-        self.params = dict(
-            host      = pick("DB_HOST", "host"),
-            port      = int(pick("DB_PORT", "port", default=3306)),
-            user      = pick("DB_USER", "user"),
-            password  = pick("DB_PASS", "password"),
-            database  = pick("DB_NAME", "database"),
-            autocommit=True,
-            charset   ="utf8mb4",
-            collation ="utf8mb4_unicode_ci",
-            raise_on_warnings=True,
+        self._params: dict[str, Any] = dict(
+            host            = pick("DB_HOST", "host"),
+            port            = int(pick("DB_PORT", "port", default=3306)),
+            user            = pick("DB_USER", "user"),
+            password        = pick("DB_PASS", "password"),
+            database        = pick("DB_NAME", "database"),
+            charset         = "utf8mb4",
+            autocommit      = True,
+            cursorclass     = pymysql.cursors.Cursor,  # plain tuples
         )
 
-        self._key  = _session_key()
-        self.conn  = get_conn(self.params, self._key)  # reuse within this session
+        self._cache_key = _session_key()
+        self.conn       = _get_conn(self._params, self._cache_key)
 
-    # ────────── internal helpers ──────────
-    def _ensure_live_conn(self):
-        """Reconnect if the cached connection was closed by MySQL."""
-        if not self.conn.is_connected():
-            get_conn.clear()
-            self.conn = get_conn(self.params, self._key)
+    # ---------- internal util ----------------------------------------------
+    def _ensure_live(self):
+        """Ping connection; reconnect if server closed it."""
+        try:
+            self.conn.ping(reconnect=True)
+        except Exception:
+            _get_conn.clear()
+            self.conn = _get_conn(self._params, self._cache_key)
 
-    def _fetch_df(self, query: str, params=None) -> pd.DataFrame:
-        self._ensure_live_conn()
+    def _fetch_df(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
+        self._ensure_live()
         try:
             with self.conn.cursor() as cur:
-                cur.execute(query, params or ())
+                cur.execute(sql, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
+            return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
         except (OperationalError, InterfaceError):
-            get_conn.clear()
-            self.conn = get_conn(self.params, self._key)
+            # retry once after reconnect
+            _get_conn.clear()
+            self.conn = _get_conn(self._params, self._cache_key)
             with self.conn.cursor() as cur:
-                cur.execute(query, params or ())
+                cur.execute(sql, params or ())
                 rows = cur.fetchall()
                 cols = [c[0] for c in cur.description]
-        except Exception:
-            self.conn.rollback()
-            raise
-        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
+            return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
 
-    def _execute(self, query: str, params=None, returning=False):
-        """
-        Run INSERT/UPDATE/DELETE.
-        If `returning` is True **you must include your own SELECT** in `query`
-        because MySQL’s RETURNING is limited.
-        """
-        self._ensure_live_conn()
+    def _execute(self, sql: str, params: Sequence[Any] | None = None, *, returning=False):
+        self._ensure_live()
         try:
             with self.conn.cursor() as cur:
-                cur.execute(query, params or ())
-                res = cur.fetchone() if returning else None
-            self.conn.commit()
-            return res
+                cur.execute(sql, params or ())
+                result = cur.fetchone() if returning else None
+            return result
         except (OperationalError, InterfaceError):
-            get_conn.clear()
-            self.conn = get_conn(self.params, self._key)
+            _get_conn.clear()
+            self.conn = _get_conn(self._params, self._cache_key)
             with self.conn.cursor() as cur:
-                cur.execute(query, params or ())
-                res = cur.fetchone() if returning else None
-            self.conn.commit()
-            return res
-        except Exception:
-            self.conn.rollback()
-            raise
+                cur.execute(sql, params or ())
+                result = cur.fetchone() if returning else None
+            return result
 
-    # ────────── public API ──────────
-    def fetch_data(self, query, params=None):
+    # ---------- public API --------------------------------------------------
+    def fetch_data(self, query: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
         return self._fetch_df(query, params)
 
-    def execute_command(self, query, params=None):
+    def execute_command(self, query: str, params: Sequence[Any] | None = None) -> None:
         self._execute(query, params)
 
-    def execute_command_returning(self, query, params=None):
+    def execute_command_returning(
+        self, query: str, params: Sequence[Any] | None = None
+    ):
         return self._execute(query, params, returning=True)
 
-    # ─────────── Dropdown Management ───────────
-    def get_all_sections(self):
+    # ---------- Dropdown helpers -------------------------------------------
+    def get_all_sections(self) -> List[str]:
         df = self.fetch_data("SELECT DISTINCT section FROM dropdowns")
         return df["section"].tolist()
 
-    def get_dropdown_values(self, section):
-        q = "SELECT value FROM dropdowns WHERE section = %s"
-        df = self.fetch_data(q, (section,))
+    def get_dropdown_values(self, section: str) -> List[str]:
+        df = self.fetch_data("SELECT value FROM dropdowns WHERE section = %s", (section,))
         return df["value"].tolist()
 
-    # ─────────── Supplier Management ───────────
-    def get_suppliers(self):
-        return self.fetch_data(
-            "SELECT supplierid, suppliername FROM supplier"
-        )
+    # ---------- Supplier helpers -------------------------------------------
+    def get_suppliers(self) -> pd.DataFrame:
+        return self.fetch_data("SELECT supplierid, suppliername FROM supplier")
 
-    # ─────────── Inventory Management ───────────
-    def add_inventory(self, data: dict):
+    # ---------- Inventory helpers ------------------------------------------
+    def add_inventory(self, data: dict[str, Any]) -> None:
         cols = ", ".join(data.keys())
         ph   = ", ".join(["%s"] * len(data))
         q = f"INSERT INTO inventory ({cols}) VALUES ({ph})"
         self.execute_command(q, list(data.values()))
 
-    # ─────────── foreign_key Management ───────────
+    # ---------- FK safety helper -------------------------------------------
     def check_foreign_key_references(
         self,
         referenced_table: str,
         referenced_column: str,
-        value
-    ) -> list[str]:
-        """
-        Return tables that still reference `value` via FOREIGN KEY.
-        Empty list ⇒ safe to delete.
-        """
+        value: Any
+    ) -> List[str]:
         fk_sql = """
-            SELECT tc.table_schema,
-                   tc.table_name
+            SELECT tc.table_schema, tc.table_name
             FROM   information_schema.table_constraints AS tc
             JOIN   information_schema.key_column_usage AS kcu
                    ON tc.constraint_name = kcu.constraint_name
@@ -175,11 +178,10 @@ class DatabaseManager:
         """
         fks = self.fetch_data(fk_sql, (referenced_table, referenced_column))
 
-        conflicts: list[str] = []
+        conflicts: List[str] = []
         for _, row in fks.iterrows():
             schema = row["table_schema"]
             table  = row["table_name"]
-
             exists_sql = f"""
                 SELECT EXISTS(
                     SELECT 1
