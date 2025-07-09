@@ -1,24 +1,21 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-Single-engine MySQL helper + optional debug cockpit.
+Inventory/Selling‑Area DB helper.
 
-Enable debug:
-──────────────
-• In .streamlit/secrets.toml
-    [mysql]
-    host = "…"
-    user = "…"
-    password = "…"
-    database = "…"
-    debug_sql = true         # 👈 add this
-or
-• Set env var AMAS_DEBUG_SQL=1 before launching Streamlit.
+Highlights
+──────────
+• ONE SQLAlchemy engine handles all reads *and* writes
+  (mysql+mysqlconnector, `pool_pre_ping=True`, `pool_recycle=3600`).
+• All write ops wrapped in a lightweight retry that
+  disposes the pool on the first Operational/Interface failure.
+• Correct MySQL syntax for INSERT‑on‑duplicate‑update.
+• shelfentries insert fills `entrydate` (CURRENT_TIMESTAMP) and
+  leaves `entryid` to auto‑increment.
 """
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Any, Sequence, Callable, TypeVar
 
@@ -28,27 +25,20 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, InterfaceError, SQLAlchemyError
 
-# ── Debug flag ───────────────────────────────────────────────
-DEBUG = (
-    bool(os.getenv("AMAS_DEBUG_SQL"))
-    or bool(st.secrets["mysql"].get("debug_sql", False))
-)
-
 # ── Engine setup ────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _get_engine() -> Engine:
     cfg = st.secrets["mysql"]
     uri = (
         "mysql+mysqlconnector://"
-        f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port',3306)}/"
+        f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port', 3306)}/"
         f"{cfg['database']}?charset=utf8mb4"
     )
     return create_engine(
         uri,
         pool_size=6,
-        pool_recycle=3_600,
-        pool_pre_ping=True,   # auto-revalidate sockets
-        echo=DEBUG,           # ⇐ log SQL to console when debugging
+        pool_recycle=3_600,   # recycle after 1 h
+        pool_pre_ping=True,   # ping before checkout
     )
 
 
@@ -58,17 +48,18 @@ T = TypeVar("T")
 
 
 def _with_retry(func: Callable[..., T], /, *args, **kwargs) -> T:
-    """Run `func` and retry once on transient connection errors."""
+    """
+    Run `func` (usually a transactional block) once; on a transient
+    OperationalError/InterfaceError dispose the pool, wait 0.5 s, retry.
+    """
     for attempt in (1, 2):
         try:
             return func(*args, **kwargs)
         except (OperationalError, InterfaceError) as err:
             if attempt == 2:
                 raise
-            if DEBUG:
-                st.warning(f"DB retry due to: {err}")
+            engine.dispose()
             time.sleep(0.5)
-            engine.dispose()  # drop pool → fresh sockets
 
 
 # ── Base wrapper ────────────────────────────────────────────
@@ -92,35 +83,8 @@ class DatabaseManager:
         _with_retry(_write)
 
 
-# ╭────────────────────────────────────────────────────────────╮
-# │  Shelf-specific helpers                                   │
-# ╰────────────────────────────────────────────────────────────╯
+# ── Shelf-specific helpers ──────────────────────────────────
 class ShelfHandler(DatabaseManager):
-    # 2.0  Debug sidebar panel
-    def debug_panel(self) -> None:
-        """Show recent rows and DSN when DEBUG is True."""
-        if not DEBUG:
-            return
-        with st.sidebar.expander("🔎 DB Debug", expanded=False):
-            st.caption("Latest 5 rows in **shelf**")
-            st.dataframe(
-                self.fetch_data(
-                    "SELECT * FROM shelf ORDER BY lastupdated DESC LIMIT 5"
-                )
-            )
-            st.caption("Latest 5 rows in **shelfentries**")
-            st.dataframe(
-                self.fetch_data(
-                    "SELECT * FROM shelfentries ORDER BY entrydate DESC LIMIT 5"
-                )
-            )
-            cfg = st.secrets["mysql"]
-            st.caption("Current DSN")
-            st.code(
-                f"{cfg['user']}@{cfg['host']}:{cfg.get('port',3306)}/{cfg['database']}",
-                language="bash",
-            )
-
     # 2.1 current shelf items
     @st.cache_data(ttl=10)
     def get_shelf_items(_self) -> pd.DataFrame:
@@ -130,7 +94,7 @@ class ShelfHandler(DatabaseManager):
                    s.quantity, s.expirationdate, s.cost_per_unit,
                    s.locid, s.lastupdated
             FROM   shelf s
-            JOIN   item  i ON s.itemid = i.itemid
+            JOIN   item i ON s.itemid = i.itemid
             ORDER  BY i.itemnameenglish, s.expirationdate
             """
         )
@@ -142,13 +106,14 @@ class ShelfHandler(DatabaseManager):
             SELECT locid
             FROM   shelfentries
             WHERE  itemid = :itemid AND locid IS NOT NULL
-            ORDER  BY entrydate DESC LIMIT 1
+            ORDER  BY entrydate DESC
+            LIMIT 1
             """,
             {"itemid": itemid},
         )
         return None if df.empty else str(df.iloc[0, 0])
 
-    # 2.3 upsert + log + inventory decrement
+    # 2.3 add / increment shelf + log + inventory subtract
     def add_to_shelf(
         self,
         *,
@@ -161,44 +126,49 @@ class ShelfHandler(DatabaseManager):
     ) -> None:
         def _tx():
             with engine.begin() as conn:
+                # ① shelf upsert
                 conn.execute(
                     text(
                         """
                         INSERT INTO shelf (itemid, expirationdate, quantity,
                                            cost_per_unit, locid)
-                        VALUES (:itemid,:exp,:qty,:cpu,:loc) AS new
+                        VALUES (:itemid, :exp, :qty, :cpu, :loc)
                         ON DUPLICATE KEY UPDATE
-                            quantity      = shelf.quantity + new.quantity,
-                            cost_per_unit = new.cost_per_unit,
-                            locid         = new.locid,
+                            quantity      = shelf.quantity + VALUES(quantity),
+                            cost_per_unit = VALUES(cost_per_unit),
+                            locid         = VALUES(locid),
                             lastupdated   = CURRENT_TIMESTAMP
                         """
                     ),
-                    dict(
-                        itemid=itemid,
-                        exp=expirationdate,
-                        qty=int(quantity),
-                        cpu=float(cost_per_unit),
-                        loc=locid,
-                    ),
+                    {
+                        "itemid": itemid,
+                        "exp": expirationdate,
+                        "qty": int(quantity),
+                        "cpu": float(cost_per_unit),
+                        "loc": locid,
+                    },
                 )
+
+                # ② movement log  (entrydate filled explicitly)
                 conn.execute(
                     text(
                         """
                         INSERT INTO shelfentries
                                (itemid, expirationdate, quantity,
-                                createdby, locid)
-                        VALUES (:itemid,:exp,:qty,:user,:loc)
+                                createdby, locid, entrydate)
+                        VALUES (:itemid, :exp, :qty, :user, :loc, CURRENT_TIMESTAMP)
                         """
                     ),
-                    dict(
-                        itemid=itemid,
-                        exp=expirationdate,
-                        qty=int(quantity),
-                        user=created_by,
-                        loc=locid,
-                    ),
+                    {
+                        "itemid": itemid,
+                        "exp": expirationdate,
+                        "qty": int(quantity),
+                        "user": created_by,
+                        "loc": locid,
+                    },
                 )
+
+                # ③ inventory decrement
                 conn.execute(
                     text(
                         """
@@ -209,12 +179,12 @@ class ShelfHandler(DatabaseManager):
                           AND cost_per_unit  = :cpu
                         """
                     ),
-                    dict(
-                        qty=int(quantity),
-                        itemid=itemid,
-                        exp=expirationdate,
-                        cpu=float(cost_per_unit),
-                    ),
+                    {
+                        "qty": int(quantity),
+                        "itemid": itemid,
+                        "exp": expirationdate,
+                        "cpu": float(cost_per_unit),
+                    },
                 )
 
         _with_retry(_tx)
@@ -245,12 +215,15 @@ class ShelfHandler(DatabaseManager):
                         """
                         SELECT shortageid, shortage_qty
                         FROM   shelf_shortage
-                        WHERE  itemid = :itemid AND resolved = FALSE
-                        ORDER  BY logged_at FOR UPDATE
+                        WHERE  itemid = :itemid
+                          AND  resolved = FALSE
+                        ORDER  BY logged_at
+                        FOR UPDATE
                         """
                     ),
                     {"itemid": itemid},
                 ).mappings()
+
                 for row in rows:
                     if remaining == 0:
                         break
@@ -272,6 +245,7 @@ class ShelfHandler(DatabaseManager):
                         {"take": take, "user": user, "sid": row["shortageid"]},
                     )
                     remaining -= take
+
                 conn.execute(text("DELETE FROM shelf_shortage WHERE shortage_qty = 0"))
             return remaining
 
@@ -317,7 +291,7 @@ class ShelfHandler(DatabaseManager):
             UPDATE item
             SET shelfthreshold = :thr,
                 shelfaverage   = :avg
-            WHERE itemid      = :id
+            WHERE itemid = :id
             """,
             {"thr": int(thr), "avg": int(avg), "id": int(itemid)},
         )
