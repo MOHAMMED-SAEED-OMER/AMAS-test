@@ -1,11 +1,13 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-• Prefers pure-Python PyMySQL driver; falls back to mysql-connector if missing.
-• Resilient SQLAlchemy engine (pool_pre_ping, pool_recycle=3600) with one-retry.
+• Uses a pure-Python PyMySQL driver if present; otherwise falls back to
+  mysql-connector.
+• Resilient SQLAlchemy engine (pool_pre_ping, pool_recycle=3600) with a
+  one-retry strategy on transient connection errors.
 • DB generates entryid (AUTO_INCREMENT) & entrydate (DEFAULT CURRENT_TIMESTAMP).
-• BACK-COMPAT: exposes both modern *and* legacy method names expected by older
-  modules (shelf.py, transfer.py, alerts.py, etc.).
+• **Back-compat:** exposes both modern *and* legacy method names expected
+  by older modules (shelf.py, transfer.py, alerts.py, etc.).
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, InterfaceError, SQLAlchemyError
 
-# ── 0. Build driver URI (PyMySQL if available) ───────────────────────────────
+# ── 0. Build driver URI (prefers PyMySQL) ────────────────────────────────────
 def _driver_uri() -> str:
     cfg = st.secrets["mysql"]
     if importlib.util.find_spec("pymysql"):
@@ -33,17 +35,17 @@ def _driver_uri() -> str:
         driver = "mysql+mysqlconnector://"
     return (
         f"{driver}{cfg['user']}:{cfg['password']}@"
-        f"{cfg['host']}:{cfg.get('port',3306)}/{cfg['database']}?charset=utf8mb4"
+        f"{cfg['host']}:{cfg.get('port', 3306)}/{cfg['database']}?charset=utf8mb4"
     )
 
-# ── 1. Engine + retry helper ────────────────────────────────────────────────
+# ── 1. Engine & retry helper ────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _get_engine() -> Engine:
     return create_engine(
         _driver_uri(),
         pool_size=6,
         pool_pre_ping=True,
-        pool_recycle=3_600,   # recycle after 1 h
+        pool_recycle=3_600,  # recycle after 1 h
         future=True,
     )
 
@@ -63,19 +65,20 @@ def _retry(fn: Callable[..., T], /, *a, **kw) -> T:
             engine.dispose()
             time.sleep(0.5)
 
-# ── 2. Thin DB wrapper ───────────────────────────────────────────────────────
+# ── 2. Thin DB wrapper ──────────────────────────────────────────────────────
 class DB:
     # modern read
     def df(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
         def _read():
             return pd.read_sql_query(text(sql), engine, params=params)
+
         try:
             return _retry(_read)
         except SQLAlchemyError as e:
             st.error(f"❌ DB read failed: {e}")
             return pd.DataFrame()
 
-    # legacy alias for transfer.py etc.
+    # legacy alias (transfer.py etc.)
     fetch_data = df  # type: ignore[assignment]
 
     # write
@@ -83,12 +86,12 @@ class DB:
         def _write():
             with engine.begin() as c:
                 c.execute(text(sql), params or {})
+
         _retry(_write)
 
-# ── 3. Shelf helper with full alias coverage ────────────────────────────────
+# ── 3. Shelf helper (now with update_shelf_settings) ────────────────────────
 class ShelfHandler(DB):
-    # ---------- DataFrames ----------
-
+    # ---------- DataFrames --------------------------------------------------
     @st.cache_data(ttl=10)
     def shelf_grid(_s) -> pd.DataFrame:
         return _s.df(
@@ -127,7 +130,8 @@ class ShelfHandler(DB):
             """
             SELECT itemid, itemnameenglish AS itemname,
                    shelfthreshold, shelfaverage
-            FROM   item ORDER BY itemnameenglish
+            FROM   item
+            ORDER  BY itemnameenglish
             """
         )
         if not df.empty:
@@ -143,7 +147,7 @@ class ShelfHandler(DB):
         df = _s.df(
             """
             SELECT i.itemid, i.itemnameenglish AS itemname,
-                   COALESCE(SUM(s.quantity),0) AS totalquantity,
+                   COALESCE(SUM(s.quantity), 0) AS totalquantity,
                    i.shelfthreshold, i.shelfaverage
             FROM   item i
             LEFT JOIN shelf s ON i.itemid = s.itemid
@@ -161,14 +165,15 @@ class ShelfHandler(DB):
 
     get_shelf_quantity_by_item = qty_by_item  # legacy alias
 
-    # ---------- Single-record reads ----------
+    # ---------- Single-record reads ----------------------------------------
     def last_locid(self, itemid: int) -> str | None:
         df = self.df(
             """
             SELECT locid
             FROM   shelfentries
             WHERE  itemid = :itemid AND locid IS NOT NULL
-            ORDER  BY entrydate DESC LIMIT 1
+            ORDER  BY entrydate DESC
+            LIMIT  1
             """,
             {"itemid": itemid},
         )
@@ -189,7 +194,7 @@ class ShelfHandler(DB):
 
     get_inventory_by_barcode = inv_by_barcode  # legacy alias
 
-    # ---------- Mutations ----------
+    # ---------- Mutations ---------------------------------------------------
     def add_to_shelf(
         self,
         *,
@@ -202,12 +207,13 @@ class ShelfHandler(DB):
     ) -> None:
         def _tx():
             with engine.begin() as c:
+                # 1) upsert shelf
                 c.execute(
                     text(
                         """
                         INSERT INTO shelf (itemid, expirationdate, quantity,
                                            cost_per_unit, locid)
-                        VALUES (:item,:exp,:qty,:cpu,:loc)
+                        VALUES (:item, :exp, :qty, :cpu, :loc)
                         ON DUPLICATE KEY UPDATE
                           quantity      = quantity + VALUES(quantity),
                           cost_per_unit = VALUES(cost_per_unit),
@@ -223,13 +229,14 @@ class ShelfHandler(DB):
                         loc=locid,
                     ),
                 )
+                # 2) audit trail
                 c.execute(
                     text(
                         """
                         INSERT INTO shelfentries
                                (itemid, quantity, expirationdate,
                                 createdby, locid)
-                        VALUES (:item,:qty,:exp,:user,:loc)
+                        VALUES (:item, :qty, :exp, :user, :loc)
                         """
                     ),
                     dict(
@@ -240,13 +247,15 @@ class ShelfHandler(DB):
                         loc=locid,
                     ),
                 )
+                # 3) deduct from inventory
                 c.execute(
                     text(
                         """
                         UPDATE inventory
                         SET quantity = quantity - :qty
-                        WHERE itemid = :item AND expirationdate = :exp
-                          AND cost_per_unit = :cpu
+                        WHERE itemid = :item
+                          AND expirationdate = :exp
+                          AND cost_per_unit  = :cpu
                         """
                     ),
                     dict(
@@ -260,6 +269,7 @@ class ShelfHandler(DB):
         _retry(_tx)
 
     def resolve_shortages(self, itemid: int, qty_need: int, user: str) -> int:
+        """Consume `qty_need` from oldest shortages first; returns remainder."""
         remaining = qty_need
 
         def _tx() -> int:
@@ -271,7 +281,8 @@ class ShelfHandler(DB):
                         SELECT shortageid, shortage_qty
                         FROM   shelf_shortage
                         WHERE  itemid = :item AND resolved = FALSE
-                        ORDER  BY logged_at FOR UPDATE
+                        ORDER  BY logged_at
+                        FOR UPDATE
                         """
                     ),
                     {"item": itemid},
@@ -287,7 +298,7 @@ class ShelfHandler(DB):
                             UPDATE shelf_shortage
                             SET shortage_qty = shortage_qty - :take,
                                 resolved      = (shortage_qty - :take = 0),
-                                resolved_qty  = COALESCE(resolved_qty,0)+:take,
+                                resolved_qty  = COALESCE(resolved_qty, 0) + :take,
                                 resolved_at   = IF(shortage_qty - :take = 0,
                                                    CURRENT_TIMESTAMP,
                                                    resolved_at),
@@ -304,12 +315,26 @@ class ShelfHandler(DB):
 
         return _retry(_tx)
 
+    # ---------- Threshold helpers ------------------------------------------
     def update_thresholds(self, itemid: int, thr: int, avg: int) -> None:
+        """Canonical method: persist new `shelfthreshold` and `shelfaverage`."""
         self.exec(
             """
             UPDATE item
-            SET shelfthreshold = :thr, shelfaverage = :avg
+            SET shelfthreshold = :thr,
+                shelfaverage   = :avg
             WHERE itemid = :id
             """,
             {"thr": int(thr), "avg": int(avg), "id": int(itemid)},
         )
+
+    # ------------------------------------------------------------------
+    # Back-compat & UI-required aliases
+    # ------------------------------------------------------------------
+    def update_shelf_settings(self, itemid: int, thr: int, avg: int) -> None:  # UI needs this
+        """Alias to `update_thresholds` for shelf_manage.py and other modules."""
+        self.update_thresholds(itemid, thr, avg)
+
+    # extra synonyms some older scripts use
+    save_shelf_settings = update_shelf_settings  # type: ignore[assignment]
+    set_shelf_settings  = update_shelf_settings  # type: ignore[assignment]
