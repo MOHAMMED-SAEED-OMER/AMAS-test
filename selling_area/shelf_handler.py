@@ -1,10 +1,22 @@
 """
 selling_area/shelf_handler.py
-MySQL 8.0 edition – fixed: cached instance methods use `_self`
+─────────────────────────────
+MySQL 8.0 helper for the Selling-Area pages (Streamlit 1.46+).
+
+Highlights
+──────────
+• Small (2-slot) connection pool cached with @st.cache_resource.
+• Falls back to making a fresh connection per call if the pool can’t start
+  (e.g. DB temporarily unreachable during cold-start).
+• _safe_conn() retries 0-1-2 s before raising, so brief hiccups don’t crash the
+  whole app.
+• All frequently-called reads memoised with @st.cache_data (underscore ‘_self’
+  so Streamlit can hash them).
 """
 
 from __future__ import annotations
 
+import time
 from contextlib import closing
 from typing import Any, Sequence, List, Dict
 
@@ -12,44 +24,79 @@ import pandas as pd
 import streamlit as st
 import mysql.connector
 import mysql.connector.pooling
+from mysql.connector import errors as mcerr
 
-
-# ────────────────────────────────────────────────────────────────
-# 0   Connection pool
-# ────────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def _get_pool() -> mysql.connector.pooling.MySQLConnectionPool:
-    return mysql.connector.pooling.MySQLConnectionPool(
-        pool_name="amas_pool",
-        pool_size=10,
-        pool_reset_session=True,
-        host     = st.secrets["mysql"]["host"],
-        user     = st.secrets["mysql"]["user"],
-        password = st.secrets["mysql"]["password"],
-        database = st.secrets["mysql"]["database"],
+# ╭────────────────────────────────────────────────────────────╮
+# │ 0.  Resilient connection provider                          │
+# ╰────────────────────────────────────────────────────────────╯
+def _mysql_cfg() -> dict[str, Any]:
+    """Read connection settings once from st.secrets."""
+    sec = st.secrets["mysql"]
+    return dict(
+        host=sec["host"],
+        port=int(sec.get("port", 3306)),  # ← respects your 8081 port
+        user=sec["user"],
+        password=sec["password"],
+        database=sec["database"],
         autocommit=False,
-        connection_timeout=30,
+        connection_timeout=5,  # fail fast if unreachable
     )
 
 
-# ────────────────────────────────────────────────────────────────
-# 1   Tiny wrapper
-# ────────────────────────────────────────────────────────────────
+class _DummyPool:
+    """Fallback when MySQLConnectionPool cannot be created."""
+
+    def __init__(self, cfg: dict[str, Any]):
+        self._cfg = cfg
+
+    def get_connection(self):
+        return mysql.connector.connect(**self._cfg)
+
+
+@st.cache_resource(show_spinner=False)
+def _provider():
+    """Return a 2-slot pool, or a dummy provider if pool creation fails."""
+    cfg = _mysql_cfg()
+    try:
+        return mysql.connector.pooling.MySQLConnectionPool(
+            pool_name="amas_pool",
+            pool_size=2,
+            pool_reset_session=True,
+            **cfg,
+        )
+    except mcerr.InterfaceError:
+        return _DummyPool(cfg)  # graceful fallback
+
+
+def _safe_conn(retries: int = 3):
+    """Grab a connection with simple exponential back-off."""
+    last_err = None
+    for back in range(retries):
+        try:
+            return _provider().get_connection()
+        except mcerr.InterfaceError as err:
+            last_err = err
+            time.sleep(back)  # 0 → 1 → 2 s
+    raise last_err
+
+
+# ╭────────────────────────────────────────────────────────────╮
+# │ 1.  Thin wrapper (Pandas-friendly)                         │
+# ╰────────────────────────────────────────────────────────────╯
 class DatabaseManager:
     def fetch_data(
         self, sql: str, params: Sequence[Any] | None = None
     ) -> pd.DataFrame:
-        conn = _get_pool().get_connection()
+        conn = _safe_conn()
         try:
-            df = pd.read_sql(sql, conn, params=params)
+            return pd.read_sql(sql, conn, params=params)
         finally:
             conn.close()
-        return df
 
     def execute_command(
         self, sql: str, params: Sequence[Any] | None = None
     ) -> None:
-        conn = _get_pool().get_connection()
+        conn = _safe_conn()
         try:
             with closing(conn.cursor()) as cur:
                 cur.execute(sql, params)
@@ -58,13 +105,13 @@ class DatabaseManager:
             conn.close()
 
 
-# ────────────────────────────────────────────────────────────────
-# 2   Shelf helpers
-# ────────────────────────────────────────────────────────────────
+# ╭────────────────────────────────────────────────────────────╮
+# │ 2.  Shelf-specific helpers                                │
+# ╰────────────────────────────────────────────────────────────╯
 class ShelfHandler(DatabaseManager):
-    # 2.1 current shelf contents -------------------------------
+    # 2.1  current shelf contents ─────────────────────────────
     @st.cache_data(ttl=10)
-    def get_shelf_items(_self) -> pd.DataFrame:           # ← underscore!
+    def get_shelf_items(_self) -> pd.DataFrame:
         return _self.fetch_data(
             """
             SELECT s.shelfid,
@@ -81,7 +128,7 @@ class ShelfHandler(DatabaseManager):
             """
         )
 
-    # 2.2 last used shelf location ----------------------------
+    # 2.2  last used shelf location ──────────────────────────
     def last_locid(self, itemid: int) -> str | None:
         df = self.fetch_data(
             """
@@ -96,7 +143,7 @@ class ShelfHandler(DatabaseManager):
         )
         return None if df.empty else str(df.iloc[0, 0])
 
-    # 2.3 upsert shelf row + movement log ---------------------
+    # 2.3  upsert shelf row + movement log ───────────────────
     def add_to_shelf(
         self,
         *,
@@ -107,9 +154,10 @@ class ShelfHandler(DatabaseManager):
         cost_per_unit: float,
         locid: str,
     ) -> None:
-        conn = _get_pool().get_connection()
+        conn = _safe_conn()
         try:
             with closing(conn.cursor()) as cur:
+                # 1️⃣  Upsert / increment shelf row
                 cur.execute(
                     """
                     INSERT INTO shelf (itemid, expirationdate, quantity,
@@ -129,6 +177,7 @@ class ShelfHandler(DatabaseManager):
                         locid,
                     ),
                 )
+                # 2️⃣  Movement log
                 cur.execute(
                     """
                     INSERT INTO shelfentries
@@ -149,7 +198,7 @@ class ShelfHandler(DatabaseManager):
         finally:
             conn.close()
 
-    # 2.4 inventory helper ------------------------------------
+    # 2.4  inventory helper ──────────────────────────────────
     def get_inventory_by_barcode(self, barcode: str) -> pd.DataFrame:
         return self.fetch_data(
             """
@@ -167,12 +216,12 @@ class ShelfHandler(DatabaseManager):
             (barcode,),
         )
 
-    # 2.5 shortage resolver -----------------------------------
+    # 2.5  shortage resolver ─────────────────────────────────
     def resolve_shortages(
         self, *, itemid: int, qty_need: int, user: str
     ) -> int:
         remaining = qty_need
-        conn = _get_pool().get_connection()
+        conn = _safe_conn()
         try:
             with closing(conn.cursor(dictionary=True)) as cur:
                 cur.execute(
@@ -219,7 +268,7 @@ class ShelfHandler(DatabaseManager):
             conn.close()
         return remaining
 
-    # 2.6 low-stock alert -------------------------------------
+    # 2.6  low-stock alert ───────────────────────────────────
     @st.cache_data(ttl=10)
     def get_low_shelf_stock(_self, threshold: int = 10) -> pd.DataFrame:
         return _self.fetch_data(
@@ -236,7 +285,7 @@ class ShelfHandler(DatabaseManager):
             (threshold,),
         )
 
-    # 2.7 item master list ------------------------------------
+    # 2.7  master item list ──────────────────────────────────
     @st.cache_data(ttl=30)
     def get_all_items(_self) -> pd.DataFrame:
         df = _self.fetch_data(
@@ -265,7 +314,7 @@ class ShelfHandler(DatabaseManager):
             (int(thr), int(avg), int(itemid)),
         )
 
-    # 2.8 quantity by item ------------------------------------
+    # 2.8  quantity by item ──────────────────────────────────
     @st.cache_data(ttl=10)
     def get_shelf_quantity_by_item(_self) -> pd.DataFrame:
         df = _self.fetch_data(
