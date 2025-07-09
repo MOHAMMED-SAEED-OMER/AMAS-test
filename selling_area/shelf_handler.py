@@ -1,22 +1,24 @@
 """
 selling_area/shelf_handler.py
 ─────────────────────────────
-Streamlined helper for the Selling-Area pages.
+Single-engine MySQL helper + optional debug cockpit.
 
-Key points
-──────────
-1. Single SQLAlchemy engine (mysql+mysqlconnector) for *all* queries.
-   • pool_pre_ping=True   → stale connections auto-revalidated
-   • pool_recycle=3600    → long-running app safety
-2. No mysql-connector pool – fewer moving parts, fewer SSL issues.
-3. All write methods run inside `engine.begin()` (single transaction)
-   and retry once on transient Operational/Interface errors.
-4. INSERT into `shelfentries` no longer includes the non-existent
-   `cost_per_unit` column (fixed earlier).
+Enable debug:
+──────────────
+• In .streamlit/secrets.toml
+    [mysql]
+    host = "…"
+    user = "…"
+    password = "…"
+    database = "…"
+    debug_sql = true         # 👈 add this
+or
+• Set env var AMAS_DEBUG_SQL=1 before launching Streamlit.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Sequence, Callable, TypeVar
 
@@ -26,6 +28,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, InterfaceError, SQLAlchemyError
 
+# ── Debug flag ───────────────────────────────────────────────
+DEBUG = (
+    bool(os.getenv("AMAS_DEBUG_SQL"))
+    or bool(st.secrets["mysql"].get("debug_sql", False))
+)
+
 # ── Engine setup ────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _get_engine() -> Engine:
@@ -33,16 +41,16 @@ def _get_engine() -> Engine:
     uri = (
         "mysql+mysqlconnector://"
         f"{cfg['user']}:{cfg['password']}@{cfg['host']}:{cfg.get('port',3306)}/"
-        f"{cfg['database']}"
-        "?charset=utf8mb4"
+        f"{cfg['database']}?charset=utf8mb4"
     )
-    # pool_pre_ping=True → transparently reconnect dropped links
     return create_engine(
         uri,
         pool_size=6,
-        pool_recycle=3_600,  # recycle after 1 h just in case
-        pool_pre_ping=True,
+        pool_recycle=3_600,
+        pool_pre_ping=True,   # auto-revalidate sockets
+        echo=DEBUG,           # ⇐ log SQL to console when debugging
     )
+
 
 engine: Engine = _get_engine()
 
@@ -50,19 +58,17 @@ T = TypeVar("T")
 
 
 def _with_retry(func: Callable[..., T], /, *args, **kwargs) -> T:
-    """
-    Execute `func` once; on OperationalError/InterfaceError retry once
-    after a brief pause. Propagate on second failure.
-    """
+    """Run `func` and retry once on transient connection errors."""
     for attempt in (1, 2):
         try:
             return func(*args, **kwargs)
         except (OperationalError, InterfaceError) as err:
             if attempt == 2:
                 raise
-            time.sleep(0.5)  # quick back-off then retry
-            # dispose the whole pool so next get() forces new socket
-            engine.dispose()
+            if DEBUG:
+                st.warning(f"DB retry due to: {err}")
+            time.sleep(0.5)
+            engine.dispose()  # drop pool → fresh sockets
 
 
 # ── Base wrapper ────────────────────────────────────────────
@@ -86,8 +92,35 @@ class DatabaseManager:
         _with_retry(_write)
 
 
-# ── Shelf-specific helpers ──────────────────────────────────
+# ╭────────────────────────────────────────────────────────────╮
+# │  Shelf-specific helpers                                   │
+# ╰────────────────────────────────────────────────────────────╯
 class ShelfHandler(DatabaseManager):
+    # 2.0  Debug sidebar panel
+    def debug_panel(self) -> None:
+        """Show recent rows and DSN when DEBUG is True."""
+        if not DEBUG:
+            return
+        with st.sidebar.expander("🔎 DB Debug", expanded=False):
+            st.caption("Latest 5 rows in **shelf**")
+            st.dataframe(
+                self.fetch_data(
+                    "SELECT * FROM shelf ORDER BY lastupdated DESC LIMIT 5"
+                )
+            )
+            st.caption("Latest 5 rows in **shelfentries**")
+            st.dataframe(
+                self.fetch_data(
+                    "SELECT * FROM shelfentries ORDER BY entrydate DESC LIMIT 5"
+                )
+            )
+            cfg = st.secrets["mysql"]
+            st.caption("Current DSN")
+            st.code(
+                f"{cfg['user']}@{cfg['host']}:{cfg.get('port',3306)}/{cfg['database']}",
+                language="bash",
+            )
+
     # 2.1 current shelf items
     @st.cache_data(ttl=10)
     def get_shelf_items(_self) -> pd.DataFrame:
@@ -109,14 +142,13 @@ class ShelfHandler(DatabaseManager):
             SELECT locid
             FROM   shelfentries
             WHERE  itemid = :itemid AND locid IS NOT NULL
-            ORDER  BY entrydate DESC
-            LIMIT 1
+            ORDER  BY entrydate DESC LIMIT 1
             """,
             {"itemid": itemid},
         )
         return None if df.empty else str(df.iloc[0, 0])
 
-    # 2.3 add / increment shelf + log + inventory subtract
+    # 2.3 upsert + log + inventory decrement
     def add_to_shelf(
         self,
         *,
@@ -129,7 +161,6 @@ class ShelfHandler(DatabaseManager):
     ) -> None:
         def _tx():
             with engine.begin() as conn:
-                # ① shelf upsert
                 conn.execute(
                     text(
                         """
@@ -151,8 +182,6 @@ class ShelfHandler(DatabaseManager):
                         loc=locid,
                     ),
                 )
-
-                # ② movement log  (no cost_per_unit column)
                 conn.execute(
                     text(
                         """
@@ -170,8 +199,6 @@ class ShelfHandler(DatabaseManager):
                         loc=locid,
                     ),
                 )
-
-                # ③ inventory decrement
                 conn.execute(
                     text(
                         """
@@ -218,15 +245,12 @@ class ShelfHandler(DatabaseManager):
                         """
                         SELECT shortageid, shortage_qty
                         FROM   shelf_shortage
-                        WHERE  itemid = :itemid
-                          AND  resolved = FALSE
-                        ORDER  BY logged_at
-                        FOR UPDATE
+                        WHERE  itemid = :itemid AND resolved = FALSE
+                        ORDER  BY logged_at FOR UPDATE
                         """
                     ),
                     {"itemid": itemid},
                 ).mappings()
-
                 for row in rows:
                     if remaining == 0:
                         break
@@ -248,7 +272,6 @@ class ShelfHandler(DatabaseManager):
                         {"take": take, "user": user, "sid": row["shortageid"]},
                     )
                     remaining -= take
-
                 conn.execute(text("DELETE FROM shelf_shortage WHERE shortage_qty = 0"))
             return remaining
 
@@ -294,7 +317,7 @@ class ShelfHandler(DatabaseManager):
             UPDATE item
             SET shelfthreshold = :thr,
                 shelfaverage   = :avg
-            WHERE itemid = :id
+            WHERE itemid      = :id
             """,
             {"thr": int(thr), "avg": int(avg), "id": int(itemid)},
         )
