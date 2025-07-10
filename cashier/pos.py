@@ -1,6 +1,9 @@
-    # cashier/pos.py  – Point-of-Sale tab (MySQL backend)
-import streamlit as st
+# cashier/pos.py  – Point-of-Sale tab (MySQL backend)
+
+from __future__ import annotations
+
 import pandas as pd
+import streamlit as st
 import streamlit.components.v1 as components
 
 from cashier.cashier_handler import CashierHandler
@@ -80,7 +83,7 @@ def display_pos_tab():
         SELECT  holdid,
                 hold_label,
                 created_at,
-                JSON_LENGTH(items) AS line_count   -- safe alias
+                JSON_LENGTH(items) AS line_count
         FROM    `pos_holds`
         ORDER BY created_at
         """
@@ -89,7 +92,17 @@ def display_pos_tab():
         st.markdown("### ⏸ Held Bills")
         for r in held.itertuples():
             c1, c2, c3 = st.columns([5, 2, 1])
-            c1.write(f"**{r.hold_label}** • {r.line_count} items • {r.created_at:%H:%M}")
+            # created_at may be NULL → protect formatting
+            time_txt = ""
+            if r.created_at is not None:
+                try:
+                    time_txt = f"{r.created_at:%H:%M}"
+                except (TypeError, ValueError):
+                    time_txt = str(r.created_at)
+            c1.write(
+                f"**{r.hold_label}** • {r.line_count} items"
+                + (f" • {time_txt}" if time_txt else "")
+            )
             if c2.button("Resume", key=f"resume_{r.holdid}"):
                 st.session_state.sales_table = cashier_handler.load_hold(r.holdid)
                 cashier_handler.delete_hold(r.holdid)
@@ -122,6 +135,7 @@ def display_pos_tab():
                 if itm is None:
                     st.warning("No matching item.")
                     return
+                # This concat triggers a pandas FutureWarning now; fine for 2 .x.
                 st.session_state.sales_table = pd.concat(
                     [st.session_state.sales_table, pd.DataFrame([itm])],
                     ignore_index=True,
@@ -146,7 +160,7 @@ def display_pos_tab():
                 cols = st.columns([7, 2, 1])
                 cols[0].markdown(f"**{row.itemname}**")
                 new_q = cols[1].number_input(
-                    "",
+                    "Quantity",
                     min_value=1,
                     value=1 if pd.isna(row.quantity) else int(row.quantity),
                     key=f"qty_{idx}",
@@ -189,7 +203,7 @@ def display_pos_tab():
         if btns[2].button("❌ Cancel"):
             clear_bill()
 
-        # F9 hot-key → click Hold
+        # Hot-key (F9) → “Hold”
         components.html(
             """
             <script>
@@ -199,8 +213,7 @@ def display_pos_tab():
                 P._f9HoldListener = function (e) {
                   if (e.code === 'F9') {
                     e.preventDefault();
-                    const btn = [...P.querySelectorAll('button')]
-                                 .find(b => b.innerText.includes('Hold'));
+                    const btn = [...P.querySelectorAll('button')].find(b => b.innerText.includes('Hold'));
                     if (btn) btn.click();
                   }
                 };
