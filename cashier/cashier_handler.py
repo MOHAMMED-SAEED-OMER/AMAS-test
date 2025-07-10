@@ -1,9 +1,13 @@
 # cashier/cashier_handler.py  – POS helpers (MySQL backend)
 
+from __future__ import annotations
+
 import json
-from datetime import date
+from typing import Any
 
 import pandas as pd
+import mysql.connector
+from mysql.connector import Error
 
 from db_handler import DatabaseManager
 
@@ -16,17 +20,67 @@ class CashierHandler(DatabaseManager):
       • log shortages when shelf stock is insufficient
     """
 
+    # ───────────────────────── initialization ──────────────────────────
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """
+        Pass connection settings straight through to DatabaseManager.
+        Example:
+            cfg = {
+                "host": "127.0.0.1",
+                "user": "amas",
+                "password": "secret",
+                "database": "amas_db",
+                "port": 3306,
+            }
+            handler = CashierHandler(**cfg)
+        """
+        super().__init__(*args, **kwargs)  # DatabaseManager sets self.conn
+
+    # ------------------------------------------------------------------
+    # Compatibility shim: some legacy code calls _ensure_live_conn()
+    # before every DB operation.  We bring the method back and make it
+    # robust for MySQL (ping + auto-reconnect via DatabaseManager.connect()).
+    # ------------------------------------------------------------------
+    def _ensure_live_conn(self) -> None:
+        """
+        Ensure `self.conn` is an open, live MySQL connection.
+
+        • If `self.conn` is None, call DatabaseManager.connect()
+          (must exist in your codebase).
+        • If `.ping()` fails, reconnect through the same hook.
+        """
+        try:
+            if getattr(self, "conn", None) is None:
+                # First contact
+                self.connect()  # type: ignore[attr-defined]
+            else:
+                # Cheap liveness check; auto-reconnect if needed
+                self.conn.ping(reconnect=True, attempts=1, delay=0)
+        except (AttributeError, Error):
+            # Either DatabaseManager lacks .connect() *or* ping failed
+            # and reconnect threw; fall back to direct connect if we have
+            # credentials on `self.db_config`.
+            if hasattr(self, "connect"):  # type: ignore[attr-defined]
+                self.connect()            # type: ignore[attr-defined]
+            elif hasattr(self, "db_config"):
+                self.conn = mysql.connector.connect(**self.db_config)  # type: ignore[attr-defined]
+            else:
+                raise RuntimeError(
+                    "Cannot establish database connection – no connect() method "
+                    "or db_config found on DatabaseManager."
+                )
+
     # ───────────────────── sale header ─────────────────────
     def create_sale_record(
         self,
-        total_amount,
-        discount_rate,
-        total_discount,
-        final_amount,
-        payment_method,
-        cashier,
-        notes="",
-        original_saleid=None,
+        total_amount: float,
+        discount_rate: float,
+        total_discount: float,
+        final_amount: float,
+        payment_method: str,
+        cashier: str,
+        notes: str = "",
+        original_saleid: int | None = None,
     ) -> int | None:
         """Insert into `sales` and return new saleid (MySQL AUTO_INCREMENT)."""
         self._ensure_live_conn()
@@ -54,7 +108,7 @@ class CashierHandler(DatabaseManager):
         return int(saleid) if saleid else None
 
     # ───────────────────── line items (batch) ─────────────────────
-    def add_sale_items(self, saleid, items_list):
+    def add_sale_items(self, saleid: int, items_list: list[dict[str, Any]]) -> None:
         rows = [
             (
                 int(saleid),
@@ -118,7 +172,7 @@ class CashierHandler(DatabaseManager):
         return remaining  # >0 means shortage
 
     # legacy method (still used by Return flow)
-    def reduce_shelf_stock(self, itemid, quantity_sold):
+    def reduce_shelf_stock(self, itemid: int, quantity_sold: int) -> None:
         itemid_py = int(itemid)
         qty_py = int(quantity_sold)
 
@@ -152,12 +206,12 @@ class CashierHandler(DatabaseManager):
     def process_sale_with_shortage(
         self,
         *,
-        cart_items,
-        discount_rate,
-        payment_method,
-        cashier,
-        notes="",
-    ):
+        cart_items: list[dict[str, Any]],
+        discount_rate: float,
+        payment_method: str,
+        cashier: str,
+        notes: str = "",
+    ) -> tuple[int, list[dict[str, Any]]] | None:
         """
         Create sale, deduct shelf quantities, log shortages.
         Returns (saleid, shortages_list) where shortages_list contains
@@ -175,9 +229,9 @@ class CashierHandler(DatabaseManager):
         if saleid is None:
             return None
 
-        shortages: list[dict] = []
-        sale_lines = []
-        running_total = 0
+        shortages: list[dict[str, Any]] = []
+        sale_lines: list[dict[str, Any]] = []
+        running_total = 0.0
 
         for item in cart_items:
             iid = int(item["itemid"])
@@ -234,7 +288,7 @@ class CashierHandler(DatabaseManager):
         return saleid, shortages
 
     # ───────────────────── reporting helper ─────────────────────
-    def get_sale_details(self, saleid):
+    def get_sale_details(self, saleid: int):
         sale_df = self.fetch_data(
             "SELECT * FROM `sales` WHERE saleid = %s", (saleid,)
         )
@@ -311,7 +365,7 @@ class CashierHandler(DatabaseManager):
         df["total"] = df["quantity"] * df["price"]
         return df[["itemid", "itemname", "quantity", "price", "total"]]
 
-    def delete_hold(self, hold_id: int):
+    def delete_hold(self, hold_id: int) -> None:
         self.execute_command(
             "DELETE FROM `pos_holds` WHERE holdid = %s", (hold_id,)
         )
