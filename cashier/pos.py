@@ -1,4 +1,4 @@
-# cashier/pos.py  – Point-of-Sale tab (MySQL backend)
+    # cashier/pos.py  – Point-of-Sale tab (MySQL backend)
 import streamlit as st
 import pandas as pd
 import streamlit.components.v1 as components
@@ -148,7 +148,7 @@ def display_pos_tab():
                 new_q = cols[1].number_input(
                     "",
                     min_value=1,
-                    value=int(row.quantity),
+                    value=1 if pd.isna(row.quantity) else int(row.quantity),
                     key=f"qty_{idx}",
                     label_visibility="collapsed",
                 )
