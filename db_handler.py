@@ -9,16 +9,12 @@ db_handler.py – MySQL edition, PyMySQL driver
 from __future__ import annotations
 
 import uuid
-import struct      # NEW – for struct.error
+import struct
 from typing import Any, Sequence, List
 
 import pandas as pd
 import pymysql
-from pymysql.err import (
-    OperationalError,
-    InterfaceError,
-    InternalError,
-)  # connection-level failures
+from pymysql.err import OperationalError, InterfaceError, InternalError
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────
@@ -35,7 +31,7 @@ def _get_conn(params: dict, cache_key: str):
     conn = pymysql.connect(**params)
     try:
         st.on_session_end(conn.close)
-    except Exception:  # running in non-interactive env
+    except Exception:
         pass
     return conn
 
@@ -51,7 +47,7 @@ class DatabaseManager:
     # ---------------------------------------------------------
     def __init__(self):
         secrets = st.secrets
-        if "mysql" in secrets:  # sectioned secrets.toml
+        if "mysql" in secrets:          # sectioned secrets.toml
             secrets = secrets["mysql"]
 
         def pick(*keys, default=None):
@@ -70,7 +66,7 @@ class DatabaseManager:
             database    = pick("DB_NAME", "database"),
             charset     = "utf8mb4",
             autocommit  = True,
-            cursorclass = pymysql.cursors.DictCursor,  # <— easier access by name
+            cursorclass = pymysql.cursors.DictCursor,  # rows as dicts
         )
 
         self._cache_key = _session_key()
@@ -97,9 +93,10 @@ class DatabaseManager:
             OperationalError,
             InterfaceError,
             InternalError,
-            struct.error,      # malformed packet
-            ValueError,        # e.g. "buffer size" errors
-            EOFError,          # server closed the stream mid-result
+            struct.error,   # malformed packet
+            ValueError,     # “buffer size” errors
+            EOFError,       # server closed stream mid-result
+            IndexError,     # truncated packet (PyMySQL protocol)
         ):
             _get_conn.clear()
             self.conn = _get_conn(self._params, self._cache_key)
@@ -132,8 +129,8 @@ class DatabaseManager:
             with self.conn.cursor() as cur:
                 cur.execute(sql, params or ())
                 result = cur.fetchone() if returning else None
-                if returning:  # drain the result set
-                    cur.fetchall()
+                if returning:
+                    cur.fetchall()  # drain
             return result
 
         return self._retryable(_run)
