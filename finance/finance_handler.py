@@ -1,6 +1,7 @@
 # finance/finance_handler.py  – MySQL backend
 from __future__ import annotations
 
+import datetime
 import decimal
 import pandas as pd
 
@@ -9,32 +10,34 @@ from db_handler import DatabaseManager
 
 class FinanceHandler(DatabaseManager):
     """
-    Finance-level helpers (MySQL flavour).
+    Finance-level helpers for the AMAS Finance module (MySQL edition).
 
-    The `_ensure_live_conn` helper below is added so long-running Streamlit
-    sessions can quietly reopen a dropped MySQL connection before running any
-    INSERT / UPDATE.  Delete it if your DatabaseManager already does this.
+    Key points
+    ----------
+    • `_ensure_live_conn()` quietly pings / re-opens the MySQL connection
+      before every write so Streamlit’s long-running sessions never hit
+      “MySQL server has gone away”.
+    • `create_supplier_payment()` now:
+        – Upgrades a date-only object to a full `datetime` (using the
+          current local time) so you always store an accurate timestamp.
+        – Relies on the table’s DEFAULT `'Standard'` when the UI leaves
+          `payment_type` blank, but still lets callers override it.
     """
 
-    # ───────────────────── internal connection guard ──────────────────────
+    # ───────────────────────── internal guard ─────────────────────────
     def _ensure_live_conn(self) -> None:
-        """
-        Re-establish `self.conn` if the MySQL server has closed the socket.
-        Works with both PyMySQL and mysql-connector.
-        """
+        """Ping the connection; reconnect if the socket was dropped."""
         if getattr(self, "conn", None) is not None:
             try:
-                # `ping(reconnect=True)` → reopen transparently if needed
-                self.conn.ping(reconnect=True)
+                self.conn.ping(reconnect=True)       # PyMySQL & mysql-connector
                 return
-            except Exception:  # pragma: no cover
+            except Exception:                        # pragma: no cover
                 pass
 
-        # Fallback → ask DatabaseManager for a fresh handle
+        # Ask the DatabaseManager base for a new handle
         if hasattr(self, "_connect"):
             self.conn = self._connect()
         else:
-            # most DB manager bases expose a public `connect()`
             self.conn = self.connect()  # type: ignore[attr-defined]
 
     # ───────────────────── Supplier Debt ─────────────────────
@@ -82,9 +85,22 @@ class FinanceHandler(DatabaseManager):
     ) -> int | None:
         """
         Insert a row into `supplierpayments` and return its AUTO_INCREMENT id.
-        """
 
-        # 1) Detect optional `payment_type` column once
+        • If the user picked only a calendar date (no time), we add the current
+          time so `paymentdate` becomes a proper timestamp.
+        • `payment_type` is only included when the caller supplies a value;
+          otherwise we rely on the table default 'Standard'.
+        """
+        # ── Normalise `payment_date` ───────────────────────────────────
+        if (
+            isinstance(payment_date, datetime.date)
+            and not isinstance(payment_date, datetime.datetime)
+        ):
+            payment_date = datetime.datetime.combine(
+                payment_date, datetime.datetime.now().time()
+            )
+
+        # ── Detect once whether the column exists ──────────────────────
         if not hasattr(self, "_has_payment_type"):
             probe = """
                 SELECT 1
@@ -105,21 +121,23 @@ class FinanceHandler(DatabaseManager):
             notes,
         ]
 
-        if payment_type and self._has_payment_type:
+        # Only send payment_type if the caller set it (otherwise leave column
+        # out and let MySQL apply its DEFAULT 'Standard')
+        if payment_type is not None and self._has_payment_type:
             cols.append("payment_type")
             vals.append(payment_type)
 
-        placeholder = ", ".join(["%s"] * len(cols))
-        col_list    = ", ".join(f"`{c}`" for c in cols)
+        placeholders = ", ".join(["%s"] * len(cols))
+        col_list     = ", ".join(f"`{c}`" for c in cols)
 
         sql = f"""
             INSERT INTO `supplierpayments` ({col_list})
-            VALUES ({placeholder});
+            VALUES ({placeholders});
         """
 
-        # 2) Guard the connection, run insert, fetch lastrowid
+        # ── Execute ───────────────────────────────────────────────────
         self._ensure_live_conn()
-        with self.conn.cursor() as cur:                 # type: ignore[attr-defined]
+        with self.conn.cursor() as cur:                # type: ignore[attr-defined]
             cur.execute(sql, vals)
             pay_id = cur.lastrowid
         self.conn.commit()
@@ -134,9 +152,7 @@ class FinanceHandler(DatabaseManager):
         allocation_status: str,
         return_id: int | None = None,
     ) -> None:
-        """
-        Link a supplier payment to a purchase-order (and optionally a Return).
-        """
+        """Link a payment to a PO (and optionally a Return)."""
         sql = """
             INSERT INTO `popayments`
                    (paymentid, poid, allocatedamount, allocationstatus, returnid)
