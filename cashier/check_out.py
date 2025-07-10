@@ -1,11 +1,10 @@
 """
-Cashier ▸ Check-Out  (MySQL backend, UTC-based like the old PostgreSQL version)
+Cashier ▸ Check-Out   (Baghdad time, MySQL backend)
 """
 from __future__ import annotations
-
-from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
+from datetime import timedelta
 
 from db_handler import DatabaseManager
 
@@ -13,74 +12,53 @@ _db    = DatabaseManager()
 DENOMS = [50_000, 25_000, 10_000, 5_000, 1_000, 500, 250]
 
 # ───────────────────────── helpers ──────────────────────────
-def _to_plain_datetime(ts):
-    """Make any Timestamp/aware-dt into a naïve UTC datetime (clock unchanged)."""
-    if ts is None:
-        return None
-    if isinstance(ts, pd.Timestamp):
-        ts = ts.to_pydatetime()
-    return ts.replace(tzinfo=None)
-
-def _fmt(val):
+def _fmt(val):          # money or Δ
     return "N/A" if val is None else f"{float(val):,.0f}"
 
-# ───────────────────────── SQL helpers ──────────────────────
+def _server_now():
+    """Return NOW() from MySQL in Baghdad TZ (naïve)."""
+    return _db.fetch_data("SELECT NOW()").iat[0, 0]
+
+# ---------- SQL helpers ----------
 def get_shift_start(cashier: str):
-    # 1️⃣ last recorded closure for this cashier
     df = _db.fetch_data(
-        """
-        SELECT shift_end
-        FROM   cashier_shift_closure
-        WHERE  cashier = %s
-        ORDER  BY shift_end DESC
-        LIMIT  1
-        """,
+        "SELECT shift_end FROM cashier_shift_closure "
+        "WHERE cashier=%s ORDER BY shift_end DESC LIMIT 1",
         (cashier,),
     )
     if not df.empty and df.iat[0, 0]:
-        return _to_plain_datetime(df.iat[0, 0])
+        return df.iat[0, 0]
 
-    # 2️⃣ else earliest sale *today* (server uses UTC)
     df = _db.fetch_data(
-        """
-        SELECT MIN(saletime)
-        FROM   sales
-        WHERE  cashier = %s
-          AND  DATE(saletime) = CURDATE()
-        """,
+        "SELECT MIN(saletime) FROM sales "
+        "WHERE cashier=%s AND DATE(saletime)=CURDATE()",
         (cashier,),
     )
-    return _to_plain_datetime(df.iat[0, 0]) if not df.empty else None
+    return df.iat[0, 0] if not df.empty else None
 
 def get_sales_totals(cashier: str, start, end):
     df = _db.fetch_data(
-        """
-        SELECT SUM(finalamount) AS system_total,
-               COUNT(*)         AS tx_count
-        FROM   sales
-        WHERE  cashier = %s
-          AND  saletime BETWEEN %s AND %s
-        """,
-        (cashier, _to_plain_datetime(start), _to_plain_datetime(end)),
+        "SELECT SUM(finalamount) AS system_total, COUNT(*) AS tx_count "
+        "FROM sales WHERE cashier=%s AND saletime BETWEEN %s AND %s",
+        (cashier, start, end),
     )
     return float(df.iat[0, 0] or 0), int(df.iat[0, 1] or 0)
 
 def get_item_summary(cashier: str, start, end):
     return _db.fetch_data(
         """
-        SELECT  i.itemid          AS "ID",
+        SELECT  i.itemid AS "ID",
                 i.itemnameenglish AS "Item",
                 SUM(si.quantity)  AS "Qty",
                 SUM(si.quantity * si.unitprice) AS "IQD"
         FROM    salesitems si
         JOIN    sales      s  ON s.saleid = si.saleid
         JOIN    item       i  ON i.itemid = si.itemid
-        WHERE   s.cashier = %s
-          AND   s.saletime BETWEEN %s AND %s
+        WHERE   s.cashier=%s AND s.saletime BETWEEN %s AND %s
         GROUP BY i.itemid, i.itemnameenglish
         ORDER BY "IQD" DESC
         """,
-        (cashier, _to_plain_datetime(start), _to_plain_datetime(end)),
+        (cashier, start, end),
     )
 
 def save_closure(cashier, start, end, denom, cash_total, system_total, notes):
@@ -98,8 +76,8 @@ def save_closure(cashier, start, end, denom, cash_total, system_total, notes):
         """,
         {
             "c":    cashier,
-            "s":    _to_plain_datetime(start),
-            "e":    _to_plain_datetime(end),
+            "s":    start,
+            "e":    end,
             "sys":  system_total,
             "cash": cash_total,
             "disc": disc,
@@ -116,21 +94,16 @@ def save_closure(cashier, start, end, denom, cash_total, system_total, notes):
 
 def fetch_last_closure(cashier):
     df = _db.fetch_data(
-        """
-        SELECT *
-        FROM   cashier_shift_closure
-        WHERE  cashier = %s
-        ORDER  BY shift_end DESC
-        LIMIT  1
-        """,
+        "SELECT * FROM cashier_shift_closure "
+        "WHERE cashier=%s ORDER BY shift_end DESC LIMIT 1",
         (cashier,),
     )
     return df.iloc[0] if not df.empty else None
 
-# ───────────────────────── UI  ──────────────────────────────
+# ---------- UI ----------
 def render():
     st.markdown(
-        "<h2 style='color:#1ABC9C;margin-bottom:0.3em'>🧾 Shift Check-Out</h2>",
+        "<h2 style='color:#1ABC9C;margin-bottom:0.2em'>🧾 Shift Check-Out</h2>",
         unsafe_allow_html=True,
     )
 
@@ -144,13 +117,7 @@ def render():
         st.info("No sales recorded for today.")
         st.stop()
 
-    now = datetime.utcnow()
-    # ─── DEBUG ───
-with st.expander("DEBUG – shift window"):
-    st.write("cashier =", cashier)
-    st.write("shift_start =", shift_start, type(shift_start))
-    st.write("now =", now)
-
+    now = _server_now()
     system_total, tx_count = get_sales_totals(cashier, shift_start, now)
 
     # Overview
