@@ -86,15 +86,17 @@ def display_return_tab() -> None:
 
         if col_ok.button("✅ Confirm return", key="pin_ok_btn"):
             if pin and _pin_ok(pin):
-                new_id = cashier_handler.finalize_sale(
+                # ---------- NEW: use process_sale_with_shortage -----------
+                res = cashier_handler.process_sale_with_shortage(
                     cart_items=pending["items"],
                     discount_rate=pending["disc_rate"],
                     payment_method="Return",
                     cashier=ss.get("user_email", "Unknown"),
-                    notes=pending["note"],
-                    original_saleid=pending["orig_id"],
+                    notes=pending["note"]
+                          + f" | Original Sale {pending['orig_id']}",
                 )
-                if new_id:
+                if res:
+                    new_id, _ = res     # ignore shortages for returns
                     st.success(f"Return processed. New Sale ID {new_id}")
                 else:
                     st.error("Database error – return not saved.")
