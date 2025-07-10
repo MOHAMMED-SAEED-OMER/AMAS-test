@@ -6,6 +6,8 @@ Consignment dashboard (MySQL backend)
 • Unsold consignment stock still with us (inventory + shelf) and its value
 • Record consignment payments (FIFO — oldest partially/unpaid POs first)
 """
+from __future__ import annotations
+
 import pandas as pd
 import streamlit as st
 
@@ -76,24 +78,29 @@ def _render_supplier_dashboard(
         )
     )
 
-    # payments per PO
-    paid_map = (
-        fh.fetch_data(
-            """
-            SELECT poid,
-                   SUM(allocatedamount) AS paid_amount
-            FROM   `popayments`
-            GROUP  BY poid
-            """
-        )
-        .set_index("poid")["paid_amount"]
-        .to_dict()
+    # payments per PO (cast Decimal → float)
+    paid_map_df = fh.fetch_data(
+        """
+        SELECT poid,
+               SUM(allocatedamount) AS paid_amount
+        FROM   `popayments`
+        GROUP  BY poid
+        """
+    )
+    if not paid_map_df.empty:
+        paid_map_df["paid_amount"] = paid_map_df["paid_amount"].astype(float)
+        paid_map = paid_map_df.set_index("poid")["paid_amount"].to_dict()
+    else:
+        paid_map = {}
+
+    po_totals["paid_amount"] = (
+        po_totals["poid"].map(paid_map).fillna(0.0).astype(float)
+    )
+    po_totals["outstanding"] = (
+        po_totals["received_value"] - po_totals["paid_amount"]
     )
 
-    po_totals["paid_amount"] = po_totals["poid"].map(paid_map).fillna(0.0)
-    po_totals["outstanding"] = po_totals["received_value"] - po_totals["paid_amount"]
-
-    outstanding_total = po_totals["outstanding"].sum()
+    outstanding_total: float = float(po_totals["outstanding"].sum())
     st.markdown(f"### 💰 Outstanding debt: **{outstanding_total:,.2f} IQD**")
 
     with st.expander("🔍 PO breakdown"):
@@ -147,13 +154,18 @@ def _render_supplier_dashboard(
         stock_df["total_qty"] = stock_df["inv_qty"] + stock_df["shelf_qty"]
         stock_df["total_value"] = stock_df["inv_value"] + stock_df["shelf_value"]
 
+        # cast money columns to float so further maths is safe
+        stock_df[["inv_value", "shelf_value", "total_value"]] = stock_df[
+            ["inv_value", "shelf_value", "total_value"]
+        ].astype(float)
+
         names_df = fh.fetch_data(
             "SELECT itemid, itemnameenglish AS itemname FROM `item`"
         )
         stock_df = stock_df.merge(names_df, on="itemid", how="left")
 
         total_qty = int(stock_df["total_qty"].sum())
-        total_value = stock_df["total_value"].sum()
+        total_value = float(stock_df["total_value"].sum())
 
     st.markdown(f"### 📦 Stock on hand: **{total_qty:,} units**")
     st.markdown(f"### 💵 Stock value: **{total_value:,.2f} IQD**")
@@ -182,7 +194,9 @@ def _render_supplier_dashboard(
     pay_cols = st.columns([2, 1, 1, 3])
     pay_date = pay_cols[0].date_input("Payment date", value=pd.Timestamp.today())
     pay_method = pay_cols[1].selectbox(
-        "Method", ["Cash", "Credit Card", "Bank Transfer", "Other"], key="consign_pay_method"
+        "Method",
+        ["Cash", "Credit Card", "Bank Transfer", "Other"],
+        key="consign_pay_method",
     )
     amount = pay_cols[2].number_input(
         "Amount", min_value=0.01, step=0.01, format="%.2f", key="consign_pay_amount"
