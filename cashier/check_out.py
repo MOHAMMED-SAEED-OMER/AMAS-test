@@ -145,6 +145,12 @@ def render():
         st.stop()
 
     now = datetime.utcnow()
+    # ─── DEBUG ───
+with st.expander("DEBUG – shift window"):
+    st.write("cashier =", cashier)
+    st.write("shift_start =", shift_start, type(shift_start))
+    st.write("now =", now)
+
     system_total, tx_count = get_sales_totals(cashier, shift_start, now)
 
     # Overview
