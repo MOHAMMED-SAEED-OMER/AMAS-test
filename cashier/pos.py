@@ -90,25 +90,25 @@ def display_pos_tab():
     )
     if not held.empty:
         st.markdown("### ⏸ Held Bills")
-        for r in held.itertuples():
+        for i, r in enumerate(held.itertuples()):
             c1, c2, c3 = st.columns([5, 2, 1])
-            # created_at may be NULL → protect formatting
-            time_txt = ""
-            if r.created_at is not None:
-                try:
-                    time_txt = f"{r.created_at:%H:%M}"
-                except (TypeError, ValueError):
-                    time_txt = str(r.created_at)
+            # created_at may be NULL
+            time_txt = (
+                f"{r.created_at:%H:%M}"
+                if getattr(r, "created_at", None) is not None
+                else ""
+            )
             c1.write(
                 f"**{r.hold_label}** • {r.line_count} items"
                 + (f" • {time_txt}" if time_txt else "")
             )
-            if c2.button("Resume", key=f"resume_{r.holdid}"):
+            uniq_id = r.holdid if r.holdid is not None else "none"
+            if c2.button("Resume", key=f"resume_{i}_{uniq_id}"):
                 st.session_state.sales_table = cashier_handler.load_hold(r.holdid)
                 cashier_handler.delete_hold(r.holdid)
                 st.success(f"Hold “{r.hold_label}” restored.")
                 st.rerun()
-            if c3.button("✖️", key=f"del_{r.holdid}"):
+            if c3.button("✖️", key=f"del_{i}_{uniq_id}"):
                 cashier_handler.delete_hold(r.holdid)
                 st.info("Hold deleted.")
                 st.rerun()
@@ -135,7 +135,6 @@ def display_pos_tab():
                 if itm is None:
                     st.warning("No matching item.")
                     return
-                # This concat triggers a pandas FutureWarning now; fine for 2 .x.
                 st.session_state.sales_table = pd.concat(
                     [st.session_state.sales_table, pd.DataFrame([itm])],
                     ignore_index=True,
