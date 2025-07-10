@@ -4,8 +4,13 @@ from cashier.cashier_handler import CashierHandler
 
 cashier_handler = CashierHandler()
 
+# ────────────────────────── helpers ──────────────────────────
+def _fmt_price(val) -> str:
+    """Return price as '12.34' or 'N/A' when None / NULL."""
+    return "N/A" if val is None else f"{float(val):.2f}"
+
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def load_item_names():
     """
     Return catalogue (itemid, itemname, sellingprice) for name dropdown.
@@ -48,7 +53,7 @@ def display_price_check_tab():
                 f"""
                 - **Item ID**: {result['itemid']}
                 - **Name**: {result['itemname']}
-                - **Selling Price**: {result['sellingprice']:.2f}
+                - **Selling Price**: {_fmt_price(result['sellingprice'])}
                 """
             )
 
@@ -79,7 +84,7 @@ def display_price_check_tab():
                         f"""
                         - **Item ID**: {row['itemid']}
                         - **Name**: {row['itemname']}
-                        - **Selling Price**: {row['sellingprice']:.2f}
+                        - **Selling Price**: {_fmt_price(row['sellingprice'])}
                         """
                     )
             else:
