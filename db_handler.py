@@ -4,8 +4,8 @@ db_handler.py – MySQL edition, PyMySQL driver
  • Session-cached connection (st.cache_resource)
  • Auto keep-alive with .ping(reconnect=True)
  • Transparent reconnect + retry on *any* driver-level glitch
+ • NEW: forces session time-zone to Baghdad (+03:00)
 """
-
 from __future__ import annotations
 
 import uuid
@@ -28,10 +28,13 @@ def _session_key() -> str:
 
 @st.cache_resource(show_spinner=False)
 def _get_conn(params: dict, cache_key: str):
+    """Create one PyMySQL connection per Streamlit session."""
     conn = pymysql.connect(**params)
+    with conn.cursor() as cur:                         # NEW ──────────────
+        cur.execute("SET time_zone = '+03:00';")       # Baghdad TZ
     try:
         st.on_session_end(conn.close)
-    except Exception:
+    except Exception:                                  # non-interactive
         pass
     return conn
 
@@ -40,14 +43,14 @@ def _get_conn(params: dict, cache_key: str):
 # 2. DatabaseManager
 # ─────────────────────────────────────────────────────────────
 class DatabaseManager:
-    """Lightweight DB helper using a cached PyMySQL connection."""
+    """Lightweight DB helper using the cached PyMySQL connection."""
 
     # ---------------------------------------------------------
     # constructor
     # ---------------------------------------------------------
     def __init__(self):
         secrets = st.secrets
-        if "mysql" in secrets:          # sectioned secrets.toml
+        if "mysql" in secrets:            # sectioned secrets.toml
             secrets = secrets["mysql"]
 
         def pick(*keys, default=None):
@@ -66,7 +69,7 @@ class DatabaseManager:
             database    = pick("DB_NAME", "database"),
             charset     = "utf8mb4",
             autocommit  = True,
-            cursorclass = pymysql.cursors.DictCursor,  # rows as dicts
+            cursorclass = pymysql.cursors.DictCursor,   # rows as dicts
         )
 
         self._cache_key = _session_key()
@@ -94,9 +97,9 @@ class DatabaseManager:
             InterfaceError,
             InternalError,
             struct.error,   # malformed packet
-            ValueError,     # “buffer size” errors
-            EOFError,       # server closed stream mid-result
-            IndexError,     # truncated packet (PyMySQL protocol)
+            ValueError,     # buffer errors
+            EOFError,       # server closed mid-result
+            IndexError,     # truncated packet
         ):
             _get_conn.clear()
             self.conn = _get_conn(self._params, self._cache_key)
@@ -130,7 +133,7 @@ class DatabaseManager:
                 cur.execute(sql, params or ())
                 result = cur.fetchone() if returning else None
                 if returning:
-                    cur.fetchall()  # drain
+                    cur.fetchall()  # drain remaining rows
             return result
 
         return self._retryable(_run)
