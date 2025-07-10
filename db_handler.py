@@ -1,38 +1,30 @@
 """
-db_handler.py – MySQL edition, PyMySQL driver (no native crashes)
+db_handler.py – MySQL edition, PyMySQL driver
 
-Why the rewrite?
-────────────────
-• `mysql-connector-python` links against glibc/openssl and can corrupt the
-  heap on Alpine-based containers → “malloc(): unsorted double linked list
-  corrupted”.  Switching to **PyMySQL** avoids native code entirely.
-
-Key points
-──────────
-• One cached PyMySQL connection per Streamlit session (`st.cache_resource`).
-• Automatic keep-alive: `conn.ping(reconnect=True)` before each query avoids
-  the “MySQL server has gone away” error.
-• Any connection-level failure (OperationalError, InterfaceError, InternalError)
-  triggers a one-time reconnect + retry.
-• Public API identical to the old version (`fetch_data`, `execute_command`,
-  `execute_command_returning`, etc.).
+ • Session-cached connection (st.cache_resource)
+ • Auto keep-alive with .ping(reconnect=True)
+ • Transparent reconnect + retry on *any* driver-level glitch
 """
 
 from __future__ import annotations
 
 import uuid
+import struct      # NEW – for struct.error
 from typing import Any, Sequence, List
 
 import pandas as pd
 import pymysql
-from pymysql.err import OperationalError, InterfaceError, InternalError  # NEW
+from pymysql.err import (
+    OperationalError,
+    InterfaceError,
+    InternalError,
+)  # connection-level failures
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────
 # 1. Helpers for session-scoped connection
 # ─────────────────────────────────────────────────────────────
 def _session_key() -> str:
-    """Unique key per Streamlit browser session."""
     if "_session_key" not in st.session_state:
         st.session_state["_session_key"] = uuid.uuid4().hex
     return st.session_state["_session_key"]
@@ -40,11 +32,10 @@ def _session_key() -> str:
 
 @st.cache_resource(show_spinner=False)
 def _get_conn(params: dict, cache_key: str):
-    """Create a PyMySQL connection once per session."""
     conn = pymysql.connect(**params)
     try:
         st.on_session_end(conn.close)
-    except Exception:  # running outside interactive session
+    except Exception:  # running in non-interactive env
         pass
     return conn
 
@@ -59,21 +50,16 @@ class DatabaseManager:
     # constructor
     # ---------------------------------------------------------
     def __init__(self):
-        # ---- read secrets -----------------------------------
         secrets = st.secrets
-        if "mysql" in secrets:           # sectioned secrets.toml
+        if "mysql" in secrets:  # sectioned secrets.toml
             secrets = secrets["mysql"]
 
         def pick(*keys, default=None):
-            """Return first present secret key (case-insensitive)."""
             for k in keys:
-                try:
+                if k in secrets:
                     return secrets[k]
-                except KeyError:
-                    try:
-                        return secrets[k.lower()]  # allow lower-case
-                    except KeyError:
-                        continue
+                if k.lower() in secrets:
+                    return secrets[k.lower()]
             return default
 
         self._params: dict[str, Any] = dict(
@@ -84,7 +70,7 @@ class DatabaseManager:
             database    = pick("DB_NAME", "database"),
             charset     = "utf8mb4",
             autocommit  = True,
-            cursorclass = pymysql.cursors.Cursor,  # plain tuples; use DictCursor if preferred
+            cursorclass = pymysql.cursors.DictCursor,  # <— easier access by name
         )
 
         self._cache_key = _session_key()
@@ -94,7 +80,6 @@ class DatabaseManager:
     # internal utilities
     # ---------------------------------------------------------
     def _ensure_live(self) -> None:
-        """Ping connection; reconnect if server closed it."""
         try:
             self.conn.ping(reconnect=True)
         except Exception:
@@ -103,12 +88,19 @@ class DatabaseManager:
 
     def _retryable(self, fn, *args, **kwargs):
         """
-        Execute *fn* once; on connection-level failures (OperationalError,
-        InterfaceError, InternalError) clear cache, reconnect and retry once.
+        Try once, then reconnect + retry when the connection breaks or
+        the packet stream is corrupted.
         """
         try:
             return fn(*args, **kwargs)
-        except (OperationalError, InterfaceError, InternalError):
+        except (
+            OperationalError,
+            InterfaceError,
+            InternalError,
+            struct.error,      # malformed packet
+            ValueError,        # e.g. "buffer size" errors
+            EOFError,          # server closed the stream mid-result
+        ):
             _get_conn.clear()
             self.conn = _get_conn(self._params, self._cache_key)
             return fn(*args, **kwargs)
@@ -116,14 +108,15 @@ class DatabaseManager:
     # ---------------------------------------------------------
     # low-level query helpers
     # ---------------------------------------------------------
-    def _fetch_df(self, sql: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
+    def _fetch_df(
+        self, sql: str, params: Sequence[Any] | None = None
+    ) -> pd.DataFrame:
         def _run() -> pd.DataFrame:
             self._ensure_live()
             with self.conn.cursor() as cur:
                 cur.execute(sql, params or ())
                 rows = cur.fetchall()
-                cols = [c[0] for c in cur.description]
-            return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame()
+                return pd.DataFrame(rows)
 
         return self._retryable(_run)
 
@@ -139,13 +132,8 @@ class DatabaseManager:
             with self.conn.cursor() as cur:
                 cur.execute(sql, params or ())
                 result = cur.fetchone() if returning else None
-
-                # Ensure remaining result set is consumed so the connection
-                # is clean for the next command.  This is cheap because the
-                # result set is already buffered client-side.
-                if returning:
+                if returning:  # drain the result set
                     cur.fetchall()
-
             return result
 
         return self._retryable(_run)
@@ -153,10 +141,14 @@ class DatabaseManager:
     # ---------------------------------------------------------
     # public API
     # ---------------------------------------------------------
-    def fetch_data(self, query: str, params: Sequence[Any] | None = None) -> pd.DataFrame:
+    def fetch_data(
+        self, query: str, params: Sequence[Any] | None = None
+    ) -> pd.DataFrame:
         return self._fetch_df(query, params)
 
-    def execute_command(self, query: str, params: Sequence[Any] | None = None) -> None:
+    def execute_command(
+        self, query: str, params: Sequence[Any] | None = None
+    ) -> None:
         self._execute(query, params)
 
     def execute_command_returning(
@@ -175,8 +167,7 @@ class DatabaseManager:
 
     def get_dropdown_values(self, section: str) -> List[str]:
         df = self.fetch_data(
-            "SELECT value FROM dropdowns WHERE section = %s",
-            (section,),
+            "SELECT value FROM dropdowns WHERE section = %s", (section,)
         )
         return df["value"].tolist()
 
@@ -184,7 +175,9 @@ class DatabaseManager:
     # supplier helpers
     # ---------------------------------------------------------
     def get_suppliers(self) -> pd.DataFrame:
-        return self.fetch_data("SELECT supplierid, suppliername FROM supplier")
+        return self.fetch_data(
+            "SELECT supplierid, suppliername FROM supplier"
+        )
 
     # ---------------------------------------------------------
     # inventory helpers
