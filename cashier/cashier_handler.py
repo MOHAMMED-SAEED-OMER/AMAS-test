@@ -23,7 +23,7 @@ class CashierHandler(DatabaseManager):
     # ───────────────────────── initialization ──────────────────────────
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """
-        Pass connection settings straight through to DatabaseManager.
+        Pass connection settings through to DatabaseManager.
 
         Example:
             handler = CashierHandler(
@@ -37,19 +37,20 @@ class CashierHandler(DatabaseManager):
         super().__init__(*args, **kwargs)  # DatabaseManager sets self.conn
 
     # ------------------------------------------------------------------
-    # Ensure we always have a live MySQL connection (compat with legacy code)
+    # Ensure we always have a live MySQL connection (legacy compat)
     # ------------------------------------------------------------------
     def _ensure_live_conn(self) -> None:
-        """Ping the connection and auto-reconnect if needed."""
+        """Ping connection and auto-reconnect if needed."""
         try:
             if getattr(self, "conn", None) is None:
-                self.connect()                       # type: ignore[attr-defined]
+                self.connect()                          # type: ignore[attr-defined]
             else:
-                self.conn.ping(reconnect=True, attempts=1, delay=0)
+                # mysql-connector accepts only the 'reconnect' kwarg
+                self.conn.ping(reconnect=True)
         except (AttributeError, Error):
             # Fall back to DatabaseManager.connect() or build from db_config
-            if hasattr(self, "connect"):            # type: ignore[attr-defined]
-                self.connect()                      # type: ignore[attr-defined]
+            if hasattr(self, "connect"):               # type: ignore[attr-defined]
+                self.connect()                         # type: ignore[attr-defined]
             elif hasattr(self, "db_config"):
                 self.conn = mysql.connector.connect(**self.db_config)  # type: ignore[attr-defined]
             else:
@@ -70,7 +71,7 @@ class CashierHandler(DatabaseManager):
         notes: str = "",
         original_saleid: int | None = None,
     ) -> int | None:
-        """Insert into `sales` and return new saleid (MySQL AUTO_INCREMENT)."""
+        """Insert into `sales` and return new saleid (AUTO_INCREMENT)."""
         self._ensure_live_conn()
         with self.conn.cursor() as cur:
             cur.execute(
@@ -142,14 +143,14 @@ class CashierHandler(DatabaseManager):
                 break
 
             if remaining >= lyr.quantity:
-                # consume the whole layer → delete row
+                # consume entire layer → delete row
                 self.execute_command(
                     "DELETE FROM `shelf` WHERE shelfid = %s",
                     (lyr.shelfid,),
                 )
                 remaining -= lyr.quantity
             else:
-                # partial take → update residual qty
+                # partial → update residual qty
                 self.execute_command(
                     "UPDATE `shelf` SET quantity = quantity - %s "
                     "WHERE shelfid = %s",
@@ -159,7 +160,7 @@ class CashierHandler(DatabaseManager):
 
         return remaining  # >0 means shortage
 
-    # legacy method (still used by Return flow)
+    # legacy method (used by Return flow)
     def reduce_shelf_stock(self, itemid: int, quantity_sold: int) -> None:
         itemid_py = int(itemid)
         qty_py = int(quantity_sold)
@@ -176,7 +177,7 @@ class CashierHandler(DatabaseManager):
         )
 
         if layer.empty:
-            return  # nothing on shelf – caller should now rely on shortage table
+            return
 
         shelfid = int(layer.iloc[0].shelfid)
         qty_left = int(layer.iloc[0].quantity) - qty_py
@@ -202,8 +203,7 @@ class CashierHandler(DatabaseManager):
     ) -> tuple[int, list[dict[str, Any]]] | None:
         """
         Create sale, deduct shelf quantities, log shortages.
-        Returns (saleid, shortages_list) where shortages_list contains
-        dicts: {"itemname": str, "qty": int}
+        Returns (saleid, shortages_list) where each dict = {"itemname": str, "qty": int}
         """
         saleid = self.create_sale_record(
             total_amount=0,
@@ -291,14 +291,11 @@ class CashierHandler(DatabaseManager):
         )
         return sale_df, items_df
 
-    # ---- Held bill helpers ---------------------------------------------
+    # ---- Held-bill helpers ---------------------------------------------
     def save_hold(
         self, *, cashier_id: str, label: str, df_items: pd.DataFrame
     ) -> int:
-        """
-        Store current bill in pos_holds (items as JSON column).
-        Returns new holdid.
-        """
+        """Store current bill in pos_holds (items JSON). Return new holdid."""
         payload = df_items[["itemid", "itemname", "quantity", "price"]].to_dict(
             orient="records"
         )
@@ -317,8 +314,7 @@ class CashierHandler(DatabaseManager):
 
     def load_hold(self, hold_id: int) -> pd.DataFrame:
         """
-        Return the held bill as a DataFrame shaped like sales_table.
-        Fills itemname if missing.
+        Return held bill as DataFrame shaped like sales_table; fill itemname if missing.
         """
         js = self.fetch_data(
             "SELECT items FROM `pos_holds` WHERE holdid = %s", (hold_id,)
@@ -330,24 +326,20 @@ class CashierHandler(DatabaseManager):
         rows = json.loads(data) if isinstance(data, str) else data
         df = pd.DataFrame(rows)
 
-        # 🔹 back-fill itemname when absent
+        # back-fill itemname when absent
         if "itemname" not in df.columns:
             ids = df["itemid"].tolist()
             if len(ids) == 1:
-                q = (
-                    "SELECT itemid, itemnameenglish AS name "
-                    "FROM `item` WHERE itemid = %s"
+                q, par = (
+                    "SELECT itemid, itemnameenglish AS name FROM `item` WHERE itemid = %s",
+                    (ids[0],),
                 )
-                par = (ids[0],)
             else:
-                q = (
-                    "SELECT itemid, itemnameenglish AS name "
-                    "FROM `item` WHERE itemid IN %s"
+                q, par = (
+                    "SELECT itemid, itemnameenglish AS name FROM `item` WHERE itemid IN %s",
+                    (tuple(ids),),
                 )
-                par = (tuple(ids),)
-            names = (
-                self.fetch_data(q, par).set_index("itemid")["name"].to_dict()
-            )
+            names = self.fetch_data(q, par).set_index("itemid")["name"].to_dict()
             df["itemname"] = df["itemid"].map(names).fillna("Unknown")
 
         df["total"] = df["quantity"] * df["price"]
