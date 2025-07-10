@@ -10,19 +10,21 @@ import streamlit as st
 
 from db_handler import DatabaseManager
 
-_db = DatabaseManager()
+_db   = DatabaseManager()
 DENOMS = [50_000, 25_000, 10_000, 5_000, 1_000, 500, 250]
-
 
 # ───────────────────────── helpers ──────────────────────────
 def _to_plain_datetime(ts) -> datetime:
-    """Convert pandas Timestamp or tz-aware datetime → naïve datetime."""
+    """Convert pandas.Timestamp or tz-aware datetime → naive UTC datetime."""
     if isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     if ts.tzinfo is not None:
         ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
     return ts
 
+def _fmt_money(val) -> str:
+    """'123,456' or 'N/A' when None."""
+    return "N/A" if val is None else f"{float(val):,.0f}"
 
 # ---------- helper SQL functions ----------
 def get_shift_start(cashier: str):
@@ -37,7 +39,7 @@ def get_shift_start(cashier: str):
         """,
         (cashier,),
     )
-    if not df.empty:
+    if not df.empty and df.iat[0, 0] is not None:
         return _to_plain_datetime(df.iat[0, 0])
 
     # otherwise: first sale *today*
@@ -52,11 +54,9 @@ def get_shift_start(cashier: str):
     )
     return _to_plain_datetime(df.iat[0, 0]) if not df.empty else None
 
-
 def get_sales_totals(cashier: str, start, end):
     start = _to_plain_datetime(start)
-    end = _to_plain_datetime(end)
-
+    end   = _to_plain_datetime(end)
     df = _db.fetch_data(
         """
         SELECT SUM(finalamount) AS system_total,
@@ -69,11 +69,9 @@ def get_sales_totals(cashier: str, start, end):
     )
     return float(df.iat[0, 0] or 0), int(df.iat[0, 1] or 0)
 
-
 def get_item_summary(cashier: str, start, end) -> pd.DataFrame:
     start = _to_plain_datetime(start)
-    end = _to_plain_datetime(end)
-
+    end   = _to_plain_datetime(end)
     return _db.fetch_data(
         """
         SELECT  i.itemid                 AS "ID",
@@ -91,7 +89,6 @@ def get_item_summary(cashier: str, start, end) -> pd.DataFrame:
         (cashier, start, end),
     )
 
-
 def save_closure(
     cashier,
     start,
@@ -102,36 +99,37 @@ def save_closure(
     notes,
 ):
     start = _to_plain_datetime(start)
-    end = _to_plain_datetime(end)
-
+    end   = _to_plain_datetime(end)
+    disc  = cash_total - system_total
     _db.execute_command(
         """
         INSERT INTO `cashier_shift_closure` (
             cashier, shift_start, shift_end,
-            system_total, cash_total,
+            system_total, cash_total, discrepancy,
             cnt_50000, cnt_25000, cnt_10000, cnt_5000,
             cnt_1000,  cnt_500,  cnt_250, notes
-        ) VALUES (%(c)s, %(s)s, %(e)s, %(sys)s, %(cash)s,
+        ) VALUES (%(c)s, %(s)s, %(e)s,
+                  %(sys)s, %(cash)s, %(disc)s,
                   %(n50)s, %(n25)s, %(n10)s, %(n5)s,
                   %(n1)s, %(n05)s, %(n025)s, %(notes)s)
         """,
         {
-            "c": cashier,
-            "s": start,
-            "e": end,
-            "sys": system_total,
+            "c":    cashier,
+            "s":    start,
+            "e":    end,
+            "sys":  system_total,
             "cash": cash_total,
-            "n50": denom[50_000],
-            "n25": denom[25_000],
-            "n10": denom[10_000],
-            "n5": denom[5_000],
-            "n1": denom[1_000],
-            "n05": denom[500],
+            "disc": disc,
+            "n50":  denom[50_000],
+            "n25":  denom[25_000],
+            "n10":  denom[10_000],
+            "n5":   denom[5_000],
+            "n1":   denom[1_000],
+            "n05":  denom[500],
             "n025": denom[250],
             "notes": notes,
         },
     )
-
 
 def fetch_last_closure(cashier):
     df = _db.fetch_data(
@@ -145,7 +143,6 @@ def fetch_last_closure(cashier):
         (cashier,),
     )
     return df.iloc[0] if not df.empty else None
-
 
 # ---------- UI ----------
 def render():
@@ -170,7 +167,7 @@ def render():
     # Overview
     c1, c2, c3 = st.columns(3)
     c1.metric("Shift start", shift_start.strftime("%H:%M"))
-    c2.metric("Total sales (IQD)", f"{system_total:,.0f}")
+    c2.metric("Total sales (IQD)", _fmt_money(system_total))
     c3.metric("# Transactions", tx_count)
 
     # Item breakdown
@@ -192,11 +189,9 @@ def render():
 
     diff = cash_total - system_total
     st.markdown(
-        (
-            "<p style='font-size:1.1em'><strong>Your total:</strong> "
-            f"{cash_total:,.0f} IQD "
-            f"({'+' if diff>=0 else ''}{diff:,.0f})</p>"
-        ),
+        f"<p style='font-size:1.1em'><strong>Your total:</strong> "
+        f"{_fmt_money(cash_total)} IQD "
+        f"({'+' if diff>=0 else ''}{_fmt_money(diff)})</p>",
         unsafe_allow_html=True,
     )
 
@@ -219,28 +214,27 @@ def render():
             st.divider()
             st.markdown("### 📄 Closure summary")
             a, b, c = st.columns(3)
-            a.metric("System total", f"{last.system_total:,.0f}")
-            b.metric("Counted cash", f"{last.cash_total:,.0f}")
-            c.metric("Δ", f"{last.discrepancy:+,.0f}", delta_color="inverse")
+            a.metric("System total", _fmt_money(last.system_total))
+            b.metric("Counted cash", _fmt_money(last.cash_total))
+            c.metric("Δ", _fmt_money(last.discrepancy), delta_color="inverse")
 
             st.table(
                 {
                     "Denomination": [f"{d:,}" for d in DENOMS],
                     "Count": [
-                        last.cnt_50000,
-                        last.cnt_25000,
-                        last.cnt_10000,
-                        last.cnt_5000,
-                        last.cnt_1000,
-                        last.cnt_500,
-                        last.cnt_250,
+                        last.cnt_50000 or 0,
+                        last.cnt_25000 or 0,
+                        last.cnt_10000 or 0,
+                        last.cnt_5000  or 0,
+                        last.cnt_1000  or 0,
+                        last.cnt_500   or 0,
+                        last.cnt_250   or 0,
                     ],
                 }
             )
             if last.notes:
                 st.info(f"**Notes:** {last.notes}")
         st.stop()
-
 
 if __name__ == "__main__":
     render()
