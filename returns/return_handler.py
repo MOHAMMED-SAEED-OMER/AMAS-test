@@ -1,5 +1,11 @@
-# returns/return_handler.py  ▶︎  MySQL / MariaDB version
+# returns/return_handler.py  – MySQL edition
+from __future__ import annotations
+
+import decimal
+from typing import Iterable
+
 import pandas as pd
+
 from db_handler import DatabaseManager
 
 
@@ -14,6 +20,30 @@ class ReturnHandler(DatabaseManager):
       • approve return
       • fetch summaries / detail
     """
+
+    # ───────────────────── internal connection guard ──────────────────────
+    def _ensure_live_conn(self) -> None:
+        """Ping the connection; reconnect if the socket was dropped."""
+        if getattr(self, "conn", None) is not None:
+            try:
+                self.conn.ping(reconnect=True)
+                return
+            except Exception:  # pragma: no cover
+                pass
+
+        # Have DatabaseManager reopen the handle
+        if hasattr(self, "_connect"):
+            self.conn = self._connect()
+        else:
+            self.conn = self.connect()  # type: ignore[attr-defined]
+
+    # ───────────────────── small helper for query results ─────────────────
+    @staticmethod
+    def _as_float(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+        for c in cols:
+            if c in df.columns:
+                df[c] = df[c].astype(float)
+        return df
 
     # ───────────────────────────────────────────────────────────────
     # Creation helpers
@@ -35,10 +65,16 @@ class ReturnHandler(DatabaseManager):
         VALUES (%s, %s, %s, 'Pending Approval', %s, %s)
         """
         self._ensure_live_conn()
-        with self.conn.cursor() as cur:
+        with self.conn.cursor() as cur:                 # type: ignore[attr-defined]
             cur.execute(
                 sql,
-                (supplier_id, creditnote, notes, createdby, total_return_cost),
+                (
+                    supplier_id,
+                    creditnote,
+                    notes,
+                    createdby,
+                    decimal.Decimal(str(total_return_cost)),
+                ),
             )
             self.conn.commit()
             return int(cur.lastrowid)
@@ -53,8 +89,10 @@ class ReturnHandler(DatabaseManager):
                 it["returnid"],
                 it["itemid"],
                 it["quantity"],
-                it["itemprice"],
-                float(it["quantity"]) * float(it["itemprice"]),
+                decimal.Decimal(str(it["itemprice"])),
+                decimal.Decimal(str(it["quantity"])) * decimal.Decimal(
+                    str(it["itemprice"])
+                ),
                 it.get("reason", ""),
                 it.get("poid"),
                 it.get("expiredate"),
@@ -69,7 +107,7 @@ class ReturnHandler(DatabaseManager):
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
         self._ensure_live_conn()
-        with self.conn.cursor() as cur:
+        with self.conn.cursor() as cur:                 # type: ignore[attr-defined]
             cur.executemany(sql, rows)
             self.conn.commit()
 
@@ -103,7 +141,8 @@ class ReturnHandler(DatabaseManager):
          WHERE supplierid = %s
          ORDER BY orderdate DESC
         """
-        return self.fetch_data(sql, (supplier_id,))
+        df = self.fetch_data(sql, (supplier_id,))
+        return self._as_float(df, ["totalcost"])
 
     def get_po_items(self, poid: int) -> pd.DataFrame:
         sql = """
@@ -127,8 +166,10 @@ class ReturnHandler(DatabaseManager):
         Return a SQL fragment that yields NULL when `col` holds the illegal
         zero-date literal, otherwise the original DATETIME value.
         """
-        # Compare the column *as text* to avoid MySQL validating the literal
-        return f"CASE WHEN CAST({col} AS CHAR) = '{INVALID_DT}' THEN NULL ELSE {col} END"
+        return (
+            f"CASE WHEN CAST({col} AS CHAR) = '{INVALID_DT}' "
+            f"THEN NULL ELSE {col} END"
+        )
 
     def get_returns_summary(self) -> pd.DataFrame:
         created  = self._clean_date_expr("r.createddate")
@@ -164,14 +205,15 @@ class ReturnHandler(DatabaseManager):
          WHERE sri.returnid = %s
          ORDER BY i.itemnameenglish
         """
-        return self.fetch_data(sql, (returnid,))
+        df = self.fetch_data(sql, (returnid,))
+        return self._as_float(df, ["itemprice", "totalcost", "quantity"])
 
     def get_return_header(self, returnid: int) -> pd.DataFrame:
         created  = self._clean_date_expr("createddate")
         approved = self._clean_date_expr("approvedate")
 
         sql = f"""
-        SELECT *,
+        SELECT * ,
                {created}  AS createddate,
                {approved} AS approvedate
           FROM supplierreturns
