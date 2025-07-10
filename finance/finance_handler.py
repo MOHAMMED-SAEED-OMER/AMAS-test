@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import datetime
 import decimal
+from typing import Iterable
+
 import pandas as pd
 
 from db_handler import DatabaseManager
@@ -12,21 +14,14 @@ class FinanceHandler(DatabaseManager):
     """
     Finance-level helpers for the AMAS Finance module (MySQL edition).
 
-    Key points
-    ----------
-    • `_ensure_live_conn()` quietly pings / re-opens the MySQL connection
-      before every write so Streamlit’s long-running sessions never hit
-      “MySQL server has gone away”.
-    • `create_supplier_payment()` now:
-        – Upgrades a date-only object to a full `datetime` (using the
-          current local time) so you always store an accurate timestamp.
-        – Relies on the table’s DEFAULT `'Standard'` when the UI leaves
-          `payment_type` blank, but still lets callers override it.
+    • `_ensure_live_conn()`        – keeps the DB connection alive.
+    • `_as_float(df, cols)`       – converts Decimal columns → float to avoid
+                                    arithmetic clashes inside pandas / NumPy.
+    • All query methods call `_as_float()` right after `fetch_data()`.
     """
 
     # ───────────────────────── internal guard ─────────────────────────
     def _ensure_live_conn(self) -> None:
-        """Ping the connection; reconnect if the socket was dropped."""
         if getattr(self, "conn", None) is not None:
             try:
                 self.conn.ping(reconnect=True)       # PyMySQL & mysql-connector
@@ -39,6 +34,15 @@ class FinanceHandler(DatabaseManager):
             self.conn = self._connect()
         else:
             self.conn = self.connect()  # type: ignore[attr-defined]
+
+    # ───────────────────── helpers ─────────────────────
+    @staticmethod
+    def _as_float(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+        """Cast listed columns to float if they exist in *df*."""
+        for c in cols:
+            if c in df.columns:
+                df[c] = df[c].astype(float)
+        return df
 
     # ───────────────────── Supplier Debt ─────────────────────
     def get_supplier_debts(self) -> pd.DataFrame:
@@ -53,7 +57,8 @@ class FinanceHandler(DatabaseManager):
             GROUP BY s.supplierid, s.suppliername
             ORDER BY s.suppliername;
         """
-        return self.fetch_data(sql)
+        df = self.fetch_data(sql)
+        return self._as_float(df, ["amount_owed"])
 
     def get_outstanding_pos_by_supplier(self, supplier_id: int) -> pd.DataFrame:
         sql = """
@@ -70,7 +75,8 @@ class FinanceHandler(DatabaseManager):
             HAVING  outstanding_amount > 0
             ORDER BY po.orderdate;
         """
-        return self.fetch_data(sql, (supplier_id,))
+        df = self.fetch_data(sql, (supplier_id,))
+        return self._as_float(df, ["totalcost", "paid_amount", "outstanding_amount"])
 
     # ───────────────────── Supplier Payments ─────────────────────
     def create_supplier_payment(
@@ -83,15 +89,7 @@ class FinanceHandler(DatabaseManager):
         notes: str = "",
         payment_type: str | None = None,
     ) -> int | None:
-        """
-        Insert a row into `supplierpayments` and return its AUTO_INCREMENT id.
-
-        • If the user picked only a calendar date (no time), we add the current
-          time so `paymentdate` becomes a proper timestamp.
-        • `payment_type` is only included when the caller supplies a value;
-          otherwise we rely on the table default 'Standard'.
-        """
-        # ── Normalise `payment_date` ───────────────────────────────────
+        # ── Normalise payment_date (add current time if only a date) ──
         if (
             isinstance(payment_date, datetime.date)
             and not isinstance(payment_date, datetime.datetime)
@@ -100,7 +98,7 @@ class FinanceHandler(DatabaseManager):
                 payment_date, datetime.datetime.now().time()
             )
 
-        # ── Detect once whether the column exists ──────────────────────
+        # ── Detect once whether payment_type column exists ────────────
         if not hasattr(self, "_has_payment_type"):
             probe = """
                 SELECT 1
@@ -121,8 +119,7 @@ class FinanceHandler(DatabaseManager):
             notes,
         ]
 
-        # Only send payment_type if the caller set it (otherwise leave column
-        # out and let MySQL apply its DEFAULT 'Standard')
+        # send payment_type only if caller set it; table default handles rest
         if payment_type is not None and self._has_payment_type:
             cols.append("payment_type")
             vals.append(payment_type)
@@ -135,7 +132,6 @@ class FinanceHandler(DatabaseManager):
             VALUES ({placeholders});
         """
 
-        # ── Execute ───────────────────────────────────────────────────
         self._ensure_live_conn()
         with self.conn.cursor() as cur:                # type: ignore[attr-defined]
             cur.execute(sql, vals)
@@ -152,7 +148,6 @@ class FinanceHandler(DatabaseManager):
         allocation_status: str,
         return_id: int | None = None,
     ) -> None:
-        """Link a payment to a PO (and optionally a Return)."""
         sql = """
             INSERT INTO `popayments`
                    (paymentid, poid, allocatedamount, allocationstatus, returnid)
@@ -194,7 +189,8 @@ class FinanceHandler(DatabaseManager):
             LEFT JOIN cost ON cost.itemid = i.itemid
             ORDER BY i.itemnameenglish;
         """
-        return self.fetch_data(sql)
+        df = self.fetch_data(sql)
+        return self._as_float(df, ["on_hand_qty", "avg_cost", "sellingprice", "profit_per_unit"])
 
     # ───────────────────── Salary helpers ─────────────────────
     def get_salary_month_status(self, year: int, month: int) -> pd.DataFrame:
@@ -214,6 +210,7 @@ class FinanceHandler(DatabaseManager):
             ORDER BY e.fullname;
         """
         df = self.fetch_data(sql, (year, month))
+        df = self._as_float(df, ["expected", "paid_so_far"])
         if not df.empty:
             df["outstanding"] = df["expected"] - df["paid_so_far"]
         return df
